@@ -1,0 +1,38 @@
+{
+  "name": "proxy-region-guard",
+  "version": "1.0.0",
+  "description": "Windows 代理 IP 地区变更实时检测与强提醒工具",
+  "main": "dist-electron/main.js",
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "build": "node scripts/build-electron.mjs && vite build",
+    "start": "npm run build && node scripts/launch.mjs",
+    "launch": "node scripts/launch.mjs",
+    "package": "node scripts/package-release.mjs"
+  },
+  "dependencies": {
+    "@ip-location-db/geolite2-country-mmdb": "^2.3.0",
+    "https-proxy-agent": "^7.0.6",
+    "js-yaml": "^4.1.0",
+    "lucide-react": "^0.468.0",
+    "maxmind": "^4.3.22",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "socks-proxy-agent": "^8.0.5",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@electron/asar": "^4.3.1",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/ws": "^8.5.13",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^33.2.1",
+    "esbuild": "^0.24.0",
+    "rcedit": "^5.0.2",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}
