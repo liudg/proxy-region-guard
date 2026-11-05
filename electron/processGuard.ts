@@ -1,11 +1,15 @@
 import { execFile } from 'node:child_process';
 import * as path from 'node:path';
-import { compileValidPatterns } from '../src/shared/processPattern';
+import {
+  compileValidPatterns,
+  CRITICAL_SYSTEM_PROCESSES,
+} from '../src/shared/processPattern';
 
 export interface ProcessKillReport {
-  matchedSummary: string[];   // 如 ["Claude.exe (×8)", "claude-native.exe"]
-  matchedRawNames: string[];  // 去重进程名列表，如 ["Claude.exe", "claude-native.exe"]
-  totalMatchedPids: number;
+  killedSummary: string[];   // 实际已被成功终止的进程汇总，如 ["Claude.exe (×8)"]
+  killedCount: number;       // 实际终止的 PID 数量
+  failedSummary: string[];   // 因权限不足等原因仍存活的进程汇总
+  failedPids: number[];      // 未能终止的存活 PID 列表（已排序，用于去重抑制）
   accessDenied: boolean;
   errorDetail?: string;
 }
@@ -14,6 +18,27 @@ interface RunningProcEntry {
   imageName: string;
   pid: number;
 }
+
+const CRITICAL_SYSTEM_SET = new Set<string>(CRITICAL_SYSTEM_PROCESSES);
+
+// 保护常见代理客户端与内核进程不被误配规则强杀（否则会导致网络彻底断联死循环）
+const PROTECTED_PROXY_INFRA_SET = new Set<string>([
+  'verge-mihomo.exe',
+  'verge-mihomo-alpha.exe',
+  'mihomo.exe',
+  'mihomo-party.exe',
+  'clash.exe',
+  'clash-verge.exe',
+  'clash-nyanpasu.exe',
+  'flclash.exe',
+  'clash for windows.exe',
+  'v2ray.exe',
+  'v2rayn.exe',
+  'xray.exe',
+  'sing-box.exe',
+  'nekoray.exe',
+  'nekobox.exe',
+]);
 
 export function decodeWinConsoleBuffer(buf: Buffer | string | null | undefined): string {
   if (!buf) return '';
@@ -68,10 +93,12 @@ function listRunningProcesses(): Promise<RunningProcEntry[]> {
   });
 }
 
-function runTaskkillTreeBatch(pids: number[]): Promise<{ accessDenied: boolean; rawError?: string }> {
+function runTaskkillTreeBatch(
+  pids: number[]
+): Promise<{ hadError: boolean; accessDenied: boolean }> {
   return new Promise((resolve) => {
     if (pids.length === 0) {
-      resolve({ accessDenied: false });
+      resolve({ hadError: false, accessDenied: false });
       return;
     }
 
@@ -86,28 +113,39 @@ function runTaskkillTreeBatch(pids: number[]): Promise<{ accessDenied: boolean; 
       { encoding: 'buffer', windowsHide: true, timeout: 5000, maxBuffer: 1024 * 1024 },
       (err, stdout, stderr) => {
         if (!err) {
-          resolve({ accessDenied: false });
+          resolve({ hadError: false, accessDenied: false });
           return;
         }
         const combined = `${decodeWinConsoleBuffer(stdout)}\n${decodeWinConsoleBuffer(stderr)}`;
         const denied = /拒绝访问|Access is denied/i.test(combined);
         resolve({
+          hadError: true,
           accessDenied: denied,
-          rawError: denied ? '部分目标进程以管理员权限运行，当前权限无法终止（请以管理员身份运行本卫士）' : undefined,
         });
       }
     );
   });
 }
 
+function formatCountMap(countByName: Map<string, number>): string[] {
+  return Array.from(countByName.entries()).map(([name, cnt]) =>
+    cnt > 1 ? `${name} (×${cnt})` : name
+  );
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 /**
- * 扫描当前所有运行进程，使用通配符/正则规则匹配，并按进程树 (/F /T) 连带全部子进程一次性强杀
+ * 扫描当前所有运行进程，使用通配符/正则规则匹配，按进程树 (/F /T) 强杀并二次核验实际终止结果
  */
 export async function terminateProtectedProcesses(patterns: string[]): Promise<ProcessKillReport> {
   const emptyReport: ProcessKillReport = {
-    matchedSummary: [],
-    matchedRawNames: [],
-    totalMatchedPids: 0,
+    killedSummary: [],
+    killedCount: 0,
+    failedSummary: [],
+    failedPids: [],
     accessDenied: false,
   };
 
@@ -126,60 +164,87 @@ export async function terminateProtectedProcesses(patterns: string[]): Promise<P
   }
 
   const selfExeLower = path.basename(process.execPath).toLowerCase();
-  const isDevElectron = selfExeLower === 'electron.exe';
   const selfPid = process.pid;
   const selfPpid = process.ppid;
 
-  const targetPids: number[] = [];
-  const countByName = new Map<string, number>();
+  const matchedEntries: RunningProcEntry[] = [];
 
   for (const proc of running) {
     if (proc.pid === selfPid || proc.pid === selfPpid) continue;
 
     const lowerName = proc.imageName.toLowerCase();
-    // 绝对保护卫士自身进程不被误杀
-    if (lowerName === '代理地区卫士.exe' || lowerName === 'proxy-region-guard.exe') {
-      continue;
-    }
-    if (isDevElectron && lowerName === 'electron.exe') {
+    // 保护卫士自身（含重命名后的 exe）、系统关键进程与代理内核进程不被误杀
+    if (
+      lowerName === selfExeLower ||
+      lowerName === '代理地区卫士.exe' ||
+      lowerName === 'proxy-region-guard.exe' ||
+      CRITICAL_SYSTEM_SET.has(lowerName) ||
+      PROTECTED_PROXY_INFRA_SET.has(lowerName)
+    ) {
       continue;
     }
 
     const hit = compiled.some((item) => item.regex.test(proc.imageName));
     if (hit) {
-      targetPids.push(proc.pid);
-      countByName.set(proc.imageName, (countByName.get(proc.imageName) || 0) + 1);
+      matchedEntries.push(proc);
     }
   }
 
-  if (targetPids.length === 0) {
+  if (matchedEntries.length === 0) {
     return emptyReport;
   }
 
-  // 分批执行 taskkill /F /T /PID ... 连同所有派生子进程（如 node.exe / crashpad_handler.exe 等）一起强杀
+  const targetPids = matchedEntries.map((p) => p.pid);
+  let anyError = false;
   let anyAccessDenied = false;
-  let errorDetail: string | undefined;
   const chunkSize = 40;
 
   for (let i = 0; i < targetPids.length; i += chunkSize) {
     const batch = targetPids.slice(i, i + chunkSize);
     const res = await runTaskkillTreeBatch(batch);
-    if (res.accessDenied) {
-      anyAccessDenied = true;
-      errorDetail = res.rawError;
+    if (res.hadError) anyError = true;
+    if (res.accessDenied) anyAccessDenied = true;
+  }
+
+  // 若 taskkill 报错（特别是权限拒绝），二次扫描存活进程以区分“真正已杀”与“因权限存活”
+  let survivingPidSet = new Set<number>();
+  if (anyError) {
+    await sleep(60);
+    const afterRunning = await listRunningProcesses();
+    survivingPidSet = new Set(afterRunning.map((p) => p.pid));
+  }
+
+  const killedByName = new Map<string, number>();
+  const failedByName = new Map<string, number>();
+  const failedPids: number[] = [];
+
+  for (const entry of matchedEntries) {
+    if (survivingPidSet.has(entry.pid)) {
+      failedPids.push(entry.pid);
+      failedByName.set(entry.imageName, (failedByName.get(entry.imageName) || 0) + 1);
+    } else {
+      killedByName.set(entry.imageName, (killedByName.get(entry.imageName) || 0) + 1);
     }
   }
 
-  const matchedRawNames = Array.from(countByName.keys());
-  const matchedSummary = Array.from(countByName.entries()).map(([name, cnt]) =>
-    cnt > 1 ? `${name} (×${cnt})` : name
-  );
+  failedPids.sort((a, b) => a - b);
+  const killedSummary = formatCountMap(killedByName);
+  const failedSummary = formatCountMap(failedByName);
+  const stillAlive = failedPids.length > 0;
+
+  let errorDetail: string | undefined;
+  if (stillAlive) {
+    errorDetail = anyAccessDenied
+      ? `无法终止高权限进程 [${failedSummary.join(', ')}]，请以管理员身份运行本卫士`
+      : `部分目标进程未能成功终止：[${failedSummary.join(', ')}]`;
+  }
 
   return {
-    matchedSummary,
-    matchedRawNames,
-    totalMatchedPids: targetPids.length,
-    accessDenied: anyAccessDenied,
+    killedSummary,
+    killedCount: matchedEntries.length - failedPids.length,
+    failedSummary,
+    failedPids,
+    accessDenied: anyAccessDenied && stillAlive,
     errorDetail,
   };
 }

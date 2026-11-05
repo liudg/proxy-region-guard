@@ -1,9 +1,5 @@
 import { EventEmitter } from 'node:events';
-import * as http from 'node:http';
-import * as https from 'node:https';
 import * as net from 'node:net';
-import { HttpsProxyAgent } from 'https-proxy-agent';
-import { SocksProxyAgent } from 'socks-proxy-agent';
 import {
   AlertPayload,
   AppStateSnapshot,
@@ -16,19 +12,26 @@ import {
 import {
   DEFAULT_CHINA_REGION_CODE,
   DEFAULT_CHINA_TIMEZONE_ID,
+  hasOfflineTimeZoneMapping,
+  isMultiTimeZoneCountry,
   isWindowsLocaleMatchingCountry,
   resolveWindowsTimeZoneForCountry,
 } from '../src/shared/timezones';
 import { ConfigStore } from './configStore';
 import { GeoIpService } from './geoipService';
 import { ClashMonitor } from './clashMonitor';
-import { getNetworkInterfaceFingerprint, readWindowsSystemProxy } from './systemProxy';
+import {
+  getNetworkInterfaceFingerprint,
+  readWindowsSystemProxy,
+  SystemProxyState,
+} from './systemProxy';
 import { ProcessKillReport, terminateProtectedProcesses } from './processGuard';
 import {
   applyWindowsTimeZoneAndRegion,
   queryExactExitIanaTimeZone,
   readWindowsLocaleState,
 } from './winSystemLocale';
+import { formatHostForUrl, requestTextViaProxy } from './netClient';
 
 interface TraceEndpoint {
   name: string;
@@ -71,22 +74,25 @@ export class ProbeEngine extends EventEmitter {
   private pendingReason: string | null = null;
   private lastProbe: ProbeResult | null = null;
   private lastError: string | null = null;
-  private lastTriggerReason = '初始化启动检测';
-  private systemProxyUrl: string | null = null;
   private winLocale: WindowsLocaleState = {
     timeZoneId: DEFAULT_CHINA_TIMEZONE_ID,
     timeZoneDisplayName: '(UTC+08:00) 北京，重庆，香港特别行政区，乌鲁木齐',
     regionCode: DEFAULT_CHINA_REGION_CODE,
     regionName: '中国',
-    geoId: '45',
   };
   private logs: GuardEventLog[] = [];
 
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private localEnvTimer: NodeJS.Timeout | null = null;
+  private clashDebounceTimer: NodeJS.Timeout | null = null;
+  private netDebounceTimer: NodeJS.Timeout | null = null;
+
+  private cachedSysProxy: { state: SystemProxyState; readAt: number } | null = null;
+  private envTickCounter = 0;
   private lastSysProxySnapshot = '';
   private lastNetFingerprint = '';
   private lastAlertSignature: string | null = null;
+  private lastGuardFailSignature: string | null = null;
 
   constructor(configStore: ConfigStore, geoIp: GeoIpService, clashMonitor: ClashMonitor) {
     super();
@@ -95,9 +101,13 @@ export class ProbeEngine extends EventEmitter {
     this.clashMonitor = clashMonitor;
 
     this.clashMonitor.on('clash-change', (reason: string) => {
-      this.addLog('info', `实时捕获事件：${reason}`);
-      // 给 Clash 节点切换留出 250ms 内部路由生效时间后立即校验出口
-      setTimeout(() => {
+      if (this.clashDebounceTimer) {
+        clearTimeout(this.clashDebounceTimer);
+      }
+      // 合并短时间内的连续节点切换，并留出 250ms 内部路由生效时间后校验出口
+      this.clashDebounceTimer = setTimeout(() => {
+        this.clashDebounceTimer = null;
+        this.addLog('info', `实时捕获事件：${reason}`);
         void this.checkNow(reason);
       }, 250);
     });
@@ -109,15 +119,23 @@ export class ProbeEngine extends EventEmitter {
         `已连接 Clash 控制接口 (${info.source})，当前节点: ${info.activeNode || '未知'}`
       );
       this.emitState();
+
+      // Clash 首次就绪或重启恢复后自动重测一次出口（避免仅事件模式下状态滞留）
+      if (this.clashDebounceTimer) {
+        clearTimeout(this.clashDebounceTimer);
+      }
+      this.clashDebounceTimer = setTimeout(() => {
+        this.clashDebounceTimer = null;
+        void this.checkNow('Clash 控制接口已连接');
+      }, 300);
     });
   }
 
   public async start(): Promise<void> {
     const [sys, initialLocale] = await Promise.all([
-      readWindowsSystemProxy(),
+      this.getSystemProxyFresh(true),
       readWindowsLocaleState(),
     ]);
-    this.systemProxyUrl = sys.proxyUrl;
     this.winLocale = initialLocale;
     this.lastSysProxySnapshot = `${sys.enabled}|${sys.proxyUrl || ''}`;
     this.lastNetFingerprint = getNetworkInterfaceFingerprint();
@@ -139,6 +157,14 @@ export class ProbeEngine extends EventEmitter {
       clearInterval(this.localEnvTimer);
       this.localEnvTimer = null;
     }
+    if (this.clashDebounceTimer) {
+      clearTimeout(this.clashDebounceTimer);
+      this.clashDebounceTimer = null;
+    }
+    if (this.netDebounceTimer) {
+      clearTimeout(this.netDebounceTimer);
+      this.netDebounceTimer = null;
+    }
   }
 
   public restartHeartbeatTimer(): void {
@@ -154,26 +180,48 @@ export class ProbeEngine extends EventEmitter {
     }
   }
 
+  private async getSystemProxyFresh(force = false): Promise<SystemProxyState> {
+    const now = Date.now();
+    if (!force && this.cachedSysProxy && now - this.cachedSysProxy.readAt < 1500) {
+      return this.cachedSysProxy.state;
+    }
+    const state = await readWindowsSystemProxy();
+    this.cachedSysProxy = { state, readAt: Date.now() };
+    return state;
+  }
+
   private startLocalEnvironmentWatcher(): void {
-    // 纯本机轻量环境监测（注册表系统代理、网卡/TUN 变动、系统时区区域同步状态 & 异常期持续进程拦截，0 外部网络流量）
     this.localEnvTimer = setInterval(async () => {
+      this.envTickCounter = (this.envTickCounter + 1) % 3;
+      const cfg = this.configStore.get();
+
       try {
-        // 1. 同步刷新系统时区与区域显示
-        const latestLocale = await readWindowsLocaleState();
-        const localeChanged =
-          latestLocale.timeZoneId !== this.winLocale.timeZoneId ||
-          latestLocale.regionCode !== this.winLocale.regionCode;
-        if (localeChanged) {
-          this.winLocale = latestLocale;
-          this.emitState();
+        // 1. 每 6 秒（3 个周期）同步一次外部手动修改的 Windows 时区与区域，降低子进程开销
+        if (this.envTickCounter === 0 && !this.isSyncingLocale) {
+          const latestLocale = await readWindowsLocaleState();
+          const localeChanged =
+            latestLocale.timeZoneId !== this.winLocale.timeZoneId ||
+            latestLocale.regionCode !== this.winLocale.regionCode;
+          if (localeChanged) {
+            this.winLocale = latestLocale;
+            this.checkLocaleAlertRecovery(cfg.defaultCountryCode);
+            this.emitState();
+          }
         }
 
-        // 2. 持续执行异常态 / 时区不一致态的受保护进程防重开拦截
-        await this.enforceProcessGuardInBackground();
+        // 2. 仅当已锁定默认地区且开启了进程守护规则时，执行异常态持续拦截
+        if (
+          cfg.defaultCountryCode &&
+          cfg.killProcessesEnabled &&
+          cfg.protectedProcessPatterns.length > 0
+        ) {
+          await this.enforceProcessGuardInBackground();
+        } else {
+          this.lastGuardFailSignature = null;
+        }
 
         // 3. 系统代理与网卡路由监测
-        const sys = await readWindowsSystemProxy();
-        this.systemProxyUrl = sys.proxyUrl;
+        const sys = await this.getSystemProxyFresh(true);
         const sysSnap = `${sys.enabled}|${sys.proxyUrl || ''}`;
         if (this.lastSysProxySnapshot && sysSnap !== this.lastSysProxySnapshot) {
           this.lastSysProxySnapshot = sysSnap;
@@ -187,13 +235,17 @@ export class ProbeEngine extends EventEmitter {
         const netFp = getNetworkInterfaceFingerprint();
         if (this.lastNetFingerprint && netFp !== this.lastNetFingerprint) {
           this.lastNetFingerprint = netFp;
-          this.addLog('info', '检测到本机网络接口 / TUN 虚拟网卡变动');
-          setTimeout(() => {
+          if (this.netDebounceTimer) {
+            clearTimeout(this.netDebounceTimer);
+          }
+          this.netDebounceTimer = setTimeout(() => {
+            this.netDebounceTimer = null;
+            this.addLog('info', '检测到本机网络接口 / TUN 虚拟网卡变动');
             void this.checkNow('本机网卡 / TUN 路由变动');
-          }, 400);
+          }, 450);
         }
       } catch {
-        // ignore
+        // ignore transient polling errors
       }
     }, 2000);
   }
@@ -207,9 +259,7 @@ export class ProbeEngine extends EventEmitter {
       winLocale: structuredClone(this.winLocale),
       lastProbe: this.lastProbe ? structuredClone(this.lastProbe) : null,
       lastError: this.lastError,
-      lastTriggerReason: this.lastTriggerReason,
       clashInfo: this.clashMonitor.getRuntimeInfo(),
-      systemProxyUrl: this.systemProxyUrl,
       geoDbSource: this.geoIp.getSourceDescription(),
       logs: [...this.logs],
     };
@@ -223,22 +273,35 @@ export class ProbeEngine extends EventEmitter {
 
   public evaluateStatusOnly(reason?: string): AppStateSnapshot {
     const cfg = this.configStore.get();
-    if (reason) {
-      this.lastTriggerReason = reason;
+
+    // 若最新一次探测为失败（this.lastError 非空），绝不能被上次历史缓存的 lastProbe 误洗白为 ok
+    if (this.lastError) {
+      this.status = 'error';
+      if (!cfg.defaultCountryCode) {
+        this.lastAlertSignature = null;
+        this.lastGuardFailSignature = null;
+      } else {
+        void this.handleDisconnectTransition(reason || '默认地区配置更新', this.lastError);
+      }
+      this.emitState();
+      return this.getSnapshot();
     }
 
-    if (this.lastError && !this.lastProbe) {
-      this.status = 'error';
-    } else if (this.lastProbe) {
+    if (this.lastProbe) {
       if (!cfg.defaultCountryCode) {
         this.status = 'unset';
         this.lastAlertSignature = null;
+        this.lastGuardFailSignature = null;
       } else if (this.lastProbe.countryCode === cfg.defaultCountryCode) {
         this.status = 'ok';
-        if (this.lastAlertSignature !== null) {
+        if (
+          this.lastAlertSignature !== null &&
+          !this.lastAlertSignature.startsWith('locale-mismatch:')
+        ) {
           this.lastAlertSignature = null;
           this.emitRecoveredAlert();
         }
+        this.checkLocaleAlertRecovery(cfg.defaultCountryCode);
       } else {
         this.status = 'mismatch';
         void this.handleMismatchTransition(reason || '默认地区配置更新');
@@ -247,7 +310,12 @@ export class ProbeEngine extends EventEmitter {
       }
     }
 
-    void this.enforceProcessGuardInBackground();
+    if (cfg.defaultCountryCode) {
+      void this.enforceProcessGuardInBackground();
+    } else {
+      this.lastGuardFailSignature = null;
+    }
+
     this.emitState();
     return this.getSnapshot();
   }
@@ -261,7 +329,6 @@ export class ProbeEngine extends EventEmitter {
     }
 
     this.isChecking = true;
-    this.lastTriggerReason = reason;
     this.emitState();
 
     try {
@@ -274,7 +341,7 @@ export class ProbeEngine extends EventEmitter {
       for (const ep of endpoints) {
         try {
           const startedAt = Date.now();
-          const rawBody = await fetchViaProxy(ep.url, channel.proxyUrl, 6000);
+          const rawBody = await requestTextViaProxy(ep.url, channel.proxyUrl, 6000);
           const latencyMs = Date.now() - startedAt;
 
           const parsed = parseTraceResponse(rawBody, ep.format);
@@ -289,7 +356,6 @@ export class ProbeEngine extends EventEmitter {
             countryName: geo.countryName,
             edgeLoc: parsed.loc,
             viaChannel: channel.description,
-            probeSource: ep.name,
             latencyMs,
             checkedAt: Date.now(),
           };
@@ -311,13 +377,13 @@ export class ProbeEngine extends EventEmitter {
         if (!cfg.defaultCountryCode) {
           this.status = 'unset';
           this.lastAlertSignature = null;
+          this.lastGuardFailSignature = null;
           if (prevIp !== probeSuccess.ip || prevCountry !== probeSuccess.countryCode) {
             this.addLog(
               'info',
               `当前出口: ${probeSuccess.countryName} (${probeSuccess.countryCode}) · ${probeSuccess.ip}`
             );
           }
-          await this.enforceProcessGuardInBackground();
         } else if (probeSuccess.countryCode === cfg.defaultCountryCode) {
           const wasAbnormal = this.status === 'mismatch' || this.status === 'error';
           this.status = 'ok';
@@ -331,11 +397,14 @@ export class ProbeEngine extends EventEmitter {
               `地区正常 [${probeSuccess.countryName}] · IP: ${probeSuccess.ip} (${probeSuccess.latencyMs}ms)`
             );
           }
-          if (this.lastAlertSignature !== null) {
+          if (
+            this.lastAlertSignature !== null &&
+            !this.lastAlertSignature.startsWith('locale-mismatch:')
+          ) {
             this.lastAlertSignature = null;
             this.emitRecoveredAlert();
           }
-          // 即使 IP 地区一致，若系统时区/区域尚未同步且开启了时区不一致拦截，也立即检查一次
+          this.checkLocaleAlertRecovery(cfg.defaultCountryCode);
           await this.enforceProcessGuardInBackground();
         } else {
           this.status = 'mismatch';
@@ -374,7 +443,8 @@ export class ProbeEngine extends EventEmitter {
   }
 
   /**
-   * 根据默认保护地区（及当前匹配的出口 IP 精确城市时区），一键设置 Windows 时区与区域
+   * 根据默认保护地区一键设置 Windows 时区与区域
+   * 单一时区国家 0ms 纯离线完成；仅多时区大国（美/加/澳/俄等）或未知冷门国联网探测城市级时区
    */
   public async syncSystemLocaleToDefault(): Promise<LocaleSyncResult> {
     const cfg = this.configStore.get();
@@ -388,15 +458,15 @@ export class ProbeEngine extends EventEmitter {
     }
 
     const targetCode = cfg.defaultCountryCode.toUpperCase();
-    const targetName = cfg.defaultCountryName || targetCode;
-
     this.isSyncingLocale = true;
     this.emitState();
 
     try {
       let exactIanaTz: string | null = null;
-      // 当当前出口 IP 处于目标保护地区时，经由代理获取该出口 IP 精确的城市级时区（如区分美西/美东）
-      if (this.lastProbe && this.lastProbe.countryCode === targetCode) {
+      const needsCityTzLookup =
+        isMultiTimeZoneCountry(targetCode) || !hasOfflineTimeZoneMapping(targetCode);
+
+      if (needsCityTzLookup && this.lastProbe && this.lastProbe.countryCode === targetCode) {
         const ch = await this.resolveProxyChannel();
         exactIanaTz = await queryExactExitIanaTimeZone(ch.proxyUrl, targetCode);
       }
@@ -416,8 +486,11 @@ export class ProbeEngine extends EventEmitter {
         };
       }
 
+      this.lastGuardFailSignature = null;
+      this.checkLocaleAlertRecovery(targetCode);
+
       const detailNote =
-        resolved.fromExactIp && exactIanaTz ? `（精确匹配出口时区 ${exactIanaTz}）` : '';
+        resolved.fromExactIp && exactIanaTz ? `（精确匹配城市时区 ${exactIanaTz}）` : '';
       const okMsg = `已同步 Windows 区域为 [${applyRes.updated.regionName}]，时区为 [${applyRes.updated.timeZoneDisplayName}]${detailNote}`;
       this.addLog('success', okMsg);
 
@@ -435,7 +508,7 @@ export class ProbeEngine extends EventEmitter {
 
   /**
    * 还原回默认中国时区与区域（UTC+08:00 北京时间 + 区域“中国”）
-   * 若当前出口 IP 或默认保护地区与中国不一致，严格执行“先强杀受保护进程，确认退出后再切换回中国时区”
+   * 若与当前出口 IP 或默认地区不一致，严格执行“先强杀受保护进程并确认全部退出后，才允许切换回中国时区”
    */
   public async restoreDefaultChinaLocale(): Promise<LocaleSyncResult> {
     const cfg = this.configStore.get();
@@ -455,28 +528,63 @@ export class ProbeEngine extends EventEmitter {
         (ipCountry !== null && ipCountry !== DEFAULT_CHINA_REGION_CODE) ||
         (defCountry !== null && defCountry !== DEFAULT_CHINA_REGION_CODE);
 
-      // 第一步：在切回中国时区之前，先强杀受保护进程树，确保目标软件存活期间绝不暴露于中国时区下
+      // 第一步：在切回中国时区之前，先强杀受保护进程树；若有任何目标进程存活，立即中止还原！
       if (
         mismatchWithCurrentEnv &&
         cfg.killProcessesEnabled &&
         cfg.protectedProcessPatterns.length > 0
       ) {
         const killReport = await this.executeProcessKillSafely(cfg.protectedProcessPatterns);
-        if (killReport.totalMatchedPids > 0) {
-          killedProcesses.push(...killReport.matchedSummary);
+        if (killReport.killedCount > 0) {
+          killedProcesses.push(...killReport.killedSummary);
           this.addLog(
             'danger',
-            `还原中国时区前检测到与当前出口/默认地区不一致，已先行强杀进程：${killReport.matchedSummary.join(', ')}`
+            `还原中国时区前检测到地区不一致，已先行强杀进程：${killReport.killedSummary.join(', ')}`
           );
-          if (killReport.accessDenied && killReport.errorDetail) {
-            this.addLog('warn', killReport.errorDetail);
+        }
+
+        if (killReport.failedPids.length > 0) {
+          const abortMsg = `${
+            killReport.errorDetail || '部分受保护进程无法终止'
+          }，已中止还原中国时区以防暴露！`;
+          this.addLog('danger', abortMsg);
+
+          if (cfg.alertPopupEnabled) {
+            const expectedCode = defCountry || ipCountry || DEFAULT_CHINA_REGION_CODE;
+            const expectedName =
+              cfg.defaultCountryName || this.lastProbe?.countryName || expectedCode;
+            this.emit('trigger-alert', {
+              alertType: 'locale-mismatch',
+              expectedCode,
+              expectedName,
+              actualCode: this.lastProbe?.countryCode || null,
+              actualName: this.lastProbe?.countryName || null,
+              actualIp: this.lastProbe?.ip || null,
+              triggerReason: '还原中国时区被安全拦截（受保护进程未能终止）',
+              killedProcesses: killedProcesses.length > 0 ? killedProcesses : undefined,
+              killError: killReport.errorDetail,
+              sysRegionCode: this.winLocale.regionCode,
+              sysRegionName: this.winLocale.regionName,
+              sysTimeZoneDisplay: this.winLocale.timeZoneDisplayName,
+              soundEnabled: cfg.alertSoundEnabled,
+              timestamp: Date.now(),
+            } satisfies AlertPayload);
           }
-          // 留出极短内核句柄回收缓冲后再广播系统时区变更
+
+          return {
+            ok: false,
+            message: abortMsg,
+            killedProcesses,
+            state: this.getSnapshot(),
+          };
+        }
+
+        if (killReport.killedCount > 0) {
           await sleep(80);
         }
       }
 
-      // 第二步：还原 Windows 时区与区域至默认中国状态
+      // 第二步：确认无残留受保护进程后，还原 Windows 时区与区域至默认中国状态
       const applyRes = await applyWindowsTimeZoneAndRegion(
         DEFAULT_CHINA_TIMEZONE_ID,
         DEFAULT_CHINA_REGION_CODE
@@ -503,6 +611,7 @@ export class ProbeEngine extends EventEmitter {
         const expectedCode = defCountry || ipCountry || DEFAULT_CHINA_REGION_CODE;
         const expectedName =
           cfg.defaultCountryName || this.lastProbe?.countryName || expectedCode;
+        this.lastAlertSignature = `locale-mismatch:${expectedCode}`;
         this.emit('trigger-alert', {
           alertType: 'locale-mismatch',
           expectedCode,
@@ -510,7 +619,7 @@ export class ProbeEngine extends EventEmitter {
           actualCode: this.lastProbe?.countryCode || null,
           actualName: this.lastProbe?.countryName || null,
           actualIp: this.lastProbe?.ip || null,
-          triggerReason: '手动还原中国时区（与出口 IP 不一致，已先行强杀进程）',
+          triggerReason: '手动还原中国时区（与保护地区不一致，已先行强杀进程）',
           killedProcesses,
           sysRegionCode: this.winLocale.regionCode,
           sysRegionName: this.winLocale.regionName,
@@ -532,12 +641,29 @@ export class ProbeEngine extends EventEmitter {
     }
   }
 
+  private checkLocaleAlertRecovery(defaultCountryCode: string | null): void {
+    if (
+      defaultCountryCode &&
+      this.status === 'ok' &&
+      this.lastAlertSignature?.startsWith('locale-mismatch:') &&
+      isWindowsLocaleMatchingCountry(
+        this.winLocale.timeZoneId,
+        this.winLocale.regionCode,
+        defaultCountryCode
+      )
+    ) {
+      this.lastAlertSignature = null;
+      this.emitRecoveredAlert();
+    }
+  }
+
   private async executeProcessKillSafely(patterns: string[]): Promise<ProcessKillReport> {
     if (this.isKillingProcesses) {
       return {
-        matchedSummary: [],
-        matchedRawNames: [],
-        totalMatchedPids: 0,
+        killedSummary: [],
+        killedCount: 0,
+        failedSummary: [],
+        failedPids: [],
         accessDenied: false,
       };
     }
@@ -550,82 +676,81 @@ export class ProbeEngine extends EventEmitter {
   }
 
   /**
-   * 后台持续巡检：处于 IP 地区不匹配、断连、或系统时区/区域不匹配期间，若受保护应用被启动则立即强杀
+   * 后台持续巡检：仅当已设置默认保护地区，且处于 IP 地区不符、断连、或系统时区/区域不符期间，拦截受保护进程重开
    */
   private async enforceProcessGuardInBackground(): Promise<void> {
     const cfg = this.configStore.get();
-    if (!cfg.killProcessesEnabled || cfg.protectedProcessPatterns.length === 0) {
-      return;
-    }
-    if (this.status === 'checking') {
+    if (
+      !cfg.defaultCountryCode ||
+      !cfg.killProcessesEnabled ||
+      cfg.protectedProcessPatterns.length === 0 ||
+      this.status === 'checking'
+    ) {
+      this.lastGuardFailSignature = null;
       return;
     }
 
     let unsafeType: 'mismatch' | 'disconnect' | 'locale-mismatch' | null = null;
     let unsafeReason = '';
-    let compareTargetCode: string | null = cfg.defaultCountryCode;
-    let compareTargetName: string | null = cfg.defaultCountryName;
 
-    if (this.status === 'mismatch' && cfg.defaultCountryCode) {
+    if (this.status === 'mismatch') {
       unsafeType = 'mismatch';
       unsafeReason = `出口地区 [${this.lastProbe?.countryName}] 与默认地区 [${cfg.defaultCountryName}] 不符`;
-    } else if (this.status === 'error' && cfg.killOnDisconnect && cfg.defaultCountryCode) {
+    } else if (this.status === 'error' && cfg.killOnDisconnect) {
       unsafeType = 'disconnect';
       unsafeReason = '代理连接异常断开期间禁止运行受保护进程';
-    } else if (cfg.killOnLocaleMismatch) {
-      // 检查系统时区/区域是否与“默认保护地区”或“当前出口 IP 地区”不一致
-      if (
-        cfg.defaultCountryCode &&
-        !isWindowsLocaleMatchingCountry(
-          this.winLocale.timeZoneId,
-          this.winLocale.regionCode,
-          cfg.defaultCountryCode
-        )
-      ) {
-        unsafeType = 'locale-mismatch';
-        compareTargetCode = cfg.defaultCountryCode;
-        compareTargetName = cfg.defaultCountryName;
-        unsafeReason = `系统时区/区域 (${this.winLocale.regionName}) 与默认地区 (${cfg.defaultCountryName}) 不一致`;
-      } else if (
-        this.lastProbe &&
-        this.lastProbe.countryCode !== 'UNKNOWN' &&
-        !isWindowsLocaleMatchingCountry(
-          this.winLocale.timeZoneId,
-          this.winLocale.regionCode,
-          this.lastProbe.countryCode
-        )
-      ) {
-        unsafeType = 'locale-mismatch';
-        compareTargetCode = this.lastProbe.countryCode;
-        compareTargetName = this.lastProbe.countryName;
-        unsafeReason = `系统时区/区域 (${this.winLocale.regionName}) 与当前出口 IP (${this.lastProbe.countryName}) 不一致`;
-      }
+    } else if (
+      cfg.killOnLocaleMismatch &&
+      !isWindowsLocaleMatchingCountry(
+        this.winLocale.timeZoneId,
+        this.winLocale.regionCode,
+        cfg.defaultCountryCode
+      )
+    ) {
+      unsafeType = 'locale-mismatch';
+      unsafeReason = `系统时区/区域 (${this.winLocale.regionName}) 与默认保护地区 (${cfg.defaultCountryName}) 不一致`;
     }
 
     if (!unsafeType) {
+      this.lastGuardFailSignature = null;
       return;
     }
 
     const report = await this.executeProcessKillSafely(cfg.protectedProcessPatterns);
-    if (report.totalMatchedPids === 0) {
+    if (report.killedCount === 0 && report.failedPids.length === 0) {
+      this.lastGuardFailSignature = null;
       return;
     }
 
-    this.addLog(
-      'danger',
-      `已自动强杀进程：${report.matchedSummary.join(', ')} · 原因：${unsafeReason}`
-    );
-    if (report.accessDenied && report.errorDetail) {
+    // 若没有任何新进程被杀，仅存在同一批因权限不足无法终止的存活 PID，抑制每 2 秒重复刷屏弹窗
+    const failSig =
+      report.failedPids.length > 0 ? `${unsafeType}:${report.failedPids.join(',')}` : null;
+    if (report.killedCount === 0 && failSig && failSig === this.lastGuardFailSignature) {
+      return;
+    }
+    this.lastGuardFailSignature = failSig;
+
+    if (report.killedCount > 0) {
+      this.addLog(
+        'danger',
+        `已自动强杀进程：${report.killedSummary.join(', ')} · 原因：${unsafeReason}`
+      );
+    }
+    if (report.errorDetail) {
       this.addLog('warn', report.errorDetail);
     }
     this.emitState();
+
+    if (unsafeType === 'locale-mismatch') {
+      this.lastAlertSignature = `locale-mismatch:${cfg.defaultCountryCode}`;
+    }
 
     if (cfg.alertPopupEnabled) {
       const clash = this.clashMonitor.getRuntimeInfo();
       const payload: AlertPayload = {
         alertType: unsafeType,
-        expectedCode: compareTargetCode,
-        expectedName: compareTargetName,
+        expectedCode: cfg.defaultCountryCode,
+        expectedName: cfg.defaultCountryName,
         actualCode: unsafeType === 'disconnect' ? null : this.lastProbe?.countryCode || null,
         actualName: unsafeType === 'disconnect' ? '连接断开' : this.lastProbe?.countryName || null,
         actualIp: unsafeType === 'disconnect' ? null : this.lastProbe?.ip || null,
@@ -634,7 +759,7 @@ export class ProbeEngine extends EventEmitter {
         activeNode: clash.connected ? clash.activeNode : null,
         triggerReason: unsafeReason,
         errorDetail: unsafeType === 'disconnect' ? this.lastError || undefined : undefined,
-        killedProcesses: report.matchedSummary,
+        killedProcesses: report.killedCount > 0 ? report.killedSummary : undefined,
         killError: report.errorDetail,
         sysRegionCode: this.winLocale.regionCode,
         sysRegionName: this.winLocale.regionName,
@@ -652,28 +777,35 @@ export class ProbeEngine extends EventEmitter {
 
     let killedProcesses: string[] | undefined;
     let killError: string | undefined;
+    let addedLogs = false;
 
     if (cfg.killProcessesEnabled && cfg.protectedProcessPatterns.length > 0) {
       const report = await this.executeProcessKillSafely(cfg.protectedProcessPatterns);
-      if (report.totalMatchedPids > 0) {
-        killedProcesses = report.matchedSummary;
+      if (report.killedCount > 0) {
+        killedProcesses = report.killedSummary;
         this.addLog(
           'danger',
-          `地区变更保护已触发，强杀进程：${report.matchedSummary.join(', ')}`
+          `地区变更保护已触发，强杀进程：${report.killedSummary.join(', ')}`
         );
+        addedLogs = true;
       }
-      if (report.accessDenied && report.errorDetail) {
+      if (report.errorDetail) {
         killError = report.errorDetail;
+        this.lastGuardFailSignature = `mismatch:${report.failedPids.join(',')}`;
         this.addLog('warn', report.errorDetail);
+        addedLogs = true;
       }
+    }
+
+    if (addedLogs) {
+      this.emitState();
     }
 
     const sig = `mismatch:${cfg.defaultCountryCode}->${this.lastProbe.countryCode}`;
     const isSameSig = this.lastAlertSignature === sig;
     this.lastAlertSignature = sig;
 
-    // 如果同一异常状态没有新杀掉进程，则不重复弹窗；若有新强杀进程则必须弹窗告知
-    if (isSameSig && (!killedProcesses || killedProcesses.length === 0)) {
+    if (isSameSig && (!killedProcesses || killedProcesses.length === 0) && !killError) {
       return;
     }
 
@@ -706,6 +838,7 @@ export class ProbeEngine extends EventEmitter {
 
     let killedProcesses: string[] | undefined;
     let killError: string | undefined;
+    let addedLogs = false;
 
     if (
       cfg.killProcessesEnabled &&
@@ -713,17 +846,24 @@ export class ProbeEngine extends EventEmitter {
       cfg.protectedProcessPatterns.length > 0
     ) {
       const report = await this.executeProcessKillSafely(cfg.protectedProcessPatterns);
-      if (report.totalMatchedPids > 0) {
-        killedProcesses = report.matchedSummary;
+      if (report.killedCount > 0) {
+        killedProcesses = report.killedSummary;
         this.addLog(
           'danger',
-          `代理断连保护已触发，强杀进程：${report.matchedSummary.join(', ')}`
+          `代理断连保护已触发，强杀进程：${report.killedSummary.join(', ')}`
         );
+        addedLogs = true;
       }
-      if (report.accessDenied && report.errorDetail) {
+      if (report.errorDetail) {
         killError = report.errorDetail;
+        this.lastGuardFailSignature = `disconnect:${report.failedPids.join(',')}`;
         this.addLog('warn', report.errorDetail);
+        addedLogs = true;
       }
+    }
+
+    if (addedLogs) {
+      this.emitState();
     }
 
     if (!cfg.alertOnDisconnect) return;
@@ -732,7 +872,7 @@ export class ProbeEngine extends EventEmitter {
     const isSameSig = this.lastAlertSignature === sig;
     this.lastAlertSignature = sig;
 
-    if (isSameSig && (!killedProcesses || killedProcesses.length === 0)) {
+    if (isSameSig && (!killedProcesses || killedProcesses.length === 0) && !killError) {
       return;
     }
 
@@ -746,7 +886,6 @@ export class ProbeEngine extends EventEmitter {
       actualCode: null,
       actualName: '连接断开',
       actualIp: null,
-      viaChannel: undefined,
       activeNode: clash.connected ? clash.activeNode : null,
       triggerReason: reason,
       errorDetail: errDetail,
@@ -803,16 +942,16 @@ export class ProbeEngine extends EventEmitter {
 
     if (cfg.proxyMode === 'manual') {
       const scheme = cfg.manualProxy.protocol === 'socks5' ? 'socks5h' : 'http';
-      const proxyUrl = `${scheme}://${cfg.manualProxy.host}:${cfg.manualProxy.port}`;
+      const formattedHost = formatHostForUrl(cfg.manualProxy.host);
+      const proxyUrl = `${scheme}://${formattedHost}:${cfg.manualProxy.port}`;
       return {
         proxyUrl,
-        description: `手动端口 (${cfg.manualProxy.protocol.toUpperCase()} ${cfg.manualProxy.host}:${cfg.manualProxy.port})`,
+        description: `手动端口 (${cfg.manualProxy.protocol.toUpperCase()} ${formattedHost}:${cfg.manualProxy.port})`,
       };
     }
 
-    // auto 模式：1) 优先读取系统代理 -> 2) 其次读取本机运行中的 Clash mixed-port -> 3) 回退到 TUN / 网卡直连
-    const sys = await readWindowsSystemProxy();
-    this.systemProxyUrl = sys.proxyUrl;
+    // auto 模式：严格遵循操作系统实际全局出口（系统代理优先，系统代理关闭时走默认网卡路由检测 TUN / 直连，绝不借道闲置本地端口造成漏报）
+    const sys = await this.getSystemProxyFresh(false);
     if (sys.enabled && sys.proxyUrl) {
       const cleanAddr = sys.proxyUrl.replace(/^[a-z0-9+.-]+:\/\//i, '');
       return {
@@ -821,30 +960,9 @@ export class ProbeEngine extends EventEmitter {
       };
     }
 
-    const clash = this.clashMonitor.getRuntimeInfo();
-    if (clash.connected && clash.mixedPort) {
-      const alive = await canConnectLocalPort('127.0.0.1', clash.mixedPort, 400);
-      if (alive) {
-        return {
-          proxyUrl: `http://127.0.0.1:${clash.mixedPort}`,
-          description: `Clash 端口 (127.0.0.1:${clash.mixedPort})`,
-        };
-      }
-    }
-
-    for (const candidatePort of [7897, 7890, 10809]) {
-      const alive = await canConnectLocalPort('127.0.0.1', candidatePort, 250);
-      if (alive) {
-        return {
-          proxyUrl: `http://127.0.0.1:${candidatePort}`,
-          description: `自动发现本地端口 (127.0.0.1:${candidatePort})`,
-        };
-      }
-    }
-
     return {
       proxyUrl: null,
-      description: '自动 (TUN 虚拟网卡 / 本机直连)',
+      description: '本机默认路由 (TUN / 直连)',
     };
   }
 
@@ -875,7 +993,7 @@ function parseTraceResponse(
   format: 'cf-trace' | 'plain-ip'
 ): { ip: string | null; loc?: string } {
   const text = raw.trim();
-  if (format === 'cf-trace' || text.includes('ip=')) {
+  if (format === 'cf-trace' || /^ip=/m.test(text)) {
     let ip: string | null = null;
     let loc: string | undefined;
     for (const line of text.split(/\r?\n/)) {
@@ -908,85 +1026,6 @@ function parseTraceResponse(
     }
   }
   return { ip: null };
-}
-
-function fetchViaProxy(
-  targetUrl: string,
-  proxyUrl: string | null,
-  timeoutMs: number
-): Promise<string> {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(targetUrl);
-    const isHttps = parsedUrl.protocol === 'https:';
-
-    let agent: http.Agent | undefined;
-    if (proxyUrl) {
-      if (proxyUrl.startsWith('socks')) {
-        agent = new SocksProxyAgent(proxyUrl, { keepAlive: false, timeout: timeoutMs });
-      } else {
-        agent = new HttpsProxyAgent(proxyUrl, { keepAlive: false, timeout: timeoutMs });
-      }
-    } else {
-      agent = isHttps
-        ? new https.Agent({ keepAlive: false, timeout: timeoutMs })
-        : new http.Agent({ keepAlive: false, timeout: timeoutMs });
-    }
-
-    const transport = isHttps ? https : http;
-    const req = transport.request(
-      parsedUrl,
-      {
-        method: 'GET',
-        agent,
-        timeout: timeoutMs,
-        headers: {
-          'User-Agent': 'curl/8.7.1',
-          Accept: 'text/plain, */*',
-          'Cache-Control': 'no-cache',
-          Connection: 'close',
-        },
-      },
-      (res) => {
-        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-          res.resume();
-          reject(new Error(`HTTP 状态码 ${res.statusCode}`));
-          return;
-        }
-        const chunks: Buffer[] = [];
-        res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
-        res.on('end', () => {
-          resolve(Buffer.concat(chunks).toString('utf-8'));
-        });
-      }
-    );
-
-    req.on('timeout', () => {
-      req.destroy(new Error('连接超时'));
-    });
-
-    req.on('error', (err) => {
-      reject(err);
-    });
-
-    req.end();
-  });
-}
-
-function canConnectLocalPort(host: string, port: number, timeoutMs: number): Promise<boolean> {
-  return new Promise((resolve) => {
-    const socket = net.createConnection({ host, port });
-    let settled = false;
-    const finish = (ok: boolean) => {
-      if (settled) return;
-      settled = true;
-      socket.destroy();
-      resolve(ok);
-    };
-    socket.setTimeout(timeoutMs);
-    socket.on('connect', () => finish(true));
-    socket.on('timeout', () => finish(false));
-    socket.on('error', () => finish(false));
-  });
 }
 
 function simplifyNetworkError(errMsg: string, channelDesc: string): string {

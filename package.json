@@ -13,21 +13,17 @@
   "dependencies": {
     "@ip-location-db/geolite2-country-mmdb": "^2.3.0",
     "https-proxy-agent": "^7.0.6",
-    "js-yaml": "^4.1.0",
     "lucide-react": "^0.468.0",
     "maxmind": "^4.3.22",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
-    "socks-proxy-agent": "^8.0.5",
-    "ws": "^8.18.0"
+    "socks-proxy-agent": "^8.0.5"
   },
   "devDependencies": {
     "@electron/asar": "^4.3.1",
-    "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.10.0",
     "@types/react": "^18.3.12",
     "@types/react-dom": "^18.3.1",
-    "@types/ws": "^8.5.13",
     "@vitejs/plugin-react": "^4.3.4",
     "electron": "^33.2.1",
     "esbuild": "^0.24.0",

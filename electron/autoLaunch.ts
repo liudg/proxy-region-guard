@@ -5,28 +5,25 @@ export const AUTOSTART_ARG = '--autostart';
 const REGISTRY_VALUE_NAME = 'ProxyRegionGuard';
 
 interface LaunchTarget {
-  rawExecPath: string;
-  quotedExecPath: string;
+  execPath: string;
   args: string[];
 }
 
 function getLaunchTarget(): LaunchTarget {
-  const rawExecPath = process.execPath;
-  const quotedExecPath = `"${rawExecPath}"`;
+  const execPath = process.execPath;
 
   if (app.isPackaged) {
     return {
-      rawExecPath,
-      quotedExecPath,
+      execPath,
       args: [AUTOSTART_ARG],
     };
   }
 
   const appDir = path.resolve(app.getAppPath());
+  const formattedDir = appDir.includes(' ') ? `"${appDir}"` : appDir;
   return {
-    rawExecPath,
-    quotedExecPath,
-    args: [`"${appDir}"`, AUTOSTART_ARG],
+    execPath,
+    args: [formattedDir, AUTOSTART_ARG],
   };
 }
 
@@ -47,7 +44,7 @@ export function applyAutoLaunchSetting(enable: boolean): boolean {
           openAtLogin: true,
           enabled: true,
           name: REGISTRY_VALUE_NAME,
-          path: target.quotedExecPath,
+          path: target.execPath,
           args: target.args,
         });
       } else {
@@ -64,7 +61,7 @@ export function applyAutoLaunchSetting(enable: boolean): boolean {
     return Boolean(app.getLoginItemSettings().openAtLogin);
   } catch (err) {
     console.error('[AutoLaunch] Failed to apply login item settings:', err);
-    return enable;
+    return readSystemAutoLaunchEnabled();
   }
 }
 
@@ -77,7 +74,7 @@ export function readSystemAutoLaunchEnabled(): boolean {
     if (process.platform === 'win32') {
       const target = getLaunchTarget();
       const info = app.getLoginItemSettings({
-        path: target.rawExecPath,
+        path: target.execPath,
         args: target.args,
       });
       const byName = info.launchItems?.find((item) => item.name === REGISTRY_VALUE_NAME);
@@ -103,7 +100,7 @@ export function reconcileAutoLaunchOnStartup(configuredAutoLaunch: boolean): boo
     if (process.platform === 'win32') {
       const target = getLaunchTarget();
       const info = app.getLoginItemSettings({
-        path: target.rawExecPath,
+        path: target.execPath,
         args: target.args,
       });
       const byName = info.launchItems?.find((item) => item.name === REGISTRY_VALUE_NAME);
@@ -113,13 +110,9 @@ export function reconcileAutoLaunchOnStartup(configuredAutoLaunch: boolean): boo
         return false;
       }
 
-      if (configuredAutoLaunch) {
+      if (configuredAutoLaunch || (byName && byName.enabled)) {
         // 重新写入一次以同步便携版移动目录后的最新可执行文件路径
         return applyAutoLaunchSetting(true);
-      }
-
-      if (byName && byName.enabled) {
-        return true;
       }
 
       return false;
@@ -131,6 +124,6 @@ export function reconcileAutoLaunchOnStartup(configuredAutoLaunch: boolean): boo
     return Boolean(app.getLoginItemSettings().openAtLogin);
   } catch (err) {
     console.error('[AutoLaunch] Failed to reconcile auto launch:', err);
-    return configuredAutoLaunch;
+    return false;
   }
 }

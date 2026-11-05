@@ -17,12 +17,6 @@ export interface AppConfig {
     host: string;
     port: number;
   };
-  clashAutoDetect: boolean;
-  clashCustomController: {
-    host: string;
-    port: number;
-    secret: string;
-  };
   heartbeatIntervalSec: number; // 0 = 仅事件触发, >0 = 心跳秒数
   customProbeUrl: string;
   alertPopupEnabled: boolean;
@@ -34,7 +28,7 @@ export interface AppConfig {
   // 进程守护配置
   killProcessesEnabled: boolean;       // 总开关：异常时自动强杀配置的进程
   killOnDisconnect: boolean;           // 代理断连/超时同样强杀进程
-  killOnLocaleMismatch: boolean;       // 系统时区/区域与默认或出口地区不一致时同样强杀进程
+  killOnLocaleMismatch: boolean;       // 系统时区/区域与默认保护地区不一致时同样强杀进程
   protectedProcessPatterns: string[];  // 手动输入的进程匹配规则列表（支持通配符如 claude*.exe 与正则）
 }
 
@@ -43,15 +37,13 @@ export interface WindowsLocaleState {
   timeZoneDisplayName: string;  // 例如 "(UTC+08:00) 北京，重庆，香港特别行政区，乌鲁木齐"
   regionCode: string;           // 例如 "CN", "US"
   regionName: string;           // 例如 "中国", "美国"
-  geoId: string;                // 例如 "45", "244"
 }
 
 export interface ClashRuntimeInfo {
   connected: boolean;
-  source: string;         // 例如: "Clash Verge (Named Pipe)" 或 "127.0.0.1:9097"
+  source: string;         // 例如: "Clash Verge (Pipe)" 或 "Clash (127.0.0.1:9097)"
   mode: string;           // rule / global / direct
   mixedPort: number | null;
-  activeGroup: string | null;
   activeNode: string | null;
   nodeChain: string[];    // 完整节点选择链，如 ["节点选择", "自动选择", "🇺🇸 美国 01"]
 }
@@ -62,7 +54,6 @@ export interface ProbeResult {
   countryName: string;    // 中文名称，如 "美国"
   edgeLoc?: string;       // Cloudflare Trace 边缘路由位置（用于辅助识别广播 IP）
   viaChannel: string;     // 本次检测实际使用的通道说明
-  probeSource: string;    // 命中的基础设施回显源，如 "Cloudflare Trace"
   latencyMs: number;
   checkedAt: number;
 }
@@ -103,9 +94,7 @@ export interface AppStateSnapshot {
   winLocale: WindowsLocaleState;
   lastProbe: ProbeResult | null;
   lastError: string | null;
-  lastTriggerReason: string;
   clashInfo: ClashRuntimeInfo;
-  systemProxyUrl: string | null;
   geoDbSource: string;
   logs: GuardEventLog[];
 }

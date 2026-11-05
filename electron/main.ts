@@ -8,6 +8,7 @@ import {
 } from 'electron';
 import * as path from 'node:path';
 import { AlertPayload, AppConfig, AppStateSnapshot } from '../src/shared/types';
+import { isValidIsoCountryCode } from '../src/shared/countries';
 import { ConfigStore } from './configStore';
 import { GeoIpService } from './geoipService';
 import { ClashMonitor } from './clashMonitor';
@@ -27,6 +28,7 @@ let mainWindow: BrowserWindow | null = null;
 let alertWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
+let isBootstrapped = false;
 
 let configStore!: ConfigStore;
 let geoIpService!: GeoIpService;
@@ -35,15 +37,10 @@ let probeEngine!: ProbeEngine;
 
 let latestAlertPayload: AlertPayload | null = null;
 let alertAutoCloseTimer: NodeJS.Timeout | null = null;
-
-const gotTheLock = app.requestSingleInstanceLock();
-if (!gotTheLock) {
-  app.quit();
-} else {
-  app.on('second-instance', () => {
-    showMainWindow();
-  });
-}
+let alertLoadHooked = false;
+let alertUserDragged = false;
+let suppressAlertMoveTrack = false;
+let lastTrayMenuSignature = '';
 
 function getPreloadPath(): string {
   return path.join(__dirname, 'preload.js');
@@ -79,14 +76,23 @@ function createMainWindow(revealOnReady = true): void {
       preload: getPreloadPath(),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
   });
 
   loadRendererRoute(mainWindow);
 
   if (revealOnReady) {
+    let revealed = false;
+    let fallbackTimer: NodeJS.Timeout | null = null;
+
     const reveal = () => {
+      if (revealed) return;
+      revealed = true;
+      if (fallbackTimer) {
+        clearTimeout(fallbackTimer);
+        fallbackTimer = null;
+      }
       if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
         mainWindow.show();
         mainWindow.focus();
@@ -94,11 +100,11 @@ function createMainWindow(revealOnReady = true): void {
     };
 
     mainWindow.once('ready-to-show', reveal);
-    setTimeout(reveal, 600);
+    fallbackTimer = setTimeout(reveal, 600);
   }
 
   mainWindow.on('close', (e) => {
-    if (!isQuitting && configStore.get().closeToTray) {
+    if (!isQuitting && configStore?.get().closeToTray) {
       e.preventDefault();
       mainWindow?.hide();
     }
@@ -110,6 +116,7 @@ function createMainWindow(revealOnReady = true): void {
 }
 
 function showMainWindow(): void {
+  if (!isBootstrapped) return;
   if (!mainWindow || mainWindow.isDestroyed()) {
     createMainWindow();
     return;
@@ -121,11 +128,39 @@ function showMainWindow(): void {
   mainWindow.focus();
 }
 
+function hideAlertWindow(): void {
+  alertUserDragged = false;
+  if (alertWindow && !alertWindow.isDestroyed()) {
+    alertWindow.hide();
+  }
+}
+
+function resizeAlertWindow(win: BrowserWindow, width: number, height: number): void {
+  const [curW, curH] = win.getSize();
+  if (curW === width && curH === height) return;
+  // Windows 下 resizable: false 窗口需临时解锁再改尺寸方可生效
+  suppressAlertMoveTrack = true;
+  win.setResizable(true);
+  win.setSize(width, height, false);
+  win.setResizable(false);
+  suppressAlertMoveTrack = false;
+}
+
+function computeAlertWindowHeight(payload: AlertPayload): number {
+  const hasKilled = Boolean(payload.killedProcesses && payload.killedProcesses.length > 0);
+  const hasErr = Boolean(payload.killError);
+  if (hasKilled && hasErr) return 356;
+  if (hasKilled || hasErr) return 318;
+  return 276;
+}
+
 function ensureAlertWindow(): BrowserWindow {
   if (alertWindow && !alertWindow.isDestroyed()) {
-    positionAlertWindow(alertWindow);
     return alertWindow;
   }
+
+  alertLoadHooked = false;
+  alertUserDragged = false;
 
   alertWindow = new BrowserWindow({
     width: 420,
@@ -145,7 +180,7 @@ function ensureAlertWindow(): BrowserWindow {
       preload: getPreloadPath(),
       contextIsolation: true,
       nodeIntegration: false,
-      sandbox: false,
+      sandbox: true,
     },
   });
 
@@ -153,8 +188,16 @@ function ensureAlertWindow(): BrowserWindow {
   positionAlertWindow(alertWindow);
   loadRendererRoute(alertWindow, 'alert');
 
+  alertWindow.on('move', () => {
+    if (!suppressAlertMoveTrack && alertWindow?.isVisible()) {
+      alertUserDragged = true;
+    }
+  });
+
   alertWindow.on('closed', () => {
     alertWindow = null;
+    alertLoadHooked = false;
+    alertUserDragged = false;
   });
 
   return alertWindow;
@@ -167,7 +210,9 @@ function positionAlertWindow(win: BrowserWindow): void {
   const margin = 18;
   const x = Math.round(workArea.x + workArea.width - w - margin);
   const y = Math.round(workArea.y + workArea.height - h - margin);
+  suppressAlertMoveTrack = true;
   win.setPosition(x, y, false);
+  suppressAlertMoveTrack = false;
 }
 
 function showCustomAlertPopup(payload: AlertPayload): void {
@@ -179,27 +224,31 @@ function showCustomAlertPopup(payload: AlertPayload): void {
   latestAlertPayload = payload;
   const win = ensureAlertWindow();
 
-  const hasKilledInfo =
-    Boolean(payload.killedProcesses && payload.killedProcesses.length > 0) ||
-    Boolean(payload.killError);
-  const targetHeight = hasKilledInfo ? 318 : 276;
+  const flushLatestAlert = () => {
+    alertLoadHooked = false;
+    if (win.isDestroyed() || !latestAlertPayload) return;
 
-  const sendAndShow = () => {
-    if (win.isDestroyed()) return;
-    win.setSize(420, targetHeight, false);
-    positionAlertWindow(win);
+    const currentPayload = latestAlertPayload;
+    const wasVisible = win.isVisible();
+    resizeAlertWindow(win, 420, computeAlertWindowHeight(currentPayload));
+    if (!wasVisible || !alertUserDragged) {
+      positionAlertWindow(win);
+    }
     win.setAlwaysOnTop(true, 'screen-saver');
-    win.webContents.send('guard:alert-data', payload);
-    if (!win.isVisible()) {
+    win.webContents.send('guard:alert-data', currentPayload);
+    if (!wasVisible) {
       // showInactive 既能强置顶浮现，又不会抢夺用户正在输入的键盘焦点
       win.showInactive();
     }
   };
 
   if (win.webContents.isLoading()) {
-    win.webContents.once('did-finish-load', sendAndShow);
+    if (!alertLoadHooked) {
+      alertLoadHooked = true;
+      win.webContents.once('did-finish-load', flushLatestAlert);
+    }
   } else {
-    sendAndShow();
+    flushLatestAlert();
   }
 }
 
@@ -208,22 +257,22 @@ function notifyAlertRecovered(payload: AlertPayload): void {
     return;
   }
   latestAlertPayload = payload;
-  alertWindow.setSize(420, 276, false);
-  positionAlertWindow(alertWindow);
+  resizeAlertWindow(alertWindow, 420, 276);
+  if (!alertUserDragged) {
+    positionAlertWindow(alertWindow);
+  }
   alertWindow.webContents.send('guard:alert-data', payload);
 
   if (alertAutoCloseTimer) {
     clearTimeout(alertAutoCloseTimer);
   }
   alertAutoCloseTimer = setTimeout(() => {
-    if (alertWindow && !alertWindow.isDestroyed()) {
-      alertWindow.hide();
-    }
+    hideAlertWindow();
   }, 2200);
 }
 
 function setupTray(): void {
-  const initialIcon = createStatusTrayIcon('checking', 32);
+  const initialIcon = createStatusTrayIcon('checking');
   tray = new Tray(initialIcon);
   tray.setToolTip('代理地区卫士 · 正在初始化...');
 
@@ -245,7 +294,7 @@ function setupTray(): void {
 function refreshTrayFromState(state: AppStateSnapshot): void {
   if (!tray) return;
 
-  const icon = createStatusTrayIcon(state.status, 32);
+  const icon = createStatusTrayIcon(state.status);
   tray.setImage(icon);
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.setIcon(createWindowAppIcon(state.status));
@@ -272,12 +321,34 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     `当前出口: ${curText}`,
     `默认地区: ${defText}`,
     `系统区域: ${state.winLocale.regionName} (${state.winLocale.regionCode})`,
-    state.clashInfo.connected ? `Clash节点: ${state.clashInfo.activeNode || state.clashInfo.mode}` : '',
+    state.clashInfo.connected
+      ? `Clash节点: ${state.clashInfo.activeNode || state.clashInfo.mode}`
+      : '',
   ]
     .filter(Boolean)
     .join('\n');
 
   tray.setToolTip(tooltip);
+
+  const canSetCurrentDefault = Boolean(
+    state.lastProbe && isValidIsoCountryCode(state.lastProbe.countryCode)
+  );
+
+  // 仅当菜单展示项实际发生变化时才重建原生菜单，避免心跳切换 isChecking 期间关闭用户已打开的右键菜单
+  const menuSig = [
+    state.status,
+    curText,
+    defText,
+    state.winLocale.regionName,
+    canSetCurrentDefault ? state.lastProbe?.countryCode : '',
+    state.isSyncingLocale ? '1' : '0',
+    state.config.autoLaunch ? '1' : '0',
+  ].join('|');
+
+  if (menuSig === lastTrayMenuSignature) {
+    return;
+  }
+  lastTrayMenuSignature = menuSig;
 
   const menu = Menu.buildFromTemplate([
     {
@@ -304,15 +375,17 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       },
     },
     {
-      label: state.lastProbe
-        ? `将当前 [${state.lastProbe.countryName}] 设为默认`
-        : '将当前地区设为默认',
-      enabled: Boolean(state.lastProbe),
+      label:
+        canSetCurrentDefault && state.lastProbe
+          ? `将当前 [${state.lastProbe.countryName}] 设为默认`
+          : '将当前地区设为默认',
+      enabled: canSetCurrentDefault,
       click: () => {
-        if (state.lastProbe) {
+        const snap = probeEngine.getSnapshot();
+        if (snap.lastProbe && isValidIsoCountryCode(snap.lastProbe.countryCode)) {
           configStore.update({
-            defaultCountryCode: state.lastProbe.countryCode,
-            defaultCountryName: state.lastProbe.countryName,
+            defaultCountryCode: snap.lastProbe.countryCode,
+            defaultCountryName: snap.lastProbe.countryName,
           });
           probeEngine.evaluateStatusOnly('通过托盘将当前地区设为默认');
         }
@@ -379,7 +452,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('guard:set-default-current', () => {
     const snap = probeEngine.getSnapshot();
-    if (snap.lastProbe && snap.lastProbe.countryCode !== 'UNKNOWN') {
+    if (snap.lastProbe && isValidIsoCountryCode(snap.lastProbe.countryCode)) {
       configStore.update({
         defaultCountryCode: snap.lastProbe.countryCode,
         defaultCountryName: snap.lastProbe.countryName,
@@ -413,16 +486,6 @@ function registerIpcHandlers(): void {
       probeEngine.restartHeartbeatTimer();
     }
 
-    const clashCfgChanged =
-      prevCfg.clashAutoDetect !== nextCfg.clashAutoDetect ||
-      prevCfg.clashCustomController.host !== nextCfg.clashCustomController.host ||
-      prevCfg.clashCustomController.port !== nextCfg.clashCustomController.port ||
-      prevCfg.clashCustomController.secret !== nextCfg.clashCustomController.secret;
-
-    if (clashCfgChanged) {
-      await clashMonitor.forceReconnect();
-    }
-
     const proxyCfgChanged =
       prevCfg.proxyMode !== nextCfg.proxyMode ||
       prevCfg.manualProxy.protocol !== nextCfg.manualProxy.protocol ||
@@ -447,7 +510,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('guard:accept-current-from-alert', () => {
     const snap = probeEngine.getSnapshot();
-    if (snap.lastProbe && snap.lastProbe.countryCode !== 'UNKNOWN') {
+    if (snap.lastProbe && isValidIsoCountryCode(snap.lastProbe.countryCode)) {
       configStore.update({
         defaultCountryCode: snap.lastProbe.countryCode,
         defaultCountryName: snap.lastProbe.countryName,
@@ -456,9 +519,7 @@ function registerIpcHandlers(): void {
         `已在警告窗确认将 [${snap.lastProbe.countryName}] 设为新默认地区`
       );
     }
-    if (alertWindow && !alertWindow.isDestroyed()) {
-      alertWindow.hide();
-    }
+    hideAlertWindow();
   });
 
   ipcMain.on('window:minimize-main', () => {
@@ -475,57 +536,64 @@ function registerIpcHandlers(): void {
   });
 
   ipcMain.on('window:open-main-from-alert', () => {
-    if (alertWindow && !alertWindow.isDestroyed()) {
-      alertWindow.hide();
-    }
+    hideAlertWindow();
     showMainWindow();
   });
 
   ipcMain.on('window:dismiss-alert', () => {
-    if (alertWindow && !alertWindow.isDestroyed()) {
-      alertWindow.hide();
-    }
+    hideAlertWindow();
   });
 }
 
-app.whenReady().then(async () => {
-  const appRoot = app.getAppPath();
-
-  configStore = new ConfigStore();
-  const initialCfg = configStore.get();
-  const effectiveAutoLaunch = reconcileAutoLaunchOnStartup(initialCfg.autoLaunch);
-  if (effectiveAutoLaunch !== initialCfg.autoLaunch) {
-    configStore.update({ autoLaunch: effectiveAutoLaunch });
-  }
-
-  geoIpService = new GeoIpService();
-  await geoIpService.init(appRoot);
-
-  clashMonitor = new ClashMonitor(() => configStore.get());
-  probeEngine = new ProbeEngine(configStore, geoIpService, clashMonitor);
-
-  probeEngine.on('state-changed', (state: AppStateSnapshot) => {
-    broadcastState(state);
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    showMainWindow();
   });
 
-  probeEngine.on('trigger-alert', (payload: AlertPayload) => {
-    showCustomAlertPopup(payload);
+  app.whenReady().then(async () => {
+    const appRoot = app.getAppPath();
+
+    configStore = new ConfigStore();
+    const initialCfg = configStore.get();
+    const effectiveAutoLaunch = reconcileAutoLaunchOnStartup(initialCfg.autoLaunch);
+    if (effectiveAutoLaunch !== initialCfg.autoLaunch) {
+      configStore.update({ autoLaunch: effectiveAutoLaunch });
+    }
+
+    geoIpService = new GeoIpService();
+    await geoIpService.init(appRoot);
+
+    clashMonitor = new ClashMonitor();
+    probeEngine = new ProbeEngine(configStore, geoIpService, clashMonitor);
+
+    probeEngine.on('state-changed', (state: AppStateSnapshot) => {
+      broadcastState(state);
+    });
+
+    probeEngine.on('trigger-alert', (payload: AlertPayload) => {
+      showCustomAlertPopup(payload);
+    });
+
+    probeEngine.on('alert-recovered', (payload: AlertPayload) => {
+      notifyAlertRecovered(payload);
+    });
+
+    registerIpcHandlers();
+    isBootstrapped = true;
+
+    const startHiddenInTray = isLaunchedFromAutoStart() && configStore.get().closeToTray;
+    createMainWindow(!startHiddenInTray);
+    setupTray();
+
+    // 预先后台初始化隐藏警告窗，使首次告警实现瞬时弹出
+    ensureAlertWindow();
+
+    await probeEngine.start();
   });
-
-  probeEngine.on('alert-recovered', (payload: AlertPayload) => {
-    notifyAlertRecovered(payload);
-  });
-
-  registerIpcHandlers();
-  const startHiddenInTray = isLaunchedFromAutoStart() && configStore.get().closeToTray;
-  createMainWindow(!startHiddenInTray);
-  setupTray();
-
-  // 预先后台初始化隐藏警告窗，使首次告警实现 0ms 瞬时弹出
-  ensureAlertWindow();
-
-  await probeEngine.start();
-});
+}
 
 app.on('before-quit', () => {
   isQuitting = true;

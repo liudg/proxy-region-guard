@@ -10,19 +10,36 @@ import {
   X,
 } from 'lucide-react';
 import { AlertPayload } from '../shared/types';
+import { isValidIsoCountryCode } from '../shared/countries';
 import { CountryFlag } from './CountryFlag';
+
+let sharedAudioCtx: AudioContext | null = null;
+
+function getSharedAudioContext(): AudioContext | null {
+  if (sharedAudioCtx && sharedAudioCtx.state !== 'closed') {
+    return sharedAudioCtx;
+  }
+  const AudioCtx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) return null;
+  sharedAudioCtx = new AudioCtx();
+  return sharedAudioCtx;
+}
 
 function playAlertChime(type: AlertPayload['alertType']): void {
   if (type === 'recovered') return;
   try {
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const ctx = new AudioCtx();
-    const now = ctx.currentTime;
+    const ctx = getSharedAudioContext();
+    if (!ctx) return;
+    if (ctx.state === 'suspended') {
+      void ctx.resume();
+    }
 
+    const now = ctx.currentTime;
     const notes =
       type === 'mismatch' || type === 'locale-mismatch' ? [880, 622.25, 880] : [660, 440];
+
     notes.forEach((freq, idx) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
@@ -35,6 +52,10 @@ function playAlertChime(type: AlertPayload['alertType']): void {
 
       osc.connect(gain);
       gain.connect(ctx.destination);
+      osc.onended = () => {
+        osc.disconnect();
+        gain.disconnect();
+      };
       osc.start(now + idx * 0.14);
       osc.stop(now + idx * 0.14 + 0.13);
     });
@@ -45,28 +66,37 @@ function playAlertChime(type: AlertPayload['alertType']): void {
 
 export const AlertPopup: React.FC = () => {
   const [payload, setPayload] = useState<AlertPayload | null>(null);
+  const latestRenderedTsRef = useRef<number>(0);
   const lastSoundTsRef = useRef<number>(0);
 
   useEffect(() => {
-    void window.guardAPI.getAlertData().then((initial) => {
-      if (initial) {
-        setPayload(initial);
+    const applyAlert = (nextPayload: AlertPayload) => {
+      if (nextPayload.timestamp < latestRenderedTsRef.current) {
+        return;
       }
-    });
-
-    const unsub = window.guardAPI.onAlertData((nextPayload) => {
+      latestRenderedTsRef.current = nextPayload.timestamp;
       setPayload(nextPayload);
       if (nextPayload.soundEnabled && nextPayload.timestamp !== lastSoundTsRef.current) {
         lastSoundTsRef.current = nextPayload.timestamp;
         playAlertChime(nextPayload.alertType);
       }
+    };
+
+    void window.guardAPI.getAlertData().then((initial) => {
+      if (initial) {
+        applyAlert(initial);
+      }
+    });
+
+    const unsub = window.guardAPI.onAlertData((nextPayload) => {
+      applyAlert(nextPayload);
     });
 
     return unsub;
   }, []);
 
   if (!payload) {
-    return <div className="alert-shell-empty" />;
+    return null;
   }
 
   const isRecovered = payload.alertType === 'recovered';
@@ -132,8 +162,8 @@ export const AlertPopup: React.FC = () => {
           </div>
         ) : isLocaleMismatch ? (
           <div className="alert-compare-grid">
-            <div className="compare-box expected">
-              <span className="compare-label">保护/出口地区</span>
+            <div className="compare-box">
+              <span className="compare-label">默认保护地区</span>
               <div className="compare-region-main">
                 <CountryFlag code={payload.expectedCode} size="md" />
                 <div className="compare-region-text">
@@ -162,7 +192,7 @@ export const AlertPopup: React.FC = () => {
           </div>
         ) : (
           <div className="alert-compare-grid">
-            <div className="compare-box expected">
+            <div className="compare-box">
               <span className="compare-label">期望默认地区</span>
               <div className="compare-region-main">
                 <CountryFlag code={payload.expectedCode} size="md" />
@@ -236,8 +266,7 @@ export const AlertPopup: React.FC = () => {
         {!isRecovered &&
           !isDisconnect &&
           !isLocaleMismatch &&
-          payload.actualCode &&
-          payload.actualCode !== 'UNKNOWN' && (
+          isValidIsoCountryCode(payload.actualCode) && (
             <button
               className="btn-alert-secondary"
               onClick={() => void window.guardAPI.acceptCurrentAsDefaultFromAlert()}

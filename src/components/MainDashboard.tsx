@@ -26,7 +26,7 @@ import {
   X,
 } from 'lucide-react';
 import { AppConfig, AppStateSnapshot } from '../shared/types';
-import { COMMON_COUNTRIES } from '../shared/countries';
+import { COMMON_COUNTRIES, isValidIsoCountryCode } from '../shared/countries';
 import { inspectProcessPattern } from '../shared/processPattern';
 import {
   DEFAULT_CHINA_REGION_CODE,
@@ -42,11 +42,14 @@ export const MainDashboard: React.FC = () => {
   const [activeTab, setActiveTab] = useState<ActiveTab>('monitor');
   const [copiedIp, setCopiedIp] = useState(false);
 
-  // 手动代理表单本地编辑态
+  // 手动代理表单本地编辑态（点击单选框时先展开表单，点“启用并重测”才真正提交，避免用旧端口误触发断连强杀）
+  const [pendingManualMode, setPendingManualMode] = useState(false);
   const [manualProto, setManualProto] = useState<'http' | 'socks5'>('http');
   const [manualHost, setManualHost] = useState('127.0.0.1');
   const [manualPort, setManualPort] = useState('7890');
+
   const [customProbe, setCustomProbe] = useState('');
+  const [probeUrlErr, setProbeUrlErr] = useState<string | null>(null);
 
   // 进程匹配规则输入态
   const [patternInput, setPatternInput] = useState('');
@@ -99,6 +102,8 @@ export const MainDashboard: React.FC = () => {
     logs,
   } = state;
 
+  const displayedProxyMode = pendingManualMode ? 'manual' : config.proxyMode;
+
   const handleCopyIp = () => {
     if (!lastProbe?.ip) return;
     void navigator.clipboard.writeText(lastProbe.ip);
@@ -106,14 +111,25 @@ export const MainDashboard: React.FC = () => {
     setTimeout(() => setCopiedIp(false), 1600);
   };
 
+  const handleSwitchNonManualMode = async (mode: 'auto' | 'direct') => {
+    setPendingManualMode(false);
+    if (config.proxyMode === mode) return;
+    const next = await window.guardAPI.updateConfig({ proxyMode: mode });
+    setState(next);
+  };
+
   const handleSaveManualProxy = async () => {
-    const portNum = Math.max(1, Math.min(65535, Number(manualPort) || 7890));
+    const cleanHost = manualHost.trim() || '127.0.0.1';
+    const portNum = Math.max(1, Math.min(65535, Math.round(Number(manualPort) || 7890)));
+    setManualHost(cleanHost);
     setManualPort(String(portNum));
+    setPendingManualMode(false);
+
     const next = await window.guardAPI.updateConfig({
       proxyMode: 'manual',
       manualProxy: {
         protocol: manualProto,
-        host: manualHost.trim() || '127.0.0.1',
+        host: cleanHost,
         port: portNum,
       },
     });
@@ -121,8 +137,23 @@ export const MainDashboard: React.FC = () => {
   };
 
   const handleSaveCustomProbe = async () => {
+    const trimmed = customProbe.trim();
+    if (trimmed) {
+      try {
+        const parsed = new URL(trimmed);
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+          setProbeUrlErr('探测地址必须以 https:// 或 http:// 开头');
+          return;
+        }
+      } catch {
+        setProbeUrlErr('请输入合法的完整 URL，例如 https://cp.cloudflare.com/cdn-cgi/trace');
+        return;
+      }
+    }
+    setProbeUrlErr(null);
+    setCustomProbe(trimmed);
     const next = await window.guardAPI.updateConfig({
-      customProbeUrl: customProbe.trim(),
+      customProbeUrl: trimmed,
     });
     setState(next);
   };
@@ -207,21 +238,24 @@ export const MainDashboard: React.FC = () => {
     },
   }[status];
 
+  const canLockCurrentProbe = Boolean(lastProbe && isValidIsoCountryCode(lastProbe.countryCode));
+
   const isCurrentAlreadyDefault =
-    Boolean(lastProbe?.countryCode) &&
+    canLockCurrentProbe &&
     Boolean(config.defaultCountryCode) &&
     lastProbe?.countryCode === config.defaultCountryCode;
 
-  // 判断当前 Windows 时区与区域是否与目标地区一致
-  const localeRefCountryCode =
-    config.defaultCountryCode ||
-    (lastProbe?.countryCode && lastProbe.countryCode !== 'UNKNOWN' ? lastProbe.countryCode : null);
+  const isCustomCountryOutsideCommon = Boolean(
+    config.defaultCountryCode &&
+      !COMMON_COUNTRIES.some((c) => c.code === config.defaultCountryCode)
+  );
 
-  const isWinLocaleMatched = localeRefCountryCode
+  // 判断当前 Windows 时区与区域是否与已锁定的默认保护地区一致
+  const isWinLocaleMatched = config.defaultCountryCode
     ? isWindowsLocaleMatchingCountry(
         winLocale.timeZoneId,
         winLocale.regionCode,
-        localeRefCountryCode
+        config.defaultCountryCode
       )
     : true;
 
@@ -324,7 +358,7 @@ export const MainDashboard: React.FC = () => {
                         <h1>{lastProbe.countryName}</h1>
                         <span className="iso-pill">{lastProbe.countryCode}</span>
                         {lastProbe.edgeLoc &&
-                          lastProbe.countryCode !== 'UNKNOWN' &&
+                          isValidIsoCountryCode(lastProbe.countryCode) &&
                           lastProbe.edgeLoc !== lastProbe.countryCode && (
                             <span
                               className="edge-hint-pill"
@@ -387,7 +421,7 @@ export const MainDashboard: React.FC = () => {
                   <button
                     className="btn-link-clear"
                     onClick={() => void window.guardAPI.setDefaultRegion(null)}
-                    title="取消默认地区锁定"
+                    title="取消默认地区锁定并暂停进程强杀守护"
                   >
                     <Unlock size={13} />
                     <span>清除默认</span>
@@ -417,18 +451,16 @@ export const MainDashboard: React.FC = () => {
                 <div className="default-actions-row">
                   <button
                     className={`btn-primary-set ${isCurrentAlreadyDefault ? 'btn-already' : ''}`}
-                    disabled={
-                      !lastProbe || lastProbe.countryCode === 'UNKNOWN' || isCurrentAlreadyDefault
-                    }
+                    disabled={!canLockCurrentProbe || isCurrentAlreadyDefault}
                     onClick={() => void window.guardAPI.setDefaultCurrent()}
                   >
                     <Sparkles size={15} />
                     <span>
                       {isCurrentAlreadyDefault
                         ? `当前 [${lastProbe?.countryName}] 已是默认`
-                        : lastProbe
+                        : canLockCurrentProbe && lastProbe
                         ? `将当前 [${lastProbe.countryName}] 设为默认`
-                        : '等待检测当前地区...'}
+                        : '等待检测有效地区...'}
                     </span>
                   </button>
 
@@ -442,6 +474,11 @@ export const MainDashboard: React.FC = () => {
                     title="也可直接手动指定期望的国家/地区"
                   >
                     <option value="">手动指定地区...</option>
+                    {isCustomCountryOutsideCommon && config.defaultCountryCode && (
+                      <option value={config.defaultCountryCode}>
+                        {config.defaultCountryName} ({config.defaultCountryCode})
+                      </option>
+                    )}
                     {COMMON_COUNTRIES.map((c) => (
                       <option key={c.code} value={c.code}>
                         {c.name} ({c.code})
@@ -452,18 +489,18 @@ export const MainDashboard: React.FC = () => {
               </div>
             </section>
 
-            {/* 3. Windows 时区与区域同步卡片（对应系统设置图1信息） */}
+            {/* 3. Windows 时区与区域同步卡片 */}
             <section className="panel-card">
               <div className="panel-card-header">
                 <div className="panel-title">
                   <Globe size={15} />
                   <span>Windows 时区与区域</span>
                 </div>
-                {localeRefCountryCode && (
+                {config.defaultCountryCode && (
                   <span
                     className={`mini-badge ${isWinLocaleMatched ? 'connected' : 'warn-badge'}`}
                   >
-                    {isWinLocaleMatched ? '已与目标地区一致' : '与出口/默认地区不一致'}
+                    {isWinLocaleMatched ? '已与保护地区一致' : '与默认保护地区不一致'}
                   </span>
                 )}
               </div>
@@ -502,7 +539,7 @@ export const MainDashboard: React.FC = () => {
                   onClick={() => void handleSyncLocale()}
                   title={
                     config.defaultCountryCode
-                      ? '自动识别出口 IP 精确城市时区并修改 Windows 时区与区域'
+                      ? '将 Windows 时区与区域同步至默认保护地区（多时区大国自动匹配城市时区）'
                       : '请先在上方设置默认保护地区'
                   }
                 >
@@ -517,13 +554,17 @@ export const MainDashboard: React.FC = () => {
                 </button>
 
                 <button
-                  className={`btn-restore-locale ${isAlreadyChinaDefaultLocale ? 'is-cn' : ''}`}
-                  disabled={isSyncingLocale}
+                  className="btn-restore-locale"
+                  disabled={isSyncingLocale || isAlreadyChinaDefaultLocale}
                   onClick={() => void handleRestoreLocale()}
-                  title="若当前出口非中国且开启了进程守护，将先强杀守护进程再还原回中国时区与区域"
+                  title={
+                    isAlreadyChinaDefaultLocale
+                      ? '当前系统已处于默认中国时区与区域'
+                      : '若当前出口非中国且开启了进程守护，将先确认强杀守护进程再还原回中国时区与区域'
+                  }
                 >
                   <RotateCcw size={14} />
-                  <span>还原默认时区</span>
+                  <span>{isAlreadyChinaDefaultLocale ? '已是中国时区' : '还原默认时区'}</span>
                 </button>
               </div>
 
@@ -536,7 +577,7 @@ export const MainDashboard: React.FC = () => {
             </section>
 
             {/* 4. Clash 实时引擎与离线库状态卡片 */}
-            <section className="panel-card compact-card">
+            <section className="panel-card">
               <div className="panel-card-header">
                 <div className="panel-title">
                   <Radio size={15} className={clashInfo.connected ? 'pulse-green' : ''} />
@@ -554,7 +595,7 @@ export const MainDashboard: React.FC = () => {
                     <span className="kv-v mode-badge">{clashInfo.mode.toUpperCase()}</span>
                   </div>
                   <div className="kv-cell">
-                    <span className="kv-k">混合端口</span>
+                    <span className="kv-k">本地端口</span>
                     <span className="kv-v">{clashInfo.mixedPort || '-'}</span>
                   </div>
                   <div className="kv-cell full-span">
@@ -614,7 +655,7 @@ export const MainDashboard: React.FC = () => {
                 <div>
                   <strong>启用异常自动强杀进程（总开关）</strong>
                   <p>
-                    触发时按进程树 (<code>taskkill /F /T</code>) 连带所有同名多进程及派生子进程一并强杀，异常未恢复期间禁止重开
+                    已锁定默认地区后，触发异常时按进程树 (<code>taskkill /F /T</code>) 连带派生子进程一并强杀，异常未恢复期间禁止重开
                   </p>
                 </div>
                 <input
@@ -647,7 +688,7 @@ export const MainDashboard: React.FC = () => {
                 <div>
                   <strong>系统时区 / 区域不一致时同样强杀</strong>
                   <p>
-                    还原默认时区若与 IP 不一致将「先杀进程再还原」；平时若忘改时区误启动受保护应用也会立即拦截
+                    还原默认时区若与保护地区不符将「先杀进程确认退出后再还原」；平时若忘改时区误启动受保护应用也会立即拦截
                   </p>
                 </div>
                 <input
@@ -662,7 +703,7 @@ export const MainDashboard: React.FC = () => {
               </div>
             </section>
 
-            {/* 2. 进程匹配规则列表卡片（仅手动输入，智能兼容通配符与正则） */}
+            {/* 2. 进程匹配规则列表卡片 */}
             <section className="panel-card">
               <div className="panel-card-header">
                 <div className="panel-title">
@@ -775,35 +816,41 @@ export const MainDashboard: React.FC = () => {
               </div>
 
               <div className="radio-group">
-                <label className={`radio-card ${config.proxyMode === 'auto' ? 'selected' : ''}`}>
+                <label className={`radio-card ${displayedProxyMode === 'auto' ? 'selected' : ''}`}>
                   <input
                     type="radio"
                     name="proxyMode"
-                    checked={config.proxyMode === 'auto'}
-                    onChange={() => void window.guardAPI.updateConfig({ proxyMode: 'auto' })}
+                    checked={displayedProxyMode === 'auto'}
+                    onChange={() => void handleSwitchNonManualMode('auto')}
                   />
                   <div>
-                    <strong>自动识别（推荐）</strong>
+                    <strong>自动识别全局出口（推荐）</strong>
                     <p>
-                      优先读取 Windows 系统代理；若未开系统代理则自动识别 Clash 本地混合端口或 TUN 网卡
+                      系统代理开启时经系统代理检测；系统代理关闭时走本机默认网卡路由（自动识别 TUN 虚拟网卡或国内直连暴露）
                     </p>
                   </div>
                 </label>
 
-                <label className={`radio-card ${config.proxyMode === 'manual' ? 'selected' : ''}`}>
+                <label
+                  className={`radio-card ${displayedProxyMode === 'manual' ? 'selected' : ''}`}
+                >
                   <input
                     type="radio"
                     name="proxyMode"
-                    checked={config.proxyMode === 'manual'}
-                    onChange={() => void window.guardAPI.updateConfig({ proxyMode: 'manual' })}
+                    checked={displayedProxyMode === 'manual'}
+                    onChange={() => {
+                      if (config.proxyMode !== 'manual') {
+                        setPendingManualMode(true);
+                      }
+                    }}
                   />
                   <div>
                     <strong>手动指定本地代理端口</strong>
-                    <p>固定通过指定的 HTTP / SOCKS5 本地端口检测（适合仅开本地端口分流模式）</p>
+                    <p>固定通过指定的 HTTP / SOCKS5 本地端口检测（适合不开系统代理与 TUN 的纯端口分流软件）</p>
                   </div>
                 </label>
 
-                {config.proxyMode === 'manual' && (
+                {displayedProxyMode === 'manual' && (
                   <div className="manual-proxy-form">
                     <select
                       value={manualProto}
@@ -816,6 +863,9 @@ export const MainDashboard: React.FC = () => {
                       type="text"
                       value={manualHost}
                       onChange={(e) => setManualHost(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void handleSaveManualProxy();
+                      }}
                       placeholder="127.0.0.1"
                     />
                     <input
@@ -823,27 +873,32 @@ export const MainDashboard: React.FC = () => {
                       className="port-input"
                       value={manualPort}
                       onChange={(e) => setManualPort(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') void handleSaveManualProxy();
+                      }}
                       placeholder="7890"
                     />
                     <button
                       className="btn-save-inline"
                       onClick={() => void handleSaveManualProxy()}
                     >
-                      保存重测
+                      {config.proxyMode === 'manual' ? '保存重测' : '启用并重测'}
                     </button>
                   </div>
                 )}
 
-                <label className={`radio-card ${config.proxyMode === 'direct' ? 'selected' : ''}`}>
+                <label
+                  className={`radio-card ${displayedProxyMode === 'direct' ? 'selected' : ''}`}
+                >
                   <input
                     type="radio"
                     name="proxyMode"
-                    checked={config.proxyMode === 'direct'}
-                    onChange={() => void window.guardAPI.updateConfig({ proxyMode: 'direct' })}
+                    checked={displayedProxyMode === 'direct'}
+                    onChange={() => void handleSwitchNonManualMode('direct')}
                   />
                   <div>
-                    <strong>纯网卡直连（仅限全局 TUN 虚拟网卡）</strong>
-                    <p>不经过本地代理端口，直接检测系统默认网卡路由出口</p>
+                    <strong>强制纯网卡直连（仅限全局 TUN 虚拟网卡）</strong>
+                    <p>忽略系统代理设置，始终直接检测操作系统默认网卡路由出口</p>
                   </div>
                 </label>
               </div>
@@ -964,7 +1019,13 @@ export const MainDashboard: React.FC = () => {
                   <input
                     type="text"
                     value={customProbe}
-                    onChange={(e) => setCustomProbe(e.target.value)}
+                    onChange={(e) => {
+                      setCustomProbe(e.target.value);
+                      if (probeUrlErr) setProbeUrlErr(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') void handleSaveCustomProbe();
+                    }}
                     placeholder="例如 https://cp.cloudflare.com/cdn-cgi/trace"
                   />
                   <button
@@ -974,6 +1035,12 @@ export const MainDashboard: React.FC = () => {
                     应用
                   </button>
                 </div>
+                {probeUrlErr && (
+                  <div className="pattern-hint err">
+                    <AlertTriangle size={12} />
+                    <span>{probeUrlErr}</span>
+                  </div>
+                )}
               </div>
             </section>
           </div>

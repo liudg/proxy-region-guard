@@ -8,11 +8,37 @@ export interface PatternInspection {
   error?: string;
 }
 
-const REGEX_SYNTAX_RE = /[\^$()[\]{}|\\+]|\.\*|\.\+/;
 const SLASH_REGEX_RE = /^\/(.+)\/([a-zA-Z]*)$/;
+// 仅当包含典型正则结构（首尾锚点 ^/$、分支 |、转义 \、字符组 [...]）时才按无斜杠正则处理，
+// 避免误伤 notepad++.exe、vc_redist(x64).exe、claude.* 等合法进程名或通配符
+const EXPLICIT_REGEX_RE = /^\^|\$$|[|\\]|\[[^\]]+\]/;
 
-// 用于拦截范围过大的危险规则（如 *.exe / .* / .+）
-const CANARY_SYSTEM_PROCESSES = ['svchost.exe', 'explorer.exe', 'dwm.exe', 'notepad.exe'];
+/**
+ * 绝不允许被规则命中或强杀的 Windows 系统核心进程与工具链进程
+ */
+export const CRITICAL_SYSTEM_PROCESSES = [
+  'system',
+  'smss.exe',
+  'csrss.exe',
+  'wininit.exe',
+  'services.exe',
+  'lsass.exe',
+  'svchost.exe',
+  'winlogon.exe',
+  'explorer.exe',
+  'dwm.exe',
+  'conhost.exe',
+  'sihost.exe',
+  'taskhostw.exe',
+  'spoolsv.exe',
+  'fontdrvhost.exe',
+  'tasklist.exe',
+  'taskkill.exe',
+  'reg.exe',
+  'tzutil.exe',
+  'powershell.exe',
+  'cmd.exe',
+] as const;
 
 export function inspectProcessPattern(input: string): PatternInspection {
   const normalized = input.trim();
@@ -45,7 +71,7 @@ export function inspectProcessPattern(input: string): PatternInspection {
         error: `正则表达式语法错误: ${err instanceof Error ? err.message : String(err)}`,
       };
     }
-  } else if (REGEX_SYNTAX_RE.test(normalized)) {
+  } else if (EXPLICIT_REGEX_RE.test(normalized)) {
     mode = 'regex';
     try {
       compiled = new RegExp(normalized, 'i');
@@ -59,6 +85,14 @@ export function inspectProcessPattern(input: string): PatternInspection {
     }
   } else {
     mode = 'wildcard';
+    if (!/[a-zA-Z0-9\u4e00-\u9fa5]/.test(normalized)) {
+      return {
+        valid: false,
+        normalized,
+        mode: 'wildcard',
+        error: '规则缺少有效进程名字符或范围过大，请限定具体应用名称，如 claude*.exe',
+      };
+    }
     const escaped = normalized
       .replace(/[.+^${}()|[\]\\]/g, '\\$&')
       .replace(/\*/g, '.*')
@@ -66,7 +100,7 @@ export function inspectProcessPattern(input: string): PatternInspection {
 
     const lower = normalized.toLowerCase();
     const hasExtOrTrailingWildcard =
-      lower.endsWith('.exe') || normalized.endsWith('*') || normalized.endsWith('?');
+      /\.[a-z0-9]{1,8}$/i.test(lower) || normalized.endsWith('*') || normalized.endsWith('?');
 
     const fullSource = hasExtOrTrailingWildcard
       ? `^(?:${escaped})$`
@@ -84,13 +118,13 @@ export function inspectProcessPattern(input: string): PatternInspection {
     }
   }
 
-  const hitsAllCanaries = CANARY_SYSTEM_PROCESSES.every((proc) => compiled.test(proc));
-  if (hitsAllCanaries) {
+  const hitCritical = CRITICAL_SYSTEM_PROCESSES.find((proc) => compiled.test(proc));
+  if (hitCritical) {
     return {
       valid: false,
       normalized,
       mode,
-      error: '规则匹配范围过大（会命中系统基础进程），请限定具体应用前缀，如 claude*.exe',
+      error: `规则匹配范围过大（会误伤系统关键进程 ${hitCritical}），请限定具体应用名称，如 claude*.exe`,
     };
   }
 

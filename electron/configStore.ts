@@ -1,8 +1,8 @@
 import { app } from 'electron';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { AppConfig } from '../src/shared/types';
-import { getCountryNameZh } from '../src/shared/countries';
+import { AppConfig, ManualProxyProtocol, ProxyMode } from '../src/shared/types';
+import { getCountryNameZh, isValidIsoCountryCode } from '../src/shared/countries';
 
 export const DEFAULT_CONFIG: AppConfig = {
   defaultCountryCode: null,
@@ -12,12 +12,6 @@ export const DEFAULT_CONFIG: AppConfig = {
     protocol: 'http',
     host: '127.0.0.1',
     port: 7890,
-  },
-  clashAutoDetect: true,
-  clashCustomController: {
-    host: '127.0.0.1',
-    port: 9090,
-    secret: '',
   },
   heartbeatIntervalSec: 15,
   customProbeUrl: '',
@@ -49,6 +43,72 @@ function sanitizePatternList(raw: unknown): string[] {
   return out;
 }
 
+function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
+  const proxyMode: ProxyMode =
+    raw.proxyMode === 'manual' || raw.proxyMode === 'direct' ? raw.proxyMode : 'auto';
+
+  const rawManual: Partial<AppConfig['manualProxy']> =
+    raw.manualProxy && typeof raw.manualProxy === 'object' ? raw.manualProxy : {};
+  const protocol: ManualProxyProtocol = rawManual.protocol === 'socks5' ? 'socks5' : 'http';
+  const host =
+    typeof rawManual.host === 'string' && rawManual.host.trim()
+      ? rawManual.host.trim()
+      : DEFAULT_CONFIG.manualProxy.host;
+  const portNum = Number(rawManual.port);
+  const port =
+    Number.isFinite(portNum) && portNum >= 1 && portNum <= 65535
+      ? Math.round(portNum)
+      : DEFAULT_CONFIG.manualProxy.port;
+
+  const hbNum = Number(raw.heartbeatIntervalSec);
+  const heartbeatIntervalSec =
+    Number.isFinite(hbNum) && hbNum >= 0
+      ? Math.round(hbNum)
+      : DEFAULT_CONFIG.heartbeatIntervalSec;
+
+  const normalizedCode = isValidIsoCountryCode(raw.defaultCountryCode)
+    ? raw.defaultCountryCode.trim().toUpperCase()
+    : null;
+
+  return {
+    defaultCountryCode: normalizedCode,
+    defaultCountryName: normalizedCode ? getCountryNameZh(normalizedCode) : null,
+    proxyMode,
+    manualProxy: { protocol, host, port },
+    heartbeatIntervalSec,
+    customProbeUrl: typeof raw.customProbeUrl === 'string' ? raw.customProbeUrl.trim() : '',
+    alertPopupEnabled:
+      typeof raw.alertPopupEnabled === 'boolean'
+        ? raw.alertPopupEnabled
+        : DEFAULT_CONFIG.alertPopupEnabled,
+    alertSoundEnabled:
+      typeof raw.alertSoundEnabled === 'boolean'
+        ? raw.alertSoundEnabled
+        : DEFAULT_CONFIG.alertSoundEnabled,
+    alertOnDisconnect:
+      typeof raw.alertOnDisconnect === 'boolean'
+        ? raw.alertOnDisconnect
+        : DEFAULT_CONFIG.alertOnDisconnect,
+    closeToTray:
+      typeof raw.closeToTray === 'boolean' ? raw.closeToTray : DEFAULT_CONFIG.closeToTray,
+    autoLaunch:
+      typeof raw.autoLaunch === 'boolean' ? raw.autoLaunch : DEFAULT_CONFIG.autoLaunch,
+    killProcessesEnabled:
+      typeof raw.killProcessesEnabled === 'boolean'
+        ? raw.killProcessesEnabled
+        : DEFAULT_CONFIG.killProcessesEnabled,
+    killOnDisconnect:
+      typeof raw.killOnDisconnect === 'boolean'
+        ? raw.killOnDisconnect
+        : DEFAULT_CONFIG.killOnDisconnect,
+    killOnLocaleMismatch:
+      typeof raw.killOnLocaleMismatch === 'boolean'
+        ? raw.killOnLocaleMismatch
+        : DEFAULT_CONFIG.killOnLocaleMismatch,
+    protectedProcessPatterns: sanitizePatternList(raw.protectedProcessPatterns),
+  };
+}
+
 export class ConfigStore {
   private filePath: string;
   private config: AppConfig;
@@ -63,24 +123,10 @@ export class ConfigStore {
     try {
       if (fs.existsSync(this.filePath)) {
         const raw = fs.readFileSync(this.filePath, 'utf-8');
-        const parsed = JSON.parse(raw);
-        const merged: AppConfig = {
-          ...DEFAULT_CONFIG,
-          ...parsed,
-          manualProxy: {
-            ...DEFAULT_CONFIG.manualProxy,
-            ...(parsed.manualProxy || {}),
-          },
-          clashCustomController: {
-            ...DEFAULT_CONFIG.clashCustomController,
-            ...(parsed.clashCustomController || {}),
-          },
-          protectedProcessPatterns: sanitizePatternList(parsed.protectedProcessPatterns),
-        };
-        if (merged.defaultCountryCode && !merged.defaultCountryName) {
-          merged.defaultCountryName = getCountryNameZh(merged.defaultCountryCode);
+        const parsed = JSON.parse(raw) as Partial<AppConfig>;
+        if (parsed && typeof parsed === 'object') {
+          return normalizeConfig(parsed);
         }
-        return merged;
       }
     } catch (err) {
       console.error('[ConfigStore] Failed to load config, using defaults:', err);
@@ -93,29 +139,18 @@ export class ConfigStore {
   }
 
   public update(partial: Partial<AppConfig>): AppConfig {
-    this.config = {
+    this.config = normalizeConfig({
       ...this.config,
       ...partial,
       manualProxy: {
         ...this.config.manualProxy,
         ...(partial.manualProxy || {}),
       },
-      clashCustomController: {
-        ...this.config.clashCustomController,
-        ...(partial.clashCustomController || {}),
-      },
       protectedProcessPatterns:
         partial.protectedProcessPatterns !== undefined
-          ? sanitizePatternList(partial.protectedProcessPatterns)
+          ? partial.protectedProcessPatterns
           : this.config.protectedProcessPatterns,
-    };
-
-    if (this.config.defaultCountryCode) {
-      this.config.defaultCountryCode = this.config.defaultCountryCode.toUpperCase();
-      this.config.defaultCountryName = getCountryNameZh(this.config.defaultCountryCode);
-    } else {
-      this.config.defaultCountryName = null;
-    }
+    });
 
     this.save();
     return this.get();

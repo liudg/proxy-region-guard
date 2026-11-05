@@ -1,10 +1,10 @@
 import { execFile } from 'node:child_process';
 import * as os from 'node:os';
+import { decodeWinConsoleBuffer } from './processGuard';
 
 export interface SystemProxyState {
   enabled: boolean;
   proxyUrl: string | null; // e.g., "http://127.0.0.1:7890" or "socks5h://127.0.0.1:1080"
-  rawServer: string | null;
 }
 
 const REG_PATH = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings';
@@ -12,25 +12,25 @@ const REG_PATH = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Internet S
 export function readWindowsSystemProxy(): Promise<SystemProxyState> {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') {
-      resolve({ enabled: false, proxyUrl: null, rawServer: null });
+      resolve({ enabled: false, proxyUrl: null });
       return;
     }
 
     execFile(
       'reg.exe',
       ['query', REG_PATH],
-      { windowsHide: true, timeout: 2500 },
+      { encoding: 'buffer', windowsHide: true, timeout: 2500 },
       (err, stdout) => {
         if (err || !stdout) {
-          resolve({ enabled: false, proxyUrl: null, rawServer: null });
+          resolve({ enabled: false, proxyUrl: null });
           return;
         }
 
+        const text = decodeWinConsoleBuffer(stdout);
         let enabled = false;
         let rawServer: string | null = null;
 
-        const lines = stdout.split(/\r?\n/);
-        for (const line of lines) {
+        for (const line of text.split(/\r?\n/)) {
           const trimmed = line.trim();
           if (trimmed.startsWith('ProxyEnable')) {
             const parts = trimmed.split(/\s+/);
@@ -45,12 +45,12 @@ export function readWindowsSystemProxy(): Promise<SystemProxyState> {
         }
 
         if (!enabled || !rawServer) {
-          resolve({ enabled: false, proxyUrl: null, rawServer });
+          resolve({ enabled: false, proxyUrl: null });
           return;
         }
 
         const proxyUrl = normalizeProxyServerString(rawServer);
-        resolve({ enabled: Boolean(proxyUrl), proxyUrl, rawServer });
+        resolve({ enabled: Boolean(proxyUrl), proxyUrl });
       }
     );
   });
@@ -85,8 +85,8 @@ function normalizeProxyServerString(raw: string): string | null {
 
 function ensureScheme(addr: string, defaultScheme: 'http' | 'socks5h'): string {
   if (/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//.test(addr)) {
-    if (addr.startsWith('socks5://')) {
-      return addr.replace(/^socks5:\/\//, 'socks5h://');
+    if (/^socks5?:\/\//i.test(addr)) {
+      return addr.replace(/^socks5?:\/\//i, 'socks5h://');
     }
     return addr;
   }

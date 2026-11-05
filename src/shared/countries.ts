@@ -71,6 +71,24 @@ const EXTRA_NAMES: Record<string, string> = {
   KZ: '哈萨克斯坦',
 };
 
+const NON_COUNTRY_CODES = new Set([
+  'UNKNOWN',
+  'XX',
+  'T1',
+  'EU',
+  'AP',
+  'A1',
+  'A2',
+  'O1',
+  'ZZ',
+]);
+
+export function isValidIsoCountryCode(code: string | null | undefined): code is string {
+  if (!code) return false;
+  const upper = code.trim().toUpperCase();
+  return /^[A-Z]{2}$/.test(upper) && !NON_COUNTRY_CODES.has(upper);
+}
+
 let displayNames: Intl.DisplayNames | null = null;
 try {
   displayNames = new Intl.DisplayNames(['zh-CN'], { type: 'region' });

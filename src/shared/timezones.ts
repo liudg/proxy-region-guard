@@ -1,4 +1,4 @@
-import { getCountryNameZh } from './countries';
+import { getCountryNameZh, isValidIsoCountryCode } from './countries';
 
 export const DEFAULT_CHINA_TIMEZONE_ID = 'China Standard Time';
 export const DEFAULT_CHINA_REGION_CODE = 'CN';
@@ -42,6 +42,7 @@ export const IANA_TO_WINDOWS_TZ: Record<string, string> = {
   'America/Juneau': 'Alaskan Standard Time',
   'Pacific/Honolulu': 'Hawaiian Standard Time',
   'US/Hawaii': 'Hawaiian Standard Time',
+  'America/Adak': 'Aleutian Standard Time',
   'America/Whitehorse': 'Yukon Standard Time',
   'America/Puerto_Rico': 'SA Western Standard Time',
 
@@ -142,6 +143,7 @@ export const IANA_TO_WINDOWS_TZ: Record<string, string> = {
   'Europe/Belgrade': 'Central Europe Standard Time',
   'Europe/Bratislava': 'Central Europe Standard Time',
   'Europe/Ljubljana': 'Central Europe Standard Time',
+  'Europe/Zagreb': 'Central Europe Standard Time',
   'Europe/Helsinki': 'FLE Standard Time',
   'Europe/Kyiv': 'FLE Standard Time',
   'Europe/Kiev': 'FLE Standard Time',
@@ -208,6 +210,7 @@ export const COUNTRY_DEFAULT_WINDOWS_TZ: Record<string, string> = {
   GB: 'GMT Standard Time',
   IE: 'GMT Standard Time',
   PT: 'GMT Standard Time',
+  IS: 'Greenwich Standard Time',
   DE: 'W. Europe Standard Time',
   NL: 'W. Europe Standard Time',
   CH: 'W. Europe Standard Time',
@@ -215,6 +218,7 @@ export const COUNTRY_DEFAULT_WINDOWS_TZ: Record<string, string> = {
   NO: 'W. Europe Standard Time',
   AT: 'W. Europe Standard Time',
   IT: 'W. Europe Standard Time',
+  LU: 'W. Europe Standard Time',
   FR: 'Romance Standard Time',
   ES: 'Romance Standard Time',
   BE: 'Romance Standard Time',
@@ -222,8 +226,16 @@ export const COUNTRY_DEFAULT_WINDOWS_TZ: Record<string, string> = {
   PL: 'Central European Standard Time',
   CZ: 'Central Europe Standard Time',
   HU: 'Central Europe Standard Time',
+  SK: 'Central Europe Standard Time',
+  SI: 'Central Europe Standard Time',
+  RS: 'Central Europe Standard Time',
+  HR: 'Central Europe Standard Time',
   FI: 'FLE Standard Time',
   UA: 'FLE Standard Time',
+  EE: 'FLE Standard Time',
+  LV: 'FLE Standard Time',
+  LT: 'FLE Standard Time',
+  BG: 'FLE Standard Time',
   RO: 'GTB Standard Time',
   GR: 'GTB Standard Time',
   TR: 'Turkey Standard Time',
@@ -231,10 +243,20 @@ export const COUNTRY_DEFAULT_WINDOWS_TZ: Record<string, string> = {
   BY: 'Belarus Standard Time',
   CA: 'Eastern Standard Time',
   MX: 'Central Standard Time (Mexico)',
+  PA: 'SA Pacific Standard Time',
+  CR: 'Central America Standard Time',
+  GT: 'Central America Standard Time',
+  VE: 'Venezuela Standard Time',
+  UY: 'Montevideo Standard Time',
+  PY: 'Paraguay Standard Time',
+  PR: 'SA Western Standard Time',
   AU: 'AUS Eastern Standard Time',
   NZ: 'New Zealand Standard Time',
+  FJ: 'Fiji Standard Time',
+  GU: 'West Pacific Standard Time',
   MY: 'Singapore Standard Time',
   PH: 'Singapore Standard Time',
+  BN: 'Singapore Standard Time',
   TH: 'SE Asia Standard Time',
   VN: 'SE Asia Standard Time',
   ID: 'SE Asia Standard Time',
@@ -246,12 +268,26 @@ export const COUNTRY_DEFAULT_WINDOWS_TZ: Record<string, string> = {
   BD: 'Bangladesh Standard Time',
   LK: 'Sri Lanka Standard Time',
   NP: 'Nepal Standard Time',
+  AF: 'Afghanistan Standard Time',
   KZ: 'Central Asia Standard Time',
+  KG: 'Central Asia Standard Time',
   UZ: 'West Asia Standard Time',
   MN: 'Ulaanbaatar Standard Time',
   AE: 'Arabian Standard Time',
+  OM: 'Arabian Standard Time',
   SA: 'Arab Standard Time',
+  QA: 'Arab Standard Time',
+  KW: 'Arab Standard Time',
+  BH: 'Arab Standard Time',
+  IQ: 'Arabic Standard Time',
+  IR: 'Iran Standard Time',
   IL: 'Israel Standard Time',
+  JO: 'Jordan Standard Time',
+  LB: 'Middle East Standard Time',
+  SY: 'Syria Standard Time',
+  AZ: 'Azerbaijan Standard Time',
+  GE: 'Georgian Standard Time',
+  AM: 'Caucasus Standard Time',
   EG: 'Egypt Standard Time',
   ZA: 'South Africa Standard Time',
   NG: 'W. Central Africa Standard Time',
@@ -265,8 +301,8 @@ export const COUNTRY_DEFAULT_WINDOWS_TZ: Record<string, string> = {
 };
 
 /**
- * 多时区大国合法的 Windows TimeZone ID 集合
- * 用于精准判断当前 Windows 时区是否属于目标国家
+ * 多时区大国合法的真实 Windows TimeZone ID 集合
+ * 用于精准判断当前 Windows 时区是否属于目标国家，以及决定是否需要联网识别城市级时区
  */
 const MULTI_TZ_COUNTRY_VALID_ZONES: Record<string, string[]> = {
   US: [
@@ -282,12 +318,9 @@ const MULTI_TZ_COUNTRY_VALID_ZONES: Record<string, string[]> = {
   ],
   CA: [
     'Pacific Standard Time',
-    'British Columbia Standard Time',
     'Mountain Standard Time',
-    'Alberta Standard Time',
     'Yukon Standard Time',
     'Central Standard Time',
-    'Manitoba Standard Time',
     'Canada Central Standard Time',
     'Eastern Standard Time',
     'Atlantic Standard Time',
@@ -345,6 +378,16 @@ const MULTI_TZ_COUNTRY_VALID_ZONES: Record<string, string[]> = {
   MN: ['Ulaanbaatar Standard Time', 'W. Mongolia Standard Time'],
 };
 
+export function isMultiTimeZoneCountry(countryCode: string | null | undefined): boolean {
+  if (!countryCode) return false;
+  return Boolean(MULTI_TZ_COUNTRY_VALID_ZONES[countryCode.trim().toUpperCase()]);
+}
+
+export function hasOfflineTimeZoneMapping(countryCode: string | null | undefined): boolean {
+  if (!countryCode) return false;
+  return Boolean(COUNTRY_DEFAULT_WINDOWS_TZ[countryCode.trim().toUpperCase()]);
+}
+
 export function mapIanaToWindowsTimeZone(ianaZone: string | null | undefined): string | null {
   if (!ianaZone) return null;
   const trimmed = ianaZone.trim();
@@ -354,7 +397,6 @@ export function mapIanaToWindowsTimeZone(ianaZone: string | null | undefined): s
     return IANA_TO_WINDOWS_TZ[trimmed];
   }
 
-  // 大小写不敏感匹配
   const lower = trimmed.toLowerCase();
   for (const [k, v] of Object.entries(IANA_TO_WINDOWS_TZ)) {
     if (k.toLowerCase() === lower) {
@@ -373,13 +415,24 @@ export function resolveWindowsTimeZoneForCountry(
   const mappedFromIana = mapIanaToWindowsTimeZone(ianaZone);
 
   if (mappedFromIana) {
-    // 校验该 IANA 时区确实属于目标国合法范围（或非多时区冲突），防止偶发脏数据
     const validMulti = MULTI_TZ_COUNTRY_VALID_ZONES[upper];
-    if (!validMulti || validMulti.includes(mappedFromIana)) {
+    if (validMulti) {
+      if (validMulti.some((z) => z.toLowerCase() === mappedFromIana.toLowerCase())) {
+        return { windowsTimeZoneId: mappedFromIana, fromExactIp: true };
+      }
+      // 不在目标多时区国合法集合内时丢弃，安全回退到该国默认时区
+    } else if (COUNTRY_DEFAULT_WINDOWS_TZ[upper]) {
+      if (COUNTRY_DEFAULT_WINDOWS_TZ[upper].toLowerCase() === mappedFromIana.toLowerCase()) {
+        return { windowsTimeZoneId: mappedFromIana, fromExactIp: true };
+      }
+      // 单一时区国家严格使用权威标准时区，确保与 isWindowsLocaleMatchingCountry 100% 一致
+    } else if (
+      upper === DEFAULT_CHINA_REGION_CODE
+        ? mappedFromIana === DEFAULT_CHINA_TIMEZONE_ID
+        : mappedFromIana !== DEFAULT_CHINA_TIMEZONE_ID
+    ) {
       return { windowsTimeZoneId: mappedFromIana, fromExactIp: true };
     }
-    // 对于其他国家，直接使用精确 IANA 映射结果
-    return { windowsTimeZoneId: mappedFromIana, fromExactIp: true };
   }
 
   const fallback = COUNTRY_DEFAULT_WINDOWS_TZ[upper] || 'UTC';
@@ -391,7 +444,7 @@ export function isWindowsLocaleMatchingCountry(
   winRegionCode: string | null | undefined,
   targetCountryCode: string | null | undefined
 ): boolean {
-  if (!targetCountryCode || targetCountryCode === 'UNKNOWN') {
+  if (!isValidIsoCountryCode(targetCountryCode)) {
     return true;
   }
   const target = targetCountryCode.trim().toUpperCase();
@@ -408,7 +461,7 @@ export function isWindowsLocaleMatchingCountry(
 
   const validMulti = MULTI_TZ_COUNTRY_VALID_ZONES[target];
   if (validMulti) {
-    return validMulti.includes(curTz);
+    return validMulti.some((z) => z.toLowerCase() === curTz.toLowerCase());
   }
 
   const expectedTz = COUNTRY_DEFAULT_WINDOWS_TZ[target];
@@ -417,7 +470,9 @@ export function isWindowsLocaleMatchingCountry(
   }
 
   // 未在静态表中的冷门小国：只要系统区域匹配，且非中国大陆时区（避免未改时区漏网）即视为匹配
-  return target === 'CN' ? curTz === DEFAULT_CHINA_TIMEZONE_ID : curTz !== DEFAULT_CHINA_TIMEZONE_ID;
+  return target === DEFAULT_CHINA_REGION_CODE
+    ? curTz.toLowerCase() === DEFAULT_CHINA_TIMEZONE_ID.toLowerCase()
+    : curTz.toLowerCase() !== DEFAULT_CHINA_TIMEZONE_ID.toLowerCase();
 }
 
 export function getWindowsRegionDisplayNameZh(code: string | null | undefined): string {

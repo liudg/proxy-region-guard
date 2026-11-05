@@ -6,11 +6,11 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
 
-export async function buildElectronMain() {
+export function getElectronEsbuildOptions() {
   const outDir = path.join(rootDir, 'dist-electron');
   fs.mkdirSync(outDir, { recursive: true });
 
-  await esbuild.build({
+  return {
     entryPoints: [
       path.join(rootDir, 'electron', 'main.ts'),
       path.join(rootDir, 'electron', 'preload.ts'),
@@ -23,27 +23,46 @@ export async function buildElectronMain() {
     external: ['electron'],
     sourcemap: true,
     logLevel: 'info',
-  });
+  };
+}
 
-  // 确保离线 mmdb 文件同步到 resources/ 目录，方便后续打包或独立分发
-  const srcMmdbDir = path.join(
+export function syncBundledMmdb() {
+  const srcMmdbFile = path.join(
     rootDir,
     'node_modules',
     '@ip-location-db',
-    'geolite2-country-mmdb'
+    'geolite2-country-mmdb',
+    'geolite2-country.mmdb'
   );
   const destResDir = path.join(rootDir, 'resources');
-  if (fs.existsSync(srcMmdbDir)) {
-    fs.mkdirSync(destResDir, { recursive: true });
-    for (const file of fs.readdirSync(srcMmdbDir)) {
-      if (file.endsWith('.mmdb')) {
-        const destFile = path.join(destResDir, file);
-        if (!fs.existsSync(destFile)) {
-          fs.copyFileSync(path.join(srcMmdbDir, file), destFile);
-        }
-      }
+  if (!fs.existsSync(srcMmdbFile)) return;
+
+  fs.mkdirSync(destResDir, { recursive: true });
+
+  // 清理多余的拆分版 mmdb，仅保留统一双栈 geolite2-country.mmdb
+  for (const obsolete of ['geolite2-country-ipv4.mmdb', 'geolite2-country-ipv6.mmdb']) {
+    const obsoletePath = path.join(destResDir, obsolete);
+    if (fs.existsSync(obsoletePath)) {
+      fs.rmSync(obsoletePath, { force: true });
     }
   }
+
+  const destFile = path.join(destResDir, 'geolite2-country.mmdb');
+  const srcStat = fs.statSync(srcMmdbFile);
+  let needCopy = !fs.existsSync(destFile);
+  if (!needCopy) {
+    const destStat = fs.statSync(destFile);
+    needCopy = srcStat.size !== destStat.size || srcStat.mtimeMs > destStat.mtimeMs;
+  }
+
+  if (needCopy) {
+    fs.copyFileSync(srcMmdbFile, destFile);
+  }
+}
+
+export async function buildElectronMain() {
+  await esbuild.build(getElectronEsbuildOptions());
+  syncBundledMmdb();
 }
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

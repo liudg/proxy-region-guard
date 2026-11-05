@@ -1,9 +1,6 @@
 import { execFile } from 'node:child_process';
-import * as http from 'node:http';
-import * as https from 'node:https';
-import { HttpsProxyAgent } from 'https-proxy-agent';
-import { SocksProxyAgent } from 'socks-proxy-agent';
 import { WindowsLocaleState } from '../src/shared/types';
+import { isValidIsoCountryCode } from '../src/shared/countries';
 import {
   DEFAULT_CHINA_REGION_CODE,
   DEFAULT_CHINA_TIMEZONE_ID,
@@ -11,6 +8,7 @@ import {
   mapIanaToWindowsTimeZone,
 } from '../src/shared/timezones';
 import { decodeWinConsoleBuffer } from './processGuard';
+import { requestJsonViaProxy } from './netClient';
 
 const tzDisplayCache = new Map<string, string>();
 
@@ -64,18 +62,16 @@ export async function readWindowsLocaleState(): Promise<WindowsLocaleState> {
       timeZoneDisplayName: '(UTC+08:00) 北京，重庆，香港特别行政区，乌鲁木齐',
       regionCode: DEFAULT_CHINA_REGION_CODE,
       regionName: '中国',
-      geoId: '45',
     };
   }
 
   const [tzOut, geoOut] = await Promise.all([
     execRegQuery('HKLM\\SYSTEM\\CurrentControlSet\\Control\\TimeZoneInformation', 'TimeZoneKeyName'),
-    execRegQuery('HKCU\\Control Panel\\International\\Geo'),
+    execRegQuery('HKCU\\Control Panel\\International\\Geo', 'Name'),
   ]);
 
   const timeZoneId = parseRegSzValue(tzOut, 'TimeZoneKeyName') || DEFAULT_CHINA_TIMEZONE_ID;
   const regionCode = (parseRegSzValue(geoOut, 'Name') || DEFAULT_CHINA_REGION_CODE).toUpperCase();
-  const geoId = parseRegSzValue(geoOut, 'Nation') || '';
   const timeZoneDisplayName = await getTimeZoneDisplayName(timeZoneId);
 
   return {
@@ -83,7 +79,6 @@ export async function readWindowsLocaleState(): Promise<WindowsLocaleState> {
     timeZoneDisplayName,
     regionCode,
     regionName: getWindowsRegionDisplayNameZh(regionCode),
-    geoId,
   };
 }
 
@@ -108,7 +103,7 @@ function runTzUtilSet(windowsTimeZoneId: string): Promise<{ ok: boolean; errText
 function runSetWinHomeLocation(isoCountryCode: string): Promise<{ ok: boolean; errText?: string }> {
   return new Promise((resolve) => {
     const upper = isoCountryCode.trim().toUpperCase();
-    if (!/^[A-Z]{2}$/.test(upper)) {
+    if (!isValidIsoCountryCode(upper)) {
       resolve({ ok: false, errText: `无效的国家/地区代码: ${isoCountryCode}` });
       return;
     }
@@ -147,41 +142,64 @@ export async function applyWindowsTimeZoneAndRegion(
   isoCountryCode: string
 ): Promise<{ ok: boolean; error?: string; updated: WindowsLocaleState }> {
   const upperCountry = isoCountryCode.trim().toUpperCase();
+  const previous = await readWindowsLocaleState();
 
-  const [tzRes, regionRes] = await Promise.all([
-    runTzUtilSet(windowsTimeZoneId),
-    runSetWinHomeLocation(upperCountry),
-  ]);
+  if (!isValidIsoCountryCode(upperCountry)) {
+    return {
+      ok: false,
+      error: `不支持将该地区代码 (${isoCountryCode}) 设置为系统区域`,
+      updated: previous,
+    };
+  }
 
-  const updated = await readWindowsLocaleState();
+  // 第一步：先设置系统时区并确认生效，避免出现“时区失败但区域已改”的半残状态
+  const tzChanged = previous.timeZoneId.toLowerCase() !== windowsTimeZoneId.toLowerCase();
+  if (tzChanged) {
+    const tzRes = await runTzUtilSet(windowsTimeZoneId);
+    const afterTz = await readWindowsLocaleState();
+    const tzMatched = afterTz.timeZoneId.toLowerCase() === windowsTimeZoneId.toLowerCase();
 
-  const tzMatched = updated.timeZoneId.toLowerCase() === windowsTimeZoneId.toLowerCase();
-  const regionMatched = updated.regionCode.toUpperCase() === upperCountry;
-
-  if (!tzRes.ok || !tzMatched) {
-    const autoTzOn = await isAutoTimeZoneServiceEnabled();
-    if (autoTzOn) {
+    if (!tzRes.ok || !tzMatched) {
+      const autoTzOn = await isAutoTimeZoneServiceEnabled();
+      if (autoTzOn) {
+        return {
+          ok: false,
+          error:
+            '系统开启了“自动设置时区”，请先在 Windows 设置 -> 时间和语言 -> 日期和时间 中关闭「自动设置时区」后再试',
+          updated: afterTz,
+        };
+      }
       return {
         ok: false,
-        error: '系统开启了“自动设置时区”，请先在 Windows 设置 -> 时间和语言 -> 日期和时间 中关闭「自动设置时区」后再试',
-        updated,
+        error: `设置系统时区失败 (${tzRes.errText || '未生效'})`,
+        updated: afterTz,
       };
     }
-    return {
-      ok: false,
-      error: `设置系统时区失败 (${tzRes.errText || '未生效'})`,
-      updated,
-    };
   }
 
-  if (!regionRes.ok || !regionMatched) {
-    return {
-      ok: false,
-      error: `设置系统区域失败 (${regionRes.errText || '未生效'})`,
-      updated,
-    };
+  // 第二步：设置系统国家/区域；若失败则回滚第一步修改过的时区
+  const regionChanged = previous.regionCode.toUpperCase() !== upperCountry;
+  if (regionChanged) {
+    const regionRes = await runSetWinHomeLocation(upperCountry);
+    const updated = await readWindowsLocaleState();
+    const regionMatched = updated.regionCode.toUpperCase() === upperCountry;
+
+    if (!regionRes.ok || !regionMatched) {
+      if (tzChanged) {
+        await runTzUtilSet(previous.timeZoneId);
+      }
+      const rolledBack = await readWindowsLocaleState();
+      return {
+        ok: false,
+        error: `设置系统区域失败 (${regionRes.errText || '未生效'})`,
+        updated: rolledBack,
+      };
+    }
+
+    return { ok: true, updated };
   }
 
+  const updated = await readWindowsLocaleState();
   return { ok: true, updated };
 }
 
@@ -227,70 +245,8 @@ const ONLINE_TZ_APIS: OnlineTzApiSpec[] = [
   },
 ];
 
-function fetchJsonViaProxy(
-  targetUrl: string,
-  proxyUrl: string | null,
-  timeoutMs: number
-): Promise<Record<string, unknown>> {
-  return new Promise((resolve, reject) => {
-    const parsedUrl = new URL(targetUrl);
-    const isHttps = parsedUrl.protocol === 'https:';
-
-    let agent: http.Agent | undefined;
-    if (proxyUrl) {
-      agent = proxyUrl.startsWith('socks')
-        ? new SocksProxyAgent(proxyUrl, { keepAlive: false, timeout: timeoutMs })
-        : new HttpsProxyAgent(proxyUrl, { keepAlive: false, timeout: timeoutMs });
-    } else {
-      agent = isHttps
-        ? new https.Agent({ keepAlive: false, timeout: timeoutMs })
-        : new http.Agent({ keepAlive: false, timeout: timeoutMs });
-    }
-
-    const transport = isHttps ? https : http;
-    const req = transport.request(
-      parsedUrl,
-      {
-        method: 'GET',
-        agent,
-        timeout: timeoutMs,
-        headers: {
-          'User-Agent': 'curl/8.7.1',
-          Accept: 'application/json',
-          'Cache-Control': 'no-cache',
-          Connection: 'close',
-        },
-      },
-      (res) => {
-        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) {
-          res.resume();
-          reject(new Error(`HTTP ${res.statusCode}`));
-          return;
-        }
-        const chunks: Buffer[] = [];
-        res.on('data', (c) => chunks.push(Buffer.from(c)));
-        res.on('end', () => {
-          try {
-            const parsed = JSON.parse(Buffer.concat(chunks).toString('utf-8')) as Record<
-              string,
-              unknown
-            >;
-            resolve(parsed);
-          } catch (e) {
-            reject(e);
-          }
-        });
-      }
-    );
-
-    req.on('timeout', () => req.destroy(new Error('timeout')));
-    req.on('error', (err) => reject(err));
-    req.end();
-  });
-}
-
 /**
- * 经由当前代理隧道探测出口 IP 所在的精确城市级 IANA 时区（如区分美国洛杉矶与纽约）
+ * 仅针对多时区大国（美/加/澳/俄等），经由当前代理隧道探测出口 IP 所在的精确城市级 IANA 时区
  */
 export async function queryExactExitIanaTimeZone(
   proxyUrl: string | null,
@@ -300,10 +256,10 @@ export async function queryExactExitIanaTimeZone(
 
   for (const spec of ONLINE_TZ_APIS) {
     try {
-      const json = await fetchJsonViaProxy(spec.url, proxyUrl, 3500);
+      const json = await requestJsonViaProxy<Record<string, unknown>>(spec.url, proxyUrl, 3200);
       const { country, ianaTz } = spec.extract(json);
-      if (country && country.trim().toUpperCase() !== expected) {
-        // 如果在线接口看到的国家与期望国家不一致，跳过以防误配跨国时区
+      // 必须明确返回国家代码且与期望国家一致，防止无国家字段或跨国脏数据污染
+      if (!country || country.trim().toUpperCase() !== expected) {
         continue;
       }
       if (ianaTz && mapIanaToWindowsTimeZone(ianaTz)) {

@@ -33,8 +33,8 @@ const STATUS_PALETTE: Record<GuardStatus, { outer: RgbaColor; inner: RgbaColor }
 
 const iconCache = new Map<string, NativeImage>();
 
-export function createStatusTrayIcon(status: GuardStatus, size = 32): NativeImage {
-  const key = `tray:${status}:${size}`;
+export function createStatusTrayIcon(status: GuardStatus): NativeImage {
+  const key = `tray:${status}`;
   const cached = iconCache.get(key);
   if (cached) return cached;
 
@@ -73,7 +73,6 @@ export function createWindowAppIcon(status: GuardStatus): NativeImage {
 }
 
 export function renderStatusPngBuffer(status: GuardStatus, size: number): Buffer {
-
   const rgba = new Uint8Array(size * size * 4);
   const palette = STATUS_PALETTE[status];
   const cx = (size - 1) / 2;
@@ -97,7 +96,8 @@ export function renderStatusPngBuffer(status: GuardStatus, size: number): Buffer
       const alpha = dist > maxR - 0.8 ? Math.max(0, Math.min(1, (maxR + 0.8 - dist) / 1.6)) : 1;
 
       const t = Math.min(1, dist / maxR);
-      const baseColor = dist > ringR ? palette.outer : blendColor(palette.outer, palette.inner, t * 0.7);
+      const baseColor =
+        dist > ringR ? palette.outer : blendColor(palette.outer, palette.inner, t * 0.7);
 
       let r = baseColor.r;
       let g = baseColor.g;
@@ -112,8 +112,8 @@ export function renderStatusPngBuffer(status: GuardStatus, size: number): Buffer
       }
 
       // 内部白色符号绘制（勾号 / 感叹号 / 圆点）
-      const nx = (x - cx) / (size * 0.5); // -1 .. 1
-      const ny = (y - cy) / (size * 0.5); // -1 .. 1
+      const nx = (x - cx) / (size * 0.5);
+      const ny = (y - cy) / (size * 0.5);
       const symbolCov = computeSymbolCoverage(status, nx, ny);
 
       if (symbolCov > 0) {
@@ -160,7 +160,6 @@ function computeSymbolCoverage(status: GuardStatus, nx: number, ny: number): num
   const feather = 0.055;
 
   if (status === 'ok') {
-    // 对勾符号 ✓
     const d1 = distToSegment(nx, ny, -0.34, 0.03, -0.08, 0.29);
     const d2 = distToSegment(nx, ny, -0.08, 0.29, 0.38, -0.24);
     const d = Math.min(d1, d2);
@@ -168,14 +167,12 @@ function computeSymbolCoverage(status: GuardStatus, nx: number, ny: number): num
   }
 
   if (status === 'mismatch' || status === 'error') {
-    // 醒目感叹号 !
     const dBar = distToSegment(nx, ny, 0, -0.38, 0, 0.08);
     const dDot = Math.hypot(nx, ny - 0.33);
     const d = Math.min(dBar, dDot - 0.02);
     return smoothCoverage(d, stroke, feather);
   }
 
-  // unset / checking: 中心圆环守护点
   const dCenter = Math.hypot(nx, ny);
   return smoothCoverage(dCenter, 0.2, feather);
 }
@@ -186,7 +183,6 @@ function smoothCoverage(dist: number, radius: number, feather: number): number {
   return (radius + feather - dist) / (2 * feather);
 }
 
-// 轻量纯内置 PNG 编码器
 const CRC_TABLE = (() => {
   const table = new Uint32Array(256);
   for (let n = 0; n < 256; n++) {
@@ -223,8 +219,8 @@ function encodeRgbaToPng(width: number, height: number, rgba: Uint8Array): Buffe
   const ihdr = Buffer.alloc(13);
   ihdr.writeUInt32BE(width, 0);
   ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8; // bit depth
-  ihdr[9] = 6; // RGBA
+  ihdr[8] = 8;
+  ihdr[9] = 6;
   ihdr[10] = 0;
   ihdr[11] = 0;
   ihdr[12] = 0;
@@ -232,7 +228,7 @@ function encodeRgbaToPng(width: number, height: number, rgba: Uint8Array): Buffe
   const stride = width * 4 + 1;
   const rawData = Buffer.alloc(stride * height);
   for (let y = 0; y < height; y++) {
-    rawData[y * stride] = 0; // filter type None
+    rawData[y * stride] = 0;
     Buffer.from(rgba.buffer, rgba.byteOffset + y * width * 4, width * 4).copy(
       rawData,
       y * stride + 1

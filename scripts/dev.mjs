@@ -1,11 +1,15 @@
 import { spawn } from 'node:child_process';
+import { createRequire } from 'node:module';
 import * as path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import * as esbuild from 'esbuild';
 import { createServer } from 'vite';
-import { buildElectronMain } from './build-electron.mjs';
+import { getElectronEsbuildOptions, syncBundledMmdb } from './build-electron.mjs';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const rootDir = path.resolve(__dirname, '..');
+const require = createRequire(import.meta.url);
+const electronExePath = require('electron');
 
 async function startDev() {
   const viteServer = await createServer({
@@ -19,26 +23,22 @@ async function startDev() {
   const devUrl = `http://localhost:${port}`;
   console.log(`[Dev] Vite renderer ready at ${devUrl}`);
 
-  await buildElectronMain();
-
-  const electronBin = path.join(
-    rootDir,
-    'node_modules',
-    '.bin',
-    process.platform === 'win32' ? 'electron.cmd' : 'electron'
-  );
+  syncBundledMmdb();
+  const esbuildCtx = await esbuild.context(getElectronEsbuildOptions());
+  await esbuildCtx.watch();
 
   const env = { ...process.env, VITE_DEV_SERVER_URL: devUrl };
   delete env.ELECTRON_RUN_AS_NODE;
 
-  const child = spawn(electronBin, ['.'], {
+  const child = spawn(electronExePath, ['.'], {
     cwd: rootDir,
     env,
     stdio: 'inherit',
-    shell: process.platform === 'win32',
+    shell: false,
   });
 
   child.on('exit', async (code) => {
+    await esbuildCtx.dispose();
     await viteServer.close();
     process.exit(code ?? 0);
   });
