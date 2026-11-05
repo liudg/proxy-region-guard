@@ -30,6 +30,20 @@ export interface AppConfig {
   alertOnDisconnect: boolean;
   closeToTray: boolean;
   autoLaunch: boolean;
+
+  // 进程守护配置
+  killProcessesEnabled: boolean;       // 总开关：异常时自动强杀配置的进程
+  killOnDisconnect: boolean;           // 代理断连/超时同样强杀进程
+  killOnLocaleMismatch: boolean;       // 系统时区/区域与默认或出口地区不一致时同样强杀进程
+  protectedProcessPatterns: string[];  // 手动输入的进程匹配规则列表（支持通配符如 claude*.exe 与正则）
+}
+
+export interface WindowsLocaleState {
+  timeZoneId: string;           // 例如 "China Standard Time"
+  timeZoneDisplayName: string;  // 例如 "(UTC+08:00) 北京，重庆，香港特别行政区，乌鲁木齐"
+  regionCode: string;           // 例如 "CN", "US"
+  regionName: string;           // 例如 "中国", "美国"
+  geoId: string;                // 例如 "45", "244"
 }
 
 export interface ClashRuntimeInfo {
@@ -61,7 +75,7 @@ export interface GuardEventLog {
 }
 
 export interface AlertPayload {
-  alertType: 'mismatch' | 'disconnect' | 'recovered';
+  alertType: 'mismatch' | 'disconnect' | 'locale-mismatch' | 'recovered';
   expectedCode: string | null;
   expectedName: string | null;
   actualCode: string | null;
@@ -72,6 +86,11 @@ export interface AlertPayload {
   activeNode?: string | null;
   triggerReason: string;
   errorDetail?: string;
+  killedProcesses?: string[];
+  killError?: string;
+  sysRegionCode?: string;
+  sysRegionName?: string;
+  sysTimeZoneDisplay?: string;
   soundEnabled: boolean;
   timestamp: number;
 }
@@ -79,7 +98,9 @@ export interface AlertPayload {
 export interface AppStateSnapshot {
   status: GuardStatus;
   isChecking: boolean;
+  isSyncingLocale: boolean;
   config: AppConfig;
+  winLocale: WindowsLocaleState;
   lastProbe: ProbeResult | null;
   lastError: string | null;
   lastTriggerReason: string;
@@ -89,6 +110,13 @@ export interface AppStateSnapshot {
   logs: GuardEventLog[];
 }
 
+export interface LocaleSyncResult {
+  ok: boolean;
+  message: string;
+  killedProcesses: string[];
+  state: AppStateSnapshot;
+}
+
 export interface GuardBridgeAPI {
   getState: () => Promise<AppStateSnapshot>;
   checkNow: (reason?: string) => Promise<AppStateSnapshot>;
@@ -96,7 +124,8 @@ export interface GuardBridgeAPI {
   setDefaultRegion: (code: string | null) => Promise<AppStateSnapshot>;
   updateConfig: (partial: Partial<AppConfig>) => Promise<AppStateSnapshot>;
   clearLogs: () => Promise<AppStateSnapshot>;
-  testAlertPopup: () => Promise<void>;
+  syncSystemLocaleToDefault: () => Promise<LocaleSyncResult>;
+  restoreDefaultChinaLocale: () => Promise<LocaleSyncResult>;
   // 窗口控制（主面板与自绘警告窗通用）
   minimizeMain: () => void;
   closeMain: () => void;

@@ -1,16 +1,28 @@
 import React, { useEffect, useRef, useState } from 'react';
-import { AlertTriangle, ArrowRight, CheckCircle2, ShieldAlert, WifiOff, X } from 'lucide-react';
+import {
+  AlertTriangle,
+  ArrowRight,
+  CheckCircle2,
+  Clock,
+  ShieldAlert,
+  Skull,
+  WifiOff,
+  X,
+} from 'lucide-react';
 import { AlertPayload } from '../shared/types';
 import { CountryFlag } from './CountryFlag';
 
 function playAlertChime(type: AlertPayload['alertType']): void {
   if (type === 'recovered') return;
   try {
-    const AudioCtx = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+    const AudioCtx =
+      window.AudioContext ||
+      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
     const ctx = new AudioCtx();
     const now = ctx.currentTime;
 
-    const notes = type === 'mismatch' ? [880, 622.25, 880] : [660, 440];
+    const notes =
+      type === 'mismatch' || type === 'locale-mismatch' ? [880, 622.25, 880] : [660, 440];
     notes.forEach((freq, idx) => {
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
@@ -59,13 +71,24 @@ export const AlertPopup: React.FC = () => {
 
   const isRecovered = payload.alertType === 'recovered';
   const isDisconnect = payload.alertType === 'disconnect';
+  const isLocaleMismatch = payload.alertType === 'locale-mismatch';
+
+  const cardClass = isRecovered
+    ? 'alert-recovered'
+    : isDisconnect
+    ? 'alert-disconnect'
+    : 'alert-mismatch';
+
+  const titleText = isRecovered
+    ? '代理出口已恢复正常'
+    : isDisconnect
+    ? '代理连接异常断开警告'
+    : isLocaleMismatch
+    ? '系统时区/区域不符 · 进程已拦截！'
+    : '代理 IP 地区变更警告！';
 
   return (
-    <div
-      className={`alert-popup-card ${
-        isRecovered ? 'alert-recovered' : isDisconnect ? 'alert-disconnect' : 'alert-mismatch'
-      }`}
-    >
+    <div className={`alert-popup-card ${cardClass}`}>
       {/* 顶部可拖拽标题条 */}
       <div className="alert-header drag-region">
         <div className="alert-title-row">
@@ -74,17 +97,13 @@ export const AlertPopup: React.FC = () => {
               <CheckCircle2 size={18} />
             ) : isDisconnect ? (
               <WifiOff size={18} />
+            ) : isLocaleMismatch ? (
+              <Clock size={18} />
             ) : (
               <ShieldAlert size={18} />
             )}
           </span>
-          <span className="alert-title-text">
-            {isRecovered
-              ? '代理出口已恢复正常'
-              : isDisconnect
-              ? '代理连接异常断开警告'
-              : '代理 IP 地区变更警告！'}
-          </span>
+          <span className="alert-title-text">{titleText}</span>
         </div>
         <button
           className="icon-close-btn no-drag"
@@ -109,6 +128,36 @@ export const AlertPopup: React.FC = () => {
             <div className="disconnect-err-msg">
               <AlertTriangle size={15} />
               <span>{payload.errorDetail || '无法通过代理连接网络，请立即检查 VPN 状态！'}</span>
+            </div>
+          </div>
+        ) : isLocaleMismatch ? (
+          <div className="alert-compare-grid">
+            <div className="compare-box expected">
+              <span className="compare-label">保护/出口地区</span>
+              <div className="compare-region-main">
+                <CountryFlag code={payload.expectedCode} size="md" />
+                <div className="compare-region-text">
+                  <strong>{payload.expectedName || '未设'}</strong>
+                  <small>{payload.expectedCode}</small>
+                </div>
+              </div>
+            </div>
+
+            <div className="compare-arrow">
+              <ArrowRight size={18} />
+            </div>
+
+            <div className="compare-box actual danger">
+              <span className="compare-label">当前系统区域</span>
+              <div className="compare-region-main">
+                <CountryFlag code={payload.sysRegionCode || 'CN'} size="md" />
+                <div className="compare-region-text">
+                  <strong>{payload.sysRegionName || '未知'}</strong>
+                  <small title={payload.sysTimeZoneDisplay}>
+                    {payload.sysTimeZoneDisplay || payload.sysRegionCode}
+                  </small>
+                </div>
+              </div>
             </div>
           </div>
         ) : (
@@ -141,6 +190,25 @@ export const AlertPopup: React.FC = () => {
           </div>
         )}
 
+        {/* 已强杀进程醒目提示条 */}
+        {payload.killedProcesses && payload.killedProcesses.length > 0 && (
+          <div className="alert-killed-banner">
+            <Skull size={14} />
+            <span className="ellipsis" title={payload.killedProcesses.join(', ')}>
+              已强杀进程树：{payload.killedProcesses.join(', ')}
+            </span>
+          </div>
+        )}
+
+        {payload.killError && (
+          <div className="alert-kill-error">
+            <AlertTriangle size={13} />
+            <span className="ellipsis" title={payload.killError}>
+              {payload.killError}
+            </span>
+          </div>
+        )}
+
         <div className="alert-meta-lines">
           {payload.actualIp && (
             <div className="alert-meta-item">
@@ -155,7 +223,7 @@ export const AlertPopup: React.FC = () => {
           )}
           <div className="alert-meta-item">
             <span className="meta-k">触发原因：</span>
-            <span className="meta-v ellipsis">
+            <span className="meta-v ellipsis" title={payload.triggerReason}>
               {payload.activeNode ? `[${payload.activeNode}] · ` : ''}
               {payload.triggerReason}
             </span>
@@ -165,15 +233,19 @@ export const AlertPopup: React.FC = () => {
 
       {/* 底部快捷处置按钮 */}
       <div className="alert-actions no-drag">
-        {!isRecovered && !isDisconnect && payload.actualCode && payload.actualCode !== 'UNKNOWN' && (
-          <button
-            className="btn-alert-secondary"
-            onClick={() => void window.guardAPI.acceptCurrentAsDefaultFromAlert()}
-            title="如果你是主动切换了节点，可一键将当前新地区更新为默认"
-          >
-            设为新默认 ({payload.actualName})
-          </button>
-        )}
+        {!isRecovered &&
+          !isDisconnect &&
+          !isLocaleMismatch &&
+          payload.actualCode &&
+          payload.actualCode !== 'UNKNOWN' && (
+            <button
+              className="btn-alert-secondary"
+              onClick={() => void window.guardAPI.acceptCurrentAsDefaultFromAlert()}
+              title="如果你是主动切换了节点，可一键将当前新地区更新为默认"
+            >
+              设为新默认 ({payload.actualName})
+            </button>
+          )}
         <button
           className="btn-alert-ghost"
           onClick={() => window.guardAPI.openMainFromAlert()}

@@ -1,18 +1,24 @@
 import React, { useEffect, useState } from 'react';
 import {
   Activity,
+  AlertTriangle,
   BellRing,
   Check,
+  Clock,
   Copy,
+  Globe,
   History,
   Lock,
   Minus,
+  Plus,
   Radio,
   RefreshCw,
+  RotateCcw,
   Settings,
   Shield,
   ShieldAlert,
   ShieldCheck,
+  ShieldOff,
   Sparkles,
   Trash2,
   Unlock,
@@ -21,9 +27,15 @@ import {
 } from 'lucide-react';
 import { AppConfig, AppStateSnapshot } from '../shared/types';
 import { COMMON_COUNTRIES } from '../shared/countries';
+import { inspectProcessPattern } from '../shared/processPattern';
+import {
+  DEFAULT_CHINA_REGION_CODE,
+  DEFAULT_CHINA_TIMEZONE_ID,
+  isWindowsLocaleMatchingCountry,
+} from '../shared/timezones';
 import { CountryFlag } from './CountryFlag';
 
-type ActiveTab = 'monitor' | 'settings' | 'logs';
+type ActiveTab = 'monitor' | 'guard' | 'settings' | 'logs';
 
 export const MainDashboard: React.FC = () => {
   const [state, setState] = useState<AppStateSnapshot | null>(null);
@@ -35,6 +47,16 @@ export const MainDashboard: React.FC = () => {
   const [manualHost, setManualHost] = useState('127.0.0.1');
   const [manualPort, setManualPort] = useState('7890');
   const [customProbe, setCustomProbe] = useState('');
+
+  // 进程匹配规则输入态
+  const [patternInput, setPatternInput] = useState('');
+  const [patternSubmitErr, setPatternSubmitErr] = useState<string | null>(null);
+
+  // 时区同步/还原即时反馈提示
+  const [localeFeedback, setLocaleFeedback] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
 
   useEffect(() => {
     void window.guardAPI.getState().then((initial) => {
@@ -65,7 +87,17 @@ export const MainDashboard: React.FC = () => {
     );
   }
 
-  const { status, isChecking, config, lastProbe, lastError, clashInfo, logs } = state;
+  const {
+    status,
+    isChecking,
+    isSyncingLocale,
+    config,
+    winLocale,
+    lastProbe,
+    lastError,
+    clashInfo,
+    logs,
+  } = state;
 
   const handleCopyIp = () => {
     if (!lastProbe?.ip) return;
@@ -91,6 +123,58 @@ export const MainDashboard: React.FC = () => {
   const handleSaveCustomProbe = async () => {
     const next = await window.guardAPI.updateConfig({
       customProbeUrl: customProbe.trim(),
+    });
+    setState(next);
+  };
+
+  const showTimedLocaleFeedback = (ok: boolean, text: string) => {
+    setLocaleFeedback({ ok, text });
+    setTimeout(() => {
+      setLocaleFeedback((prev) => (prev && prev.text === text ? null : prev));
+    }, 5500);
+  };
+
+  const handleSyncLocale = async () => {
+    setLocaleFeedback(null);
+    const res = await window.guardAPI.syncSystemLocaleToDefault();
+    setState(res.state);
+    showTimedLocaleFeedback(res.ok, res.message);
+  };
+
+  const handleRestoreLocale = async () => {
+    setLocaleFeedback(null);
+    const res = await window.guardAPI.restoreDefaultChinaLocale();
+    setState(res.state);
+    showTimedLocaleFeedback(res.ok, res.message);
+  };
+
+  const handleAddPattern = async () => {
+    const check = inspectProcessPattern(patternInput);
+    if (!check.valid) {
+      setPatternSubmitErr(check.error || '规则格式不正确');
+      return;
+    }
+
+    const exists = config.protectedProcessPatterns.some(
+      (p) => p.toLowerCase() === check.normalized.toLowerCase()
+    );
+    if (exists) {
+      setPatternSubmitErr('该规则已在守护列表中');
+      return;
+    }
+
+    setPatternSubmitErr(null);
+    setPatternInput('');
+    const next = await window.guardAPI.updateConfig({
+      protectedProcessPatterns: [...config.protectedProcessPatterns, check.normalized],
+    });
+    setState(next);
+  };
+
+  const handleRemovePattern = async (target: string) => {
+    const filtered = config.protectedProcessPatterns.filter((p) => p !== target);
+    const next = await window.guardAPI.updateConfig({
+      protectedProcessPatterns: filtered,
     });
     setState(next);
   };
@@ -128,6 +212,25 @@ export const MainDashboard: React.FC = () => {
     Boolean(config.defaultCountryCode) &&
     lastProbe?.countryCode === config.defaultCountryCode;
 
+  // 判断当前 Windows 时区与区域是否与目标地区一致
+  const localeRefCountryCode =
+    config.defaultCountryCode ||
+    (lastProbe?.countryCode && lastProbe.countryCode !== 'UNKNOWN' ? lastProbe.countryCode : null);
+
+  const isWinLocaleMatched = localeRefCountryCode
+    ? isWindowsLocaleMatchingCountry(
+        winLocale.timeZoneId,
+        winLocale.regionCode,
+        localeRefCountryCode
+      )
+    : true;
+
+  const isAlreadyChinaDefaultLocale =
+    winLocale.regionCode.toUpperCase() === DEFAULT_CHINA_REGION_CODE &&
+    winLocale.timeZoneId.toLowerCase() === DEFAULT_CHINA_TIMEZONE_ID.toLowerCase();
+
+  const livePatternCheck = patternInput.trim() ? inspectProcessPattern(patternInput) : null;
+
   return (
     <div className="dashboard-window">
       {/* 自绘无边框标题栏 */}
@@ -161,22 +264,32 @@ export const MainDashboard: React.FC = () => {
           className={`nav-tab ${activeTab === 'monitor' ? 'active' : ''}`}
           onClick={() => setActiveTab('monitor')}
         >
-          <Activity size={15} />
+          <Activity size={14} />
           <span>实时监控</span>
+        </button>
+        <button
+          className={`nav-tab ${activeTab === 'guard' ? 'active' : ''}`}
+          onClick={() => setActiveTab('guard')}
+        >
+          <ShieldAlert size={14} />
+          <span>进程守护</span>
+          {config.protectedProcessPatterns.length > 0 && (
+            <span className="tab-count">{config.protectedProcessPatterns.length}</span>
+          )}
         </button>
         <button
           className={`nav-tab ${activeTab === 'settings' ? 'active' : ''}`}
           onClick={() => setActiveTab('settings')}
         >
-          <Settings size={15} />
-          <span>代理与提醒设置</span>
+          <Settings size={14} />
+          <span>代理设置</span>
         </button>
         <button
           className={`nav-tab ${activeTab === 'logs' ? 'active' : ''}`}
           onClick={() => setActiveTab('logs')}
         >
-          <History size={15} />
-          <span>变更日志</span>
+          <History size={14} />
+          <span>日志</span>
           {logs.length > 0 && <span className="tab-count">{logs.length}</span>}
         </button>
       </nav>
@@ -291,12 +404,12 @@ export const MainDashboard: React.FC = () => {
                         <strong>
                           {config.defaultCountryName} ({config.defaultCountryCode})
                         </strong>
-                        <small>当检测到出口偏离该国家/地区时立即变红并置顶弹窗</small>
+                        <small>偏离该国家/地区时立即变红弹窗并按策略终止守护进程</small>
                       </div>
                     </>
                   ) : (
                     <div className="default-unset-hint">
-                      <span>尚未锁定默认地区。选好 VPN 代理后，点击右侧按钮一键锁定。</span>
+                      <span>尚未锁定默认地区。选好 VPN 代理后，点击下方按钮一键锁定。</span>
                     </div>
                   )}
                 </div>
@@ -304,7 +417,9 @@ export const MainDashboard: React.FC = () => {
                 <div className="default-actions-row">
                   <button
                     className={`btn-primary-set ${isCurrentAlreadyDefault ? 'btn-already' : ''}`}
-                    disabled={!lastProbe || lastProbe.countryCode === 'UNKNOWN' || isCurrentAlreadyDefault}
+                    disabled={
+                      !lastProbe || lastProbe.countryCode === 'UNKNOWN' || isCurrentAlreadyDefault
+                    }
                     onClick={() => void window.guardAPI.setDefaultCurrent()}
                   >
                     <Sparkles size={15} />
@@ -337,7 +452,90 @@ export const MainDashboard: React.FC = () => {
               </div>
             </section>
 
-            {/* 3. Clash 实时引擎与离线库状态卡片 */}
+            {/* 3. Windows 时区与区域同步卡片（对应系统设置图1信息） */}
+            <section className="panel-card">
+              <div className="panel-card-header">
+                <div className="panel-title">
+                  <Globe size={15} />
+                  <span>Windows 时区与区域</span>
+                </div>
+                {localeRefCountryCode && (
+                  <span
+                    className={`mini-badge ${isWinLocaleMatched ? 'connected' : 'warn-badge'}`}
+                  >
+                    {isWinLocaleMatched ? '已与目标地区一致' : '与出口/默认地区不一致'}
+                  </span>
+                )}
+              </div>
+
+              <div className="win-locale-grid">
+                <div className="win-locale-box">
+                  <div className="win-locale-icon">
+                    <Clock size={16} />
+                  </div>
+                  <div className="win-locale-info">
+                    <span className="win-locale-label">时区</span>
+                    <strong
+                      className="win-locale-val ellipsis"
+                      title={winLocale.timeZoneDisplayName}
+                    >
+                      {winLocale.timeZoneDisplayName}
+                    </strong>
+                  </div>
+                </div>
+
+                <div className="win-locale-box region-box">
+                  <div className="win-locale-icon">
+                    <CountryFlag code={winLocale.regionCode} size="sm" />
+                  </div>
+                  <div className="win-locale-info">
+                    <span className="win-locale-label">区域</span>
+                    <strong className="win-locale-val">{winLocale.regionName}</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div className="locale-actions-row">
+                <button
+                  className="btn-sync-locale"
+                  disabled={!config.defaultCountryCode || isSyncingLocale}
+                  onClick={() => void handleSyncLocale()}
+                  title={
+                    config.defaultCountryCode
+                      ? '自动识别出口 IP 精确城市时区并修改 Windows 时区与区域'
+                      : '请先在上方设置默认保护地区'
+                  }
+                >
+                  <RefreshCw className={isSyncingLocale ? 'spin' : ''} size={14} />
+                  <span>
+                    {isSyncingLocale
+                      ? '正在设置系统时区...'
+                      : config.defaultCountryCode
+                      ? `一键同步至 [${config.defaultCountryName}]`
+                      : '请先设置默认保护地区'}
+                  </span>
+                </button>
+
+                <button
+                  className={`btn-restore-locale ${isAlreadyChinaDefaultLocale ? 'is-cn' : ''}`}
+                  disabled={isSyncingLocale}
+                  onClick={() => void handleRestoreLocale()}
+                  title="若当前出口非中国且开启了进程守护，将先强杀守护进程再还原回中国时区与区域"
+                >
+                  <RotateCcw size={14} />
+                  <span>还原默认时区</span>
+                </button>
+              </div>
+
+              {localeFeedback && (
+                <div className={`locale-feedback ${localeFeedback.ok ? 'ok' : 'err'}`}>
+                  {localeFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
+                  <span>{localeFeedback.text}</span>
+                </div>
+              )}
+            </section>
+
+            {/* 4. Clash 实时引擎与离线库状态卡片 */}
             <section className="panel-card compact-card">
               <div className="panel-card-header">
                 <div className="panel-title">
@@ -377,13 +575,190 @@ export const MainDashboard: React.FC = () => {
               <div className="engine-bottom-bar">
                 <span className="db-tag">离线库：{state.geoDbSource}</span>
                 <button
-                  className="btn-preview-alert"
-                  onClick={() => void window.guardAPI.testAlertPopup()}
+                  className={`guard-quick-pill ${
+                    config.killProcessesEnabled && config.protectedProcessPatterns.length > 0
+                      ? 'active'
+                      : ''
+                  }`}
+                  onClick={() => setActiveTab('guard')}
                 >
-                  <BellRing size={13} />
-                  <span>预览警告弹窗</span>
+                  {config.killProcessesEnabled && config.protectedProcessPatterns.length > 0 ? (
+                    <>
+                      <ShieldCheck size={13} />
+                      <span>进程守护：{config.protectedProcessPatterns.length} 条规则生效</span>
+                    </>
+                  ) : (
+                    <>
+                      <ShieldOff size={13} />
+                      <span>配置进程守护</span>
+                    </>
+                  )}
                 </button>
               </div>
+            </section>
+          </div>
+        )}
+
+        {activeTab === 'guard' && (
+          <div className="tab-pane">
+            {/* 1. 强杀触发策略卡片 */}
+            <section className="panel-card">
+              <div className="panel-card-header">
+                <div className="panel-title">
+                  <ShieldAlert size={15} />
+                  <span>异常自动终止进程策略</span>
+                </div>
+              </div>
+
+              <div className="setting-row">
+                <div>
+                  <strong>启用异常自动强杀进程（总开关）</strong>
+                  <p>
+                    触发时按进程树 (<code>taskkill /F /T</code>) 连带所有同名多进程及派生子进程一并强杀，异常未恢复期间禁止重开
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="toggle-switch"
+                  checked={config.killProcessesEnabled}
+                  onChange={(e) =>
+                    void window.guardAPI.updateConfig({ killProcessesEnabled: e.target.checked })
+                  }
+                />
+              </div>
+
+              <div className="setting-row">
+                <div>
+                  <strong>代理断连 / 超时同样强杀</strong>
+                  <p>当已设置默认保护地区但代理连接失败或节点超时时，立即终止守护进程</p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="toggle-switch"
+                  disabled={!config.killProcessesEnabled}
+                  checked={config.killOnDisconnect}
+                  onChange={(e) =>
+                    void window.guardAPI.updateConfig({ killOnDisconnect: e.target.checked })
+                  }
+                />
+              </div>
+
+              <div className="setting-row no-border-bottom">
+                <div>
+                  <strong>系统时区 / 区域不一致时同样强杀</strong>
+                  <p>
+                    还原默认时区若与 IP 不一致将「先杀进程再还原」；平时若忘改时区误启动受保护应用也会立即拦截
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="toggle-switch"
+                  disabled={!config.killProcessesEnabled}
+                  checked={config.killOnLocaleMismatch}
+                  onChange={(e) =>
+                    void window.guardAPI.updateConfig({ killOnLocaleMismatch: e.target.checked })
+                  }
+                />
+              </div>
+            </section>
+
+            {/* 2. 进程匹配规则列表卡片（仅手动输入，智能兼容通配符与正则） */}
+            <section className="panel-card">
+              <div className="panel-card-header">
+                <div className="panel-title">
+                  <Lock size={15} />
+                  <span>受保护应用进程规则列表</span>
+                </div>
+                <span className="mini-badge neutral">
+                  共 {config.protectedProcessPatterns.length} 条
+                </span>
+              </div>
+
+              <div className="pattern-input-group">
+                <div className="pattern-input-row">
+                  <input
+                    type="text"
+                    value={patternInput}
+                    onChange={(e) => {
+                      setPatternInput(e.target.value);
+                      if (patternSubmitErr) setPatternSubmitErr(null);
+                    }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') {
+                        void handleAddPattern();
+                      }
+                    }}
+                    placeholder="输入进程名、通配符或正则，如 claude*.exe"
+                  />
+                  <button className="btn-save-inline" onClick={() => void handleAddPattern()}>
+                    <Plus size={14} />
+                    <span>添加</span>
+                  </button>
+                </div>
+
+                {patternSubmitErr ? (
+                  <div className="pattern-hint err">
+                    <AlertTriangle size={12} />
+                    <span>{patternSubmitErr}</span>
+                  </div>
+                ) : livePatternCheck ? (
+                  livePatternCheck.valid ? (
+                    <div className="pattern-hint valid">
+                      <Check size={12} />
+                      <span>
+                        识别为
+                        <strong>
+                          {livePatternCheck.mode === 'regex' ? ' 正则表达式 ' : ' 通配符 '}
+                        </strong>
+                        模式（大小写不敏感，回车即可添加）
+                      </span>
+                    </div>
+                  ) : (
+                    <div className="pattern-hint err">
+                      <AlertTriangle size={12} />
+                      <span>{livePatternCheck.error}</span>
+                    </div>
+                  )
+                ) : (
+                  <p className="pattern-syntax-tip">
+                    支持通配符（如 <code>claude*.exe</code>、<code>*cursor*</code>）与正则表达式（如{' '}
+                    <code>/^(claude|cursor).*\.exe$/</code>），均不区分大小写。
+                  </p>
+                )}
+              </div>
+
+              {config.protectedProcessPatterns.length === 0 ? (
+                <div className="pattern-empty">
+                  暂无守护进程规则。添加如 <code>claude*.exe</code> 后，一旦 IP 地区跳变或系统时区不符将瞬间强杀该应用全部关联进程。
+                </div>
+              ) : (
+                <div className="pattern-list">
+                  {config.protectedProcessPatterns.map((pat) => {
+                    const info = inspectProcessPattern(pat);
+                    return (
+                      <div key={pat} className="pattern-item">
+                        <div className="pattern-item-left">
+                          <code className="pattern-code">{pat}</code>
+                          <span
+                            className={`pattern-mode-tag ${
+                              info.mode === 'regex' ? 'regex' : 'wildcard'
+                            }`}
+                          >
+                            {info.mode === 'regex' ? '正则' : '通配符'}
+                          </span>
+                        </div>
+                        <button
+                          className="btn-remove-pattern"
+                          onClick={() => void handleRemovePattern(pat)}
+                          title="移除该规则"
+                        >
+                          <Trash2 size={14} />
+                        </button>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </section>
           </div>
         )}
@@ -409,7 +784,9 @@ export const MainDashboard: React.FC = () => {
                   />
                   <div>
                     <strong>自动识别（推荐）</strong>
-                    <p>优先读取 Windows 系统代理；若未开系统代理则自动识别 Clash 本地混合端口或 TUN 网卡</p>
+                    <p>
+                      优先读取 Windows 系统代理；若未开系统代理则自动识别 Clash 本地混合端口或 TUN 网卡
+                    </p>
                   </div>
                 </label>
 
@@ -448,7 +825,10 @@ export const MainDashboard: React.FC = () => {
                       onChange={(e) => setManualPort(e.target.value)}
                       placeholder="7890"
                     />
-                    <button className="btn-save-inline" onClick={() => void handleSaveManualProxy()}>
+                    <button
+                      className="btn-save-inline"
+                      onClick={() => void handleSaveManualProxy()}
+                    >
                       保存重测
                     </button>
                   </div>
@@ -504,7 +884,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>软件自绘置顶警告弹窗</strong>
-                  <p>地区变更时在屏幕右下角弹出强置顶卡片（不受系统勿扰模式屏蔽）</p>
+                  <p>地区变更或进程拦截时在屏幕右下角弹出强置顶卡片（不受系统勿扰模式屏蔽）</p>
                 </div>
                 <input
                   type="checkbox"
@@ -519,7 +899,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>异常警告提示音</strong>
-                  <p>弹出地区变更或断连警告时播放短促提示音</p>
+                  <p>弹出地区变更、断连或进程拦截警告时播放短促提示音</p>
                 </div>
                 <input
                   type="checkbox"
@@ -577,7 +957,9 @@ export const MainDashboard: React.FC = () => {
               </div>
 
               <div className="custom-probe-box">
-                <label>自定义回显探测 URL（留空默认使用 Cloudflare / AWS 全球基础设施互备）：</label>
+                <label>
+                  自定义回显探测 URL（留空默认使用 Cloudflare / AWS 全球基础设施互备）：
+                </label>
                 <div className="custom-probe-row">
                   <input
                     type="text"
@@ -585,7 +967,10 @@ export const MainDashboard: React.FC = () => {
                     onChange={(e) => setCustomProbe(e.target.value)}
                     placeholder="例如 https://cp.cloudflare.com/cdn-cgi/trace"
                   />
-                  <button className="btn-save-inline" onClick={() => void handleSaveCustomProbe()}>
+                  <button
+                    className="btn-save-inline"
+                    onClick={() => void handleSaveCustomProbe()}
+                  >
                     应用
                   </button>
                 </div>

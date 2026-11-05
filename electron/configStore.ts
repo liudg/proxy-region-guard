@@ -26,7 +26,28 @@ export const DEFAULT_CONFIG: AppConfig = {
   alertOnDisconnect: true,
   closeToTray: true,
   autoLaunch: false,
+  killProcessesEnabled: true,
+  killOnDisconnect: true,
+  killOnLocaleMismatch: true,
+  protectedProcessPatterns: [],
 };
+
+function sanitizePatternList(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item !== 'string') continue;
+    const trimmed = item.trim();
+    if (!trimmed) continue;
+    const key = trimmed.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(trimmed);
+    }
+  }
+  return out;
+}
 
 export class ConfigStore {
   private filePath: string;
@@ -54,6 +75,7 @@ export class ConfigStore {
             ...DEFAULT_CONFIG.clashCustomController,
             ...(parsed.clashCustomController || {}),
           },
+          protectedProcessPatterns: sanitizePatternList(parsed.protectedProcessPatterns),
         };
         if (merged.defaultCountryCode && !merged.defaultCountryName) {
           merged.defaultCountryName = getCountryNameZh(merged.defaultCountryCode);
@@ -63,7 +85,7 @@ export class ConfigStore {
     } catch (err) {
       console.error('[ConfigStore] Failed to load config, using defaults:', err);
     }
-    return { ...DEFAULT_CONFIG };
+    return structuredClone(DEFAULT_CONFIG);
   }
 
   public get(): AppConfig {
@@ -82,6 +104,10 @@ export class ConfigStore {
         ...this.config.clashCustomController,
         ...(partial.clashCustomController || {}),
       },
+      protectedProcessPatterns:
+        partial.protectedProcessPatterns !== undefined
+          ? sanitizePatternList(partial.protectedProcessPatterns)
+          : this.config.protectedProcessPatterns,
     };
 
     if (this.config.defaultCountryCode) {

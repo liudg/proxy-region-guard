@@ -64,8 +64,8 @@ function createMainWindow(revealOnReady = true): void {
   const icon = createWindowAppIcon('unset');
 
   mainWindow = new BrowserWindow({
-    width: 500,
-    height: 720,
+    width: 510,
+    height: 750,
     minWidth: 460,
     minHeight: 640,
     center: true,
@@ -128,7 +128,7 @@ function ensureAlertWindow(): BrowserWindow {
   }
 
   alertWindow = new BrowserWindow({
-    width: 410,
+    width: 420,
     height: 276,
     frame: false,
     transparent: true,
@@ -179,8 +179,14 @@ function showCustomAlertPopup(payload: AlertPayload): void {
   latestAlertPayload = payload;
   const win = ensureAlertWindow();
 
+  const hasKilledInfo =
+    Boolean(payload.killedProcesses && payload.killedProcesses.length > 0) ||
+    Boolean(payload.killError);
+  const targetHeight = hasKilledInfo ? 318 : 276;
+
   const sendAndShow = () => {
     if (win.isDestroyed()) return;
+    win.setSize(420, targetHeight, false);
     positionAlertWindow(win);
     win.setAlwaysOnTop(true, 'screen-saver');
     win.webContents.send('guard:alert-data', payload);
@@ -202,6 +208,8 @@ function notifyAlertRecovered(payload: AlertPayload): void {
     return;
   }
   latestAlertPayload = payload;
+  alertWindow.setSize(420, 276, false);
+  positionAlertWindow(alertWindow);
   alertWindow.webContents.send('guard:alert-data', payload);
 
   if (alertAutoCloseTimer) {
@@ -263,6 +271,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     `代理地区卫士 · ${statusLabelMap[state.status]}`,
     `当前出口: ${curText}`,
     `默认地区: ${defText}`,
+    `系统区域: ${state.winLocale.regionName} (${state.winLocale.regionCode})`,
     state.clashInfo.connected ? `Clash节点: ${state.clashInfo.activeNode || state.clashInfo.mode}` : '',
   ]
     .filter(Boolean)
@@ -281,6 +290,10 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     },
     {
       label: `默认: ${defText}`,
+      enabled: false,
+    },
+    {
+      label: `系统区域: ${state.winLocale.regionName}`,
       enabled: false,
     },
     { type: 'separator' },
@@ -306,9 +319,19 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       },
     },
     {
-      label: '预览警告弹窗效果',
+      label: state.config.defaultCountryName
+        ? `一键同步系统时区与区域 (${state.config.defaultCountryName})`
+        : '一键同步系统时区与区域 (需先设默认)',
+      enabled: Boolean(state.config.defaultCountryCode) && !state.isSyncingLocale,
       click: () => {
-        showCustomAlertPopup(probeEngine.buildTestAlertPayload());
+        void probeEngine.syncSystemLocaleToDefault();
+      },
+    },
+    {
+      label: '还原默认中国时区与区域',
+      enabled: !state.isSyncingLocale,
+      click: () => {
+        void probeEngine.restoreDefaultChinaLocale();
       },
     },
     { type: 'separator' },
@@ -416,9 +439,9 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('guard:clear-logs', () => probeEngine.clearLogs());
 
-  ipcMain.handle('guard:test-alert', () => {
-    showCustomAlertPopup(probeEngine.buildTestAlertPayload());
-  });
+  ipcMain.handle('guard:sync-locale', () => probeEngine.syncSystemLocaleToDefault());
+
+  ipcMain.handle('guard:restore-locale', () => probeEngine.restoreDefaultChinaLocale());
 
   ipcMain.handle('guard:get-alert-data', () => latestAlertPayload);
 

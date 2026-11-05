@@ -1,5 +1,10 @@
 import { contextBridge, ipcRenderer } from 'electron';
-import { AlertPayload, AppConfig, AppStateSnapshot, GuardBridgeAPI } from '../src/shared/types';
+import {
+  AlertPayload,
+  AppConfig,
+  AppStateSnapshot,
+  GuardBridgeAPI,
+} from '../src/shared/types';
 
 const api: GuardBridgeAPI = {
   getState: () => ipcRenderer.invoke('guard:get-state'),
@@ -8,7 +13,8 @@ const api: GuardBridgeAPI = {
   setDefaultRegion: (code: string | null) => ipcRenderer.invoke('guard:set-default-region', code),
   updateConfig: (partial: Partial<AppConfig>) => ipcRenderer.invoke('guard:update-config', partial),
   clearLogs: () => ipcRenderer.invoke('guard:clear-logs'),
-  testAlertPopup: () => ipcRenderer.invoke('guard:test-alert'),
+  syncSystemLocaleToDefault: () => ipcRenderer.invoke('guard:sync-locale'),
+  restoreDefaultChinaLocale: () => ipcRenderer.invoke('guard:restore-locale'),
 
   minimizeMain: () => ipcRenderer.send('window:minimize-main'),
   closeMain: () => ipcRenderer.send('window:close-main'),
