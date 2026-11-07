@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import * as path from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import {
   compileValidPatterns,
   CRITICAL_SYSTEM_PROCESSES,
@@ -14,7 +15,7 @@ export interface ProcessKillReport {
   errorDetail?: string;
 }
 
-interface RunningProcEntry {
+export interface RunningProcEntry {
   imageName: string;
   pid: number;
 }
@@ -25,6 +26,7 @@ const CRITICAL_SYSTEM_SET = new Set<string>(CRITICAL_SYSTEM_PROCESSES);
 const PROTECTED_PROXY_INFRA_SET = new Set<string>([
   'verge-mihomo.exe',
   'verge-mihomo-alpha.exe',
+  'clash-verge-service.exe',
   'mihomo.exe',
   'mihomo-party.exe',
   'clash.exe',
@@ -54,7 +56,7 @@ export function decodeWinConsoleBuffer(buf: Buffer | string | null | undefined):
   }
 }
 
-function listRunningProcesses(): Promise<RunningProcEntry[]> {
+export function listRunningProcesses(): Promise<RunningProcEntry[]> {
   return new Promise((resolve) => {
     if (process.platform !== 'win32') {
       resolve([]);
@@ -131,10 +133,6 @@ function formatCountMap(countByName: Map<string, number>): string[] {
   return Array.from(countByName.entries()).map(([name, cnt]) =>
     cnt > 1 ? `${name} (×${cnt})` : name
   );
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 /**

@@ -1,11 +1,13 @@
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   Menu,
   screen,
   Tray,
 } from 'electron';
+import { execFileSync } from 'node:child_process';
 import * as path from 'node:path';
 import { AlertPayload, AppConfig, AppStateSnapshot } from '../src/shared/types';
 import { isValidIsoCountryCode } from '../src/shared/countries';
@@ -19,6 +21,68 @@ import {
   isLaunchedFromAutoStart,
   reconcileAutoLaunchOnStartup,
 } from './autoLaunch';
+
+const ELEVATED_RELAUNCH_FLAG = '--elevated-relaunch';
+
+function isRunningAsWindowsAdmin(): boolean {
+  if (process.platform !== 'win32') return true;
+  try {
+    execFileSync('fltmc.exe', [], { stdio: 'ignore', windowsHide: true, timeout: 1500 });
+    return true;
+  } catch {
+    try {
+      execFileSync('net.exe', ['session'], { stdio: 'ignore', windowsHide: true, timeout: 1500 });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+}
+
+function tryRelaunchAsWindowsAdmin(): boolean {
+  if (
+    process.platform !== 'win32' ||
+    process.argv.includes(ELEVATED_RELAUNCH_FLAG) ||
+    isRunningAsWindowsAdmin()
+  ) {
+    return false;
+  }
+
+  try {
+    const appDir = path.resolve(app.getAppPath());
+    const userArgs = (app.isPackaged ? process.argv.slice(1) : [appDir, ...process.argv.slice(2)]).filter(
+      (a) => a !== ELEVATED_RELAUNCH_FLAG
+    );
+    userArgs.push(ELEVATED_RELAUNCH_FLAG);
+
+    const psScript = [
+      '$ErrorActionPreference = "Stop"',
+      '$exe = $env:GUARD_ELEVATE_EXE',
+      '$cwd = $env:GUARD_ELEVATE_CWD',
+      '$argList = @(ConvertFrom-Json $env:GUARD_ELEVATE_ARGS)',
+      'Start-Process -FilePath $exe -WorkingDirectory $cwd -ArgumentList $argList -Verb RunAs',
+    ].join('; ');
+
+    execFileSync(
+      'powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', psScript],
+      {
+        stdio: 'ignore',
+        windowsHide: true,
+        timeout: 15000,
+        env: {
+          ...process.env,
+          GUARD_ELEVATE_EXE: process.execPath,
+          GUARD_ELEVATE_CWD: process.cwd(),
+          GUARD_ELEVATE_ARGS: JSON.stringify(userArgs),
+        },
+      }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 if (process.platform === 'win32') {
   app.setAppUserModelId('com.antigravity.proxy-region-guard');
@@ -61,10 +125,10 @@ function createMainWindow(revealOnReady = true): void {
   const icon = createWindowAppIcon('unset');
 
   mainWindow = new BrowserWindow({
-    width: 510,
-    height: 750,
-    minWidth: 460,
-    minHeight: 640,
+    width: 530,
+    height: 760,
+    minWidth: 480,
+    minHeight: 650,
     center: true,
     frame: false,
     transparent: false,
@@ -138,7 +202,6 @@ function hideAlertWindow(): void {
 function resizeAlertWindow(win: BrowserWindow, width: number, height: number): void {
   const [curW, curH] = win.getSize();
   if (curW === width && curH === height) return;
-  // Windows 下 resizable: false 窗口需临时解锁再改尺寸方可生效
   suppressAlertMoveTrack = true;
   win.setResizable(true);
   win.setSize(width, height, false);
@@ -237,7 +300,6 @@ function showCustomAlertPopup(payload: AlertPayload): void {
     win.setAlwaysOnTop(true, 'screen-saver');
     win.webContents.send('guard:alert-data', currentPayload);
     if (!wasVisible) {
-      // showInactive 既能强置顶浮现，又不会抢夺用户正在输入的键盘焦点
       win.showInactive();
     }
   };
@@ -304,43 +366,54 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     ? `${state.lastProbe.countryName} (${state.lastProbe.countryCode}) · ${state.lastProbe.ip}`
     : state.lastError || '检测中...';
 
-  const defText = state.config.defaultCountryCode
-    ? `${state.config.defaultCountryName} (${state.config.defaultCountryCode})`
-    : '未设置';
+  const nodeText = state.config.selectedClashNode
+    ? `指定节点: ${state.config.selectedClashNode}`
+    : state.clashInfo.connected
+    ? `Clash全局: ${state.clashInfo.activeNode || state.clashInfo.mode}`
+    : '未指定节点';
+
+  const claudeText = state.claudeState.running
+    ? 'Claude: 🟢 受控运行中'
+    : state.claudeState.canLaunch
+    ? 'Claude: 就绪可启动'
+    : 'Claude: 待校验';
 
   const statusLabelMap: Record<AppStateSnapshot['status'], string> = {
-    ok: '🟢 地区一致 (正常)',
-    mismatch: '🔴 地区异常变更！',
+    ok: '🟢 代理与时区一致 (正常)',
+    mismatch: '🔴 代理或时区不一致！',
     error: '🔴 代理连接异常！',
-    unset: '🔵 未设默认地区',
+    unset: '🔵 待选择节点或保护地区',
     checking: '⏳ 正在检测...',
   };
 
   const tooltip = [
     `代理地区卫士 · ${statusLabelMap[state.status]}`,
+    nodeText,
     `当前出口: ${curText}`,
-    `默认地区: ${defText}`,
     `系统区域: ${state.winLocale.regionName} (${state.winLocale.regionCode})`,
-    state.clashInfo.connected
-      ? `Clash节点: ${state.clashInfo.activeNode || state.clashInfo.mode}`
-      : '',
+    claudeText,
   ]
     .filter(Boolean)
     .join('\n');
 
   tray.setToolTip(tooltip);
 
-  const canSetCurrentDefault = Boolean(
+  const probeValid = Boolean(
     state.lastProbe && isValidIsoCountryCode(state.lastProbe.countryCode)
   );
+  const canSyncLocale = Boolean(state.config.defaultCountryCode || probeValid);
+  const syncTargetName =
+    state.config.defaultCountryName || (probeValid ? state.lastProbe?.countryName : '') || '';
 
-  // 仅当菜单展示项实际发生变化时才重建原生菜单，避免心跳切换 isChecking 期间关闭用户已打开的右键菜单
   const menuSig = [
     state.status,
     curText,
-    defText,
+    nodeText,
     state.winLocale.regionName,
-    canSetCurrentDefault ? state.lastProbe?.countryCode : '',
+    claudeText,
+    state.claudeState.canLaunch ? '1' : '0',
+    state.claudeState.running ? '1' : '0',
+    canSyncLocale ? syncTargetName : '',
     state.isSyncingLocale ? '1' : '0',
     state.config.autoLaunch ? '1' : '0',
   ].join('|');
@@ -356,17 +429,39 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       enabled: false,
     },
     {
+      label: nodeText,
+      enabled: false,
+    },
+    {
       label: `当前: ${curText}`,
       enabled: false,
     },
     {
-      label: `默认: ${defText}`,
+      label: `系统区域: ${state.winLocale.regionName} (${state.winLocale.regionCode})`,
       enabled: false,
     },
+    { type: 'separator' },
     {
-      label: `系统区域: ${state.winLocale.regionName}`,
-      enabled: false,
+      label: state.claudeState.running
+        ? '🟢 Claude 正在受控运行 (点击重新激活)'
+        : state.claudeState.canLaunch
+        ? '🚀 安全启动 Claude Desktop'
+        : `🔒 启动 Claude (${state.claudeState.launchBlockReason || '条件未满足'})`,
+      enabled: state.claudeState.canLaunch,
+      click: () => {
+        void probeEngine.launchClaudeFromGuard();
+      },
     },
+    ...(state.claudeState.running
+      ? [
+          {
+            label: '🛑 立即终止 Claude 进程',
+            click: () => {
+              void probeEngine.terminateClaudeManually();
+            },
+          },
+        ]
+      : []),
     { type: 'separator' },
     {
       label: '立即重新检测',
@@ -375,27 +470,10 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       },
     },
     {
-      label:
-        canSetCurrentDefault && state.lastProbe
-          ? `将当前 [${state.lastProbe.countryName}] 设为默认`
-          : '将当前地区设为默认',
-      enabled: canSetCurrentDefault,
-      click: () => {
-        const snap = probeEngine.getSnapshot();
-        if (snap.lastProbe && isValidIsoCountryCode(snap.lastProbe.countryCode)) {
-          configStore.update({
-            defaultCountryCode: snap.lastProbe.countryCode,
-            defaultCountryName: snap.lastProbe.countryName,
-          });
-          probeEngine.evaluateStatusOnly('通过托盘将当前地区设为默认');
-        }
-      },
-    },
-    {
-      label: state.config.defaultCountryName
-        ? `一键同步系统时区与区域 (${state.config.defaultCountryName})`
-        : '一键同步系统时区与区域 (需先设默认)',
-      enabled: Boolean(state.config.defaultCountryCode) && !state.isSyncingLocale,
+      label: syncTargetName
+        ? `一键同步系统时区与区域 (${syncTargetName})`
+        : '一键同步系统时区与区域',
+      enabled: canSyncLocale && !state.isSyncingLocale,
       click: () => {
         void probeEngine.syncSystemLocaleToDefault();
       },
@@ -425,9 +503,10 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       click: () => showMainWindow(),
     },
     {
-      label: '完全退出程序',
+      label: '完全退出程序 (同时关闭 Claude)',
       click: () => {
         isQuitting = true;
+        probeEngine?.stop();
         app.quit();
       },
     },
@@ -471,6 +550,28 @@ function registerIpcHandlers(): void {
     );
   });
 
+  ipcMain.handle('guard:select-clash-node', (_e, nodeName: string | null) =>
+    probeEngine.selectClashNode(nodeName)
+  );
+
+  ipcMain.handle('guard:launch-claude', () => probeEngine.launchClaudeFromGuard());
+
+  ipcMain.handle('guard:terminate-claude', () => probeEngine.terminateClaudeManually());
+
+  ipcMain.handle('guard:browse-claude-exe', async () => {
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const res = await dialog.showOpenDialog(win as BrowserWindow, {
+      title: '选择 Claude Desktop 可执行文件 (Claude.exe)',
+      filters: [{ name: '可执行文件 (*.exe)', extensions: ['exe'] }],
+      properties: ['openFile'],
+    });
+    if (!res.canceled && res.filePaths.length > 0) {
+      configStore.update({ claudeExePath: res.filePaths[0] });
+      await probeEngine.refreshClaudeInstallDetection();
+    }
+    return probeEngine.getSnapshot();
+  });
+
   ipcMain.handle('guard:update-config', async (_e, partial: Partial<AppConfig>) => {
     const prevCfg = configStore.get();
     let nextCfg = configStore.update(partial);
@@ -482,8 +583,19 @@ function registerIpcHandlers(): void {
       }
     }
 
+    if (prevCfg.claudeExePath !== nextCfg.claudeExePath) {
+      await probeEngine.refreshClaudeInstallDetection();
+    }
+
     if (prevCfg.heartbeatIntervalSec !== nextCfg.heartbeatIntervalSec) {
       probeEngine.restartHeartbeatTimer();
+    }
+
+    if (
+      prevCfg.selectedClashNode !== nextCfg.selectedClashNode ||
+      prevCfg.dedicatedProxyPort !== nextCfg.dedicatedProxyPort
+    ) {
+      return probeEngine.selectClashNode(nextCfg.selectedClashNode);
     }
 
     const proxyCfgChanged =
@@ -531,6 +643,7 @@ function registerIpcHandlers(): void {
       mainWindow?.hide();
     } else {
       isQuitting = true;
+      probeEngine?.stop();
       app.quit();
     }
   });
@@ -545,58 +658,65 @@ function registerIpcHandlers(): void {
   });
 }
 
-const gotTheLock = app.requestSingleInstanceLock();
-if (!gotTheLock) {
-  app.quit();
+if (tryRelaunchAsWindowsAdmin()) {
+  app.exit(0);
 } else {
-  app.on('second-instance', () => {
-    showMainWindow();
-  });
-
-  app.whenReady().then(async () => {
-    const appRoot = app.getAppPath();
-
-    configStore = new ConfigStore();
-    const initialCfg = configStore.get();
-    const effectiveAutoLaunch = reconcileAutoLaunchOnStartup(initialCfg.autoLaunch);
-    if (effectiveAutoLaunch !== initialCfg.autoLaunch) {
-      configStore.update({ autoLaunch: effectiveAutoLaunch });
-    }
-
-    geoIpService = new GeoIpService();
-    await geoIpService.init(appRoot);
-
-    clashMonitor = new ClashMonitor();
-    probeEngine = new ProbeEngine(configStore, geoIpService, clashMonitor);
-
-    probeEngine.on('state-changed', (state: AppStateSnapshot) => {
-      broadcastState(state);
+  const gotTheLock = app.requestSingleInstanceLock();
+  if (!gotTheLock) {
+    app.quit();
+  } else {
+    app.on('second-instance', () => {
+      showMainWindow();
     });
 
-    probeEngine.on('trigger-alert', (payload: AlertPayload) => {
-      showCustomAlertPopup(payload);
+    app.whenReady().then(async () => {
+      const appRoot = app.getAppPath();
+
+      configStore = new ConfigStore();
+      const initialCfg = configStore.get();
+      const effectiveAutoLaunch = reconcileAutoLaunchOnStartup(initialCfg.autoLaunch);
+      if (effectiveAutoLaunch !== initialCfg.autoLaunch) {
+        configStore.update({ autoLaunch: effectiveAutoLaunch });
+      }
+
+      geoIpService = new GeoIpService();
+      await geoIpService.init(appRoot);
+
+      clashMonitor = new ClashMonitor();
+      probeEngine = new ProbeEngine(configStore, geoIpService, clashMonitor);
+
+      probeEngine.on('state-changed', (state: AppStateSnapshot) => {
+        broadcastState(state);
+      });
+
+      probeEngine.on('trigger-alert', (payload: AlertPayload) => {
+        showCustomAlertPopup(payload);
+      });
+
+      probeEngine.on('alert-recovered', (payload: AlertPayload) => {
+        notifyAlertRecovered(payload);
+      });
+
+      registerIpcHandlers();
+      isBootstrapped = true;
+
+      const startHiddenInTray = isLaunchedFromAutoStart() && configStore.get().closeToTray;
+      createMainWindow(!startHiddenInTray);
+      setupTray();
+
+      ensureAlertWindow();
+
+      await probeEngine.start();
     });
-
-    probeEngine.on('alert-recovered', (payload: AlertPayload) => {
-      notifyAlertRecovered(payload);
-    });
-
-    registerIpcHandlers();
-    isBootstrapped = true;
-
-    const startHiddenInTray = isLaunchedFromAutoStart() && configStore.get().closeToTray;
-    createMainWindow(!startHiddenInTray);
-    setupTray();
-
-    // 预先后台初始化隐藏警告窗，使首次告警实现瞬时弹出
-    ensureAlertWindow();
-
-    await probeEngine.start();
-  });
+  }
 }
 
 app.on('before-quit', () => {
   isQuitting = true;
+  probeEngine?.stop();
+});
+
+app.on('will-quit', () => {
   probeEngine?.stop();
 });
 

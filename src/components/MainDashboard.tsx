@@ -2,14 +2,19 @@ import React, { useEffect, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
+  Ban,
   BellRing,
+  Bot,
   Check,
+  CheckCircle2,
   Clock,
   Copy,
+  FolderOpen,
   Globe,
   History,
   Lock,
   Minus,
+  Play,
   Plus,
   Radio,
   RefreshCw,
@@ -18,12 +23,13 @@ import {
   Shield,
   ShieldAlert,
   ShieldCheck,
-  ShieldOff,
   Sparkles,
+  Square,
   Trash2,
   Unlock,
   WifiOff,
   X,
+   XCircle,
 } from 'lucide-react';
 import { AppConfig, AppStateSnapshot } from '../shared/types';
 import { COMMON_COUNTRIES, isValidIsoCountryCode } from '../shared/countries';
@@ -35,18 +41,19 @@ import {
 } from '../shared/timezones';
 import { CountryFlag } from './CountryFlag';
 
-type ActiveTab = 'monitor' | 'guard' | 'settings' | 'logs';
+type ActiveTab = 'monitor' | 'claude' | 'guard' | 'settings' | 'logs';
 
 export const MainDashboard: React.FC = () => {
   const [state, setState] = useState<AppStateSnapshot | null>(null);
-  const [activeTab, setActiveTab] = useState<ActiveTab>('monitor');
+  const [activeTab, setActiveTab] = useState<ActiveTab>('claude');
   const [copiedIp, setCopiedIp] = useState(false);
 
-  // 手动代理表单本地编辑态（点击单选框时先展开表单，点“启用并重测”才真正提交，避免用旧端口误触发断连强杀）
+  // 手动代理表单本地编辑态
   const [pendingManualMode, setPendingManualMode] = useState(false);
   const [manualProto, setManualProto] = useState<'http' | 'socks5'>('http');
   const [manualHost, setManualHost] = useState('127.0.0.1');
   const [manualPort, setManualPort] = useState('7890');
+  const [dedicatedPortInput, setDedicatedPortInput] = useState('27897');
 
   const [customProbe, setCustomProbe] = useState('');
   const [probeUrlErr, setProbeUrlErr] = useState<string | null>(null);
@@ -57,6 +64,14 @@ export const MainDashboard: React.FC = () => {
 
   // 时区同步/还原即时反馈提示
   const [localeFeedback, setLocaleFeedback] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
+
+  // Claude 启动/终止操作状态与反馈
+  const [isLaunchingClaude, setIsLaunchingClaude] = useState(false);
+  const [isSwitchingNode, setIsSwitchingNode] = useState(false);
+  const [claudeFeedback, setClaudeFeedback] = useState<{
     ok: boolean;
     text: string;
   } | null>(null);
@@ -78,6 +93,7 @@ export const MainDashboard: React.FC = () => {
     setManualProto(cfg.manualProxy.protocol);
     setManualHost(cfg.manualProxy.host);
     setManualPort(String(cfg.manualProxy.port));
+    setDedicatedPortInput(String(cfg.dedicatedProxyPort));
     setCustomProbe(cfg.customProbeUrl);
   };
 
@@ -99,6 +115,7 @@ export const MainDashboard: React.FC = () => {
     lastProbe,
     lastError,
     clashInfo,
+    claudeState,
     logs,
   } = state;
 
@@ -109,6 +126,68 @@ export const MainDashboard: React.FC = () => {
     void navigator.clipboard.writeText(lastProbe.ip);
     setCopiedIp(true);
     setTimeout(() => setCopiedIp(false), 1600);
+  };
+
+  const handleSelectClashNode = async (nodeName: string) => {
+    const val = nodeName.trim() || null;
+    setIsSwitchingNode(true);
+    try {
+      const next = await window.guardAPI.selectClashNode(val);
+      setState(next);
+    } finally {
+      setIsSwitchingNode(false);
+    }
+  };
+
+  const showTimedClaudeFeedback = (ok: boolean, text: string) => {
+    setClaudeFeedback({ ok, text });
+    setTimeout(() => {
+      setClaudeFeedback((prev) => (prev && prev.text === text ? null : prev));
+    }, 6000);
+  };
+
+  const handleLaunchClaude = async () => {
+    setIsLaunchingClaude(true);
+    setClaudeFeedback(null);
+    try {
+      const res = await window.guardAPI.launchClaude();
+      setState(res.state);
+      showTimedClaudeFeedback(res.ok, res.message);
+    } finally {
+      setIsLaunchingClaude(false);
+    }
+  };
+
+  const handleTerminateClaude = async () => {
+    setClaudeFeedback(null);
+    const res = await window.guardAPI.terminateClaudeNow();
+    setState(res.state);
+    showTimedClaudeFeedback(res.ok, res.message);
+  };
+
+  const handleSyncLocaleFromClaude = async () => {
+    setClaudeFeedback(null);
+    const res = await window.guardAPI.syncSystemLocaleToDefault();
+    setState(res.state);
+    showTimedClaudeFeedback(res.ok, res.message);
+  };
+
+  const handleSaveDedicatedPort = async () => {
+    const portNum = Math.max(
+      1024,
+      Math.min(65535, Math.round(Number(dedicatedPortInput) || 27897))
+    );
+    setDedicatedPortInput(String(portNum));
+    if (portNum === config.dedicatedProxyPort) return;
+    setIsSwitchingNode(true);
+    try {
+      const next = await window.guardAPI.updateConfig({
+        dedicatedProxyPort: portNum,
+      });
+      setState(next);
+    } finally {
+      setIsSwitchingNode(false);
+    }
   };
 
   const handleSwitchNonManualMode = async (mode: 'auto' | 'direct') => {
@@ -212,12 +291,12 @@ export const MainDashboard: React.FC = () => {
 
   const statusMeta = {
     ok: {
-      badge: '状态正常 · 地区一致',
+      badge: '状态正常 · 代理与时区一致',
       cls: 'status-ok',
       icon: <ShieldCheck size={18} />,
     },
     mismatch: {
-      badge: '警告 · 出口地区不符！',
+      badge: '警告 · 代理与时区/地区不一致！',
       cls: 'status-mismatch',
       icon: <ShieldAlert size={18} />,
     },
@@ -227,7 +306,7 @@ export const MainDashboard: React.FC = () => {
       icon: <WifiOff size={18} />,
     },
     unset: {
-      badge: '待设默认保护地区',
+      badge: '待选择节点或保护地区',
       cls: 'status-unset',
       icon: <Shield size={18} />,
     },
@@ -250,12 +329,19 @@ export const MainDashboard: React.FC = () => {
       !COMMON_COUNTRIES.some((c) => c.code === config.defaultCountryCode)
   );
 
-  // 判断当前 Windows 时区与区域是否与已锁定的默认保护地区一致
-  const isWinLocaleMatched = config.defaultCountryCode
+  const probeValid = Boolean(lastProbe && isValidIsoCountryCode(lastProbe.countryCode));
+
+  const effectiveTargetCode =
+    config.defaultCountryCode || (probeValid ? lastProbe?.countryCode : null) || null;
+
+  const effectiveTargetName =
+    config.defaultCountryName || (probeValid ? lastProbe?.countryName : null) || null;
+
+  const isWinLocaleMatched = effectiveTargetCode
     ? isWindowsLocaleMatchingCountry(
         winLocale.timeZoneId,
         winLocale.regionCode,
-        config.defaultCountryCode
+        effectiveTargetCode
       )
     : true;
 
@@ -264,6 +350,97 @@ export const MainDashboard: React.FC = () => {
     winLocale.timeZoneId.toLowerCase() === DEFAULT_CHINA_TIMEZONE_ID.toLowerCase();
 
   const livePatternCheck = patternInput.trim() ? inspectProcessPattern(patternInput) : null;
+
+  const concreteNodes = clashInfo.availableNodes.filter((n) => !n.isGroup);
+  const groupNodes = clashInfo.availableNodes.filter((n) => n.isGroup);
+  const isSelectedNodeMissing = Boolean(
+    config.selectedClashNode &&
+      clashInfo.connected &&
+      !clashInfo.availableNodes.some((n) => n.name === config.selectedClashNode)
+  );
+
+  const installTypeLabel = {
+    'msix-alias': 'MSIX 官方执行别名 (推荐)',
+    'msix-direct': 'MSIX 应用包直连',
+    squirrel: '独立安装包',
+    custom: '手动指定路径',
+    'not-found': '未找到安装路径',
+  }[claudeState.installType];
+
+  const renderClashNodeSelector = () => (
+    <div className="clash-node-selector-wrap">
+      <div className="node-selector-row">
+        <select
+          className="clash-node-select"
+          value={config.selectedClashNode || ''}
+          disabled={isSwitchingNode || (!clashInfo.connected && !config.selectedClashNode)}
+          onChange={(e) => void handleSelectClashNode(e.target.value)}
+        >
+          <option value="">
+            {clashInfo.connected
+              ? '请选择要强制绑定的 Clash 节点...'
+              : '未连接 Clash Verge 控制接口...'}
+          </option>
+          {isSelectedNodeMissing && config.selectedClashNode && (
+            <option value={config.selectedClashNode}>
+              ⚠️ {config.selectedClashNode} (当前配置中不存在)
+            </option>
+          )}
+          {concreteNodes.length > 0 && (
+            <optgroup label={`🚀 具体落地节点 (${concreteNodes.length} 个)`}>
+              {concreteNodes.map((n) => (
+                <option key={n.name} value={n.name}>
+                  {n.name} [{n.type}
+                  {n.delay ? ` · ${n.delay}ms` : ''}]
+                </option>
+              ))}
+            </optgroup>
+          )}
+          {groupNodes.length > 0 && (
+            <optgroup label={`📁 策略组 (${groupNodes.length} 个)`}>
+              {groupNodes.map((g) => (
+                <option key={g.name} value={g.name}>
+                  {g.name} ({g.type}
+                  {g.now ? ` → ${g.now}` : ''})
+                </option>
+              ))}
+            </optgroup>
+          )}
+        </select>
+
+        {config.selectedClashNode && (
+          <button
+            className="btn-clear-node"
+            disabled={isSwitchingNode}
+            onClick={() => void handleSelectClashNode('')}
+            title="取消固定节点绑定，恢复跟随系统代理"
+          >
+            <X size={14} />
+          </button>
+        )}
+      </div>
+
+      {config.selectedClashNode && (
+        <div className="dedicated-port-status">
+          <span
+            className={`port-dot ${
+              clashInfo.dedicatedPortListening ? 'listening' : 'not-listening'
+            }`}
+          />
+          <span>
+            专属本地端口：<code>127.0.0.1:{config.dedicatedProxyPort}</code>
+          </span>
+          <span className="port-bind-tag">
+            {isSwitchingNode
+              ? '正在绑定节点...'
+              : clashInfo.dedicatedPortListening
+              ? `已锁定直通 [${config.selectedClashNode}]`
+              : '端口未就绪'}
+          </span>
+        </div>
+      )}
+    </div>
+  );
 
   return (
     <div className="dashboard-window">
@@ -295,6 +472,24 @@ export const MainDashboard: React.FC = () => {
       {/* 顶部导航栏 */}
       <nav className="nav-tabs">
         <button
+          className={`nav-tab ${activeTab === 'claude' ? 'active' : ''}`}
+          onClick={() => setActiveTab('claude')}
+        >
+          <Bot size={14} />
+          <span>Claude 专栏</span>
+          <span
+            className={`tab-status-dot ${
+              claudeState.running
+                ? 'running'
+                : claudeState.canLaunch
+                ? 'ready'
+                : isChecking && !lastProbe && !lastError
+                ? 'checking'
+                : 'locked'
+            }`}
+          />
+        </button>
+        <button
           className={`nav-tab ${activeTab === 'monitor' ? 'active' : ''}`}
           onClick={() => setActiveTab('monitor')}
         >
@@ -316,7 +511,7 @@ export const MainDashboard: React.FC = () => {
           onClick={() => setActiveTab('settings')}
         >
           <Settings size={14} />
-          <span>代理设置</span>
+          <span>设置</span>
         </button>
         <button
           className={`nav-tab ${activeTab === 'logs' ? 'active' : ''}`}
@@ -330,6 +525,353 @@ export const MainDashboard: React.FC = () => {
 
       {/* 内容主体 */}
       <main className="dashboard-content">
+        {activeTab === 'claude' && (
+          <div className="tab-pane">
+            {/* 1. Claude 唯一启动入口 & 三重一致性校验主控卡 */}
+            <section
+              className={`hero-card claude-hero-card ${
+                claudeState.running || claudeState.canLaunch
+                  ? 'status-ok'
+                  : isChecking && !lastProbe && !lastError
+                  ? 'status-checking'
+                  : 'status-mismatch'
+              }`}
+            >
+              <div className="hero-top-row">
+                <div
+                  className={`status-pill ${
+                    claudeState.running || claudeState.canLaunch
+                      ? 'status-ok'
+                      : isChecking && !lastProbe && !lastError
+                      ? 'status-checking'
+                      : 'status-mismatch'
+                  }`}
+                >
+                  {claudeState.running ? (
+                    <>
+                      <ShieldCheck size={17} />
+                      <span>
+                        Claude 受控运行中 ({claudeState.processCount} 个进程)
+                      </span>
+                    </>
+                  ) : claudeState.canLaunch ? (
+                    <>
+                      <CheckCircle2 size={17} />
+                      <span>三重校验一致 · 允许启动 Claude</span>
+                    </>
+                  ) : isChecking && !lastProbe && !lastError ? (
+                    <>
+                      <RefreshCw className="spin" size={17} />
+                      <span>正在验证所选节点出口与环境...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Lock size={17} />
+                      <span>未通过校验 · 禁止启动 Claude</span>
+                    </>
+                  )}
+                </div>
+
+                <button
+                  className="btn-refresh"
+                  disabled={isChecking || isSwitchingNode}
+                  onClick={() => void window.guardAPI.checkNow('Claude 专栏手动重测')}
+                >
+                  <RefreshCw className={isChecking ? 'spin' : ''} size={14} />
+                  <span>{isChecking ? '校验中...' : '重新校验'}</span>
+                </button>
+              </div>
+
+              {/* 三重一致性对比矩阵：指定代理出口 vs 系统区域 vs 系统时区 */}
+              <div className="three-way-check-grid">
+                <div
+                  className={`check-step-card ${
+                    claudeState.proxyCountryCode && config.selectedClashNode
+                      ? 'matched'
+                      : 'unmatched'
+                  }`}
+                >
+                  <div className="check-step-header">
+                    <span className="step-num">1. 指定代理出口</span>
+                    {claudeState.proxyCountryCode && config.selectedClashNode ? (
+                      <CheckCircle2 size={14} className="step-icon-ok" />
+                    ) : (
+                      <XCircle size={14} className="step-icon-err" />
+                    )}
+                  </div>
+                  <div className="check-step-body">
+                    {claudeState.proxyCountryCode && lastProbe ? (
+                      <>
+                        <div className="step-main-line">
+                          <CountryFlag code={claudeState.proxyCountryCode} size="sm" />
+                          <strong>
+                            {claudeState.proxyCountryName} ({claudeState.proxyCountryCode})
+                          </strong>
+                        </div>
+                        <small className="ellipsis" title={lastProbe.ip}>
+                          IP: {lastProbe.ip}
+                        </small>
+                      </>
+                    ) : (
+                      <>
+                        <strong className="text-warn">
+                          {config.selectedClashNode ? '节点未连通' : '未选定节点'}
+                        </strong>
+                        <small>请在下方下拉框选择节点</small>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                <div
+                  className={`check-step-card ${
+                    claudeState.winRegionMatched ? 'matched' : 'unmatched'
+                  }`}
+                >
+                  <div className="check-step-header">
+                    <span className="step-num">2. 系统国家/区域</span>
+                    {claudeState.winRegionMatched ? (
+                      <CheckCircle2 size={14} className="step-icon-ok" />
+                    ) : (
+                      <XCircle size={14} className="step-icon-err" />
+                    )}
+                  </div>
+                  <div className="check-step-body">
+                    <div className="step-main-line">
+                      <CountryFlag code={winLocale.regionCode} size="sm" />
+                      <strong>
+                        {winLocale.regionName} ({winLocale.regionCode})
+                      </strong>
+                    </div>
+                    <small>
+                      {claudeState.winRegionMatched ? '与指定代理一致' : '与代理地区不符！'}
+                    </small>
+                  </div>
+                </div>
+
+                <div
+                  className={`check-step-card ${
+                    claudeState.winTimeZoneMatched ? 'matched' : 'unmatched'
+                  }`}
+                >
+                  <div className="check-step-header">
+                    <span className="step-num">3. 系统时区</span>
+                    {claudeState.winTimeZoneMatched ? (
+                      <CheckCircle2 size={14} className="step-icon-ok" />
+                    ) : (
+                      <XCircle size={14} className="step-icon-err" />
+                    )}
+                  </div>
+                  <div className="check-step-body">
+                    <strong
+                      className="ellipsis"
+                      title={winLocale.timeZoneDisplayName}
+                    >
+                      {winLocale.timeZoneDisplayName}
+                    </strong>
+                    <small>
+                      {claudeState.winTimeZoneMatched ? '与指定代理一致' : '与代理时区不符！'}
+                    </small>
+                  </div>
+                </div>
+              </div>
+
+              {/* 校验未通过原因提示 */}
+              {claudeState.launchBlockReason && (
+                <div className="claude-block-banner">
+                  <div className="block-banner-text">
+                    <AlertTriangle size={15} />
+                    <span>{claudeState.launchBlockReason}</span>
+                  </div>
+                  {claudeState.proxyCountryCode &&
+                    config.defaultCountryCode &&
+                    config.defaultCountryCode !== claudeState.proxyCountryCode && (
+                      <button
+                        className="btn-banner-quick-sync"
+                        onClick={() =>
+                          void window.guardAPI.setDefaultCurrent().then(setState)
+                        }
+                      >
+                        <Sparkles size={13} />
+                        <span>
+                          将默认保护地区更改为 [{claudeState.proxyCountryName}]
+                        </span>
+                      </button>
+                    )}
+                  {claudeState.proxyCountryCode &&
+                    (!config.defaultCountryCode ||
+                      config.defaultCountryCode === claudeState.proxyCountryCode) &&
+                    (!claudeState.winRegionMatched || !claudeState.winTimeZoneMatched) && (
+                      <button
+                        className="btn-banner-quick-sync"
+                        disabled={isSyncingLocale}
+                        onClick={() => void handleSyncLocaleFromClaude()}
+                      >
+                        <RefreshCw className={isSyncingLocale ? 'spin' : ''} size={13} />
+                        <span>
+                          {isSyncingLocale
+                            ? '正在同步系统时区与区域...'
+                            : `一键同步系统时区与区域至 [${claudeState.proxyCountryName}]`}
+                        </span>
+                      </button>
+                    )}
+                </div>
+              )}
+
+              {/* 唯一启动入口主按钮与强杀按钮 */}
+              <div className="claude-launch-actions">
+                <button
+                  className={`btn-launch-claude ${
+                    claudeState.canLaunch ? 'ready' : 'disabled'
+                  }`}
+                  disabled={!claudeState.canLaunch || isLaunchingClaude || isSwitchingNode}
+                  onClick={() => void handleLaunchClaude()}
+                >
+                  {isLaunchingClaude ? (
+                    <>
+                      <RefreshCw className="spin" size={16} />
+                      <span>正在校验环境并拉起 Claude...</span>
+                    </>
+                  ) : (
+                    <>
+                      <Play size={16} />
+                      <span>
+                        {claudeState.running
+                          ? '重新激活 / 唤起 Claude Desktop'
+                          : '安全启动 Claude Desktop（唯一入口）'}
+                      </span>
+                    </>
+                  )}
+                </button>
+
+                {claudeState.running && (
+                  <button
+                    className="btn-kill-claude"
+                    onClick={() => void handleTerminateClaude()}
+                    title="立即强杀全部 Claude 关联进程并回收启动锁"
+                  >
+                    <Square size={14} />
+                    <span>终止 Claude</span>
+                  </button>
+                )}
+              </div>
+
+              {claudeFeedback && (
+                <div className={`locale-feedback ${claudeFeedback.ok ? 'ok' : 'err'}`}>
+                  {claudeFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
+                  <span>{claudeFeedback.text}</span>
+                </div>
+              )}
+            </section>
+
+            {/* 2. Clash Verge 专属节点选择卡片 */}
+            <section className="panel-card">
+              <div className="panel-card-header">
+                <div className="panel-title">
+                  <Radio size={15} className={clashInfo.connected ? 'pulse-green' : ''} />
+                  <span>指定 Clash Verge 专属代理节点</span>
+                </div>
+                <span className={`mini-badge ${clashInfo.connected ? 'connected' : 'warn-badge'}`}>
+                  {clashInfo.connected
+                    ? `${clashInfo.source} · ${clashInfo.mode.toUpperCase()}${
+                        clashInfo.mixedPort ? ` (${clashInfo.mixedPort})` : ''
+                      }`
+                    : '未连接 Clash Verge'}
+                </span>
+              </div>
+
+              {renderClashNodeSelector()}
+
+            </section>
+
+            {/* 3. 启动保护与客户端设置 */}
+            <section className="panel-card">
+              <div className="panel-card-header">
+                <div className="panel-title">
+                  <Ban size={15} />
+                  <span>启动保护与客户端设置</span>
+                </div>
+                <span className="mini-badge neutral">{installTypeLabel}</span>
+              </div>
+
+              <div className="setting-row">
+                <div>
+                  <strong>仅允许从本面板启动 Claude</strong>
+                  <p>拦截桌面、开始菜单等外部直接启动，防止未校验环境裸奔</p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="toggle-switch"
+                  checked={config.claudeExclusiveGuard}
+                  onChange={(e) =>
+                    void window.guardAPI
+                      .updateConfig({ claudeExclusiveGuard: e.target.checked })
+                      .then(setState)
+                  }
+                />
+              </div>
+
+              <div className="claude-exe-path-box">
+                <div className="exe-path-header">
+                  <span>专属代理监听端口：</span>
+                </div>
+                <div className="exe-path-row">
+                  <code className="exe-path-code">127.0.0.1 :</code>
+                  <input
+                    type="number"
+                    className="dedicated-port-input"
+                    min={1024}
+                    max={65535}
+                    value={dedicatedPortInput}
+                    onChange={(e) => setDedicatedPortInput(e.target.value)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') void handleSaveDedicatedPort();
+                    }}
+                  />
+                  <button
+                    className="btn-save-inline"
+                    disabled={isSwitchingNode}
+                    onClick={() => void handleSaveDedicatedPort()}
+                  >
+                    <span>保存端口</span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="claude-exe-path-box">
+                <div className="exe-path-header">
+                  <span>客户端路径：</span>
+                  {config.claudeExePath && (
+                    <button
+                      className="btn-link-clear"
+                      onClick={() =>
+                        void window.guardAPI.updateConfig({ claudeExePath: '' }).then(setState)
+                      }
+                    >
+                      恢复自动探测
+                    </button>
+                  )}
+                </div>
+                <div className="exe-path-row">
+                  <code
+                    className="exe-path-code ellipsis"
+                    title={claudeState.detectedExePath || '未检测到 Claude.exe'}
+                  >
+                    {claudeState.detectedExePath || '未检测到 Claude Desktop，请点击右侧手动选择'}
+                  </code>
+                  <button
+                    className="btn-save-inline"
+                    onClick={() => void window.guardAPI.browseClaudeExe().then(setState)}
+                  >
+                    <FolderOpen size={13} />
+                    <span>浏览...</span>
+                  </button>
+                </div>
+              </div>
+            </section>
+          </div>
+        )}
+
         {activeTab === 'monitor' && (
           <div className="tab-pane">
             {/* 1. 当前出口状态主卡片 */}
@@ -391,7 +933,9 @@ export const MainDashboard: React.FC = () => {
                   )}
 
                   <div className="hero-footer-meta">
-                    <span>检测通道：{lastProbe.viaChannel}</span>
+                    <span className="ellipsis" title={lastProbe.viaChannel}>
+                      检测通道：{lastProbe.viaChannel}
+                    </span>
                     <span>更新于 {formatTime(lastProbe.checkedAt)}</span>
                   </div>
                 </div>
@@ -401,7 +945,7 @@ export const MainDashboard: React.FC = () => {
                     <div className="error-empty-box">
                       <WifiOff size={28} />
                       <p>{lastError}</p>
-                      <small>请确认 VPN / Clash 已连接，或在设置中调整本地代理端口</small>
+                      <small>请确认 Clash Verge 已连接并选择有效节点</small>
                     </div>
                   ) : (
                     <p>正在通过代理隧道验证真实出口 IP...</p>
@@ -410,7 +954,94 @@ export const MainDashboard: React.FC = () => {
               )}
             </section>
 
-            {/* 2. 默认保护地区卡片 */}
+            {/* 2. Windows 时区与区域同步卡片 */}
+            <section className="panel-card">
+              <div className="panel-card-header">
+                <div className="panel-title">
+                  <Globe size={15} />
+                  <span>Windows 时区与区域</span>
+                </div>
+                {effectiveTargetCode && (
+                  <span
+                    className={`mini-badge ${isWinLocaleMatched ? 'connected' : 'warn-badge'}`}
+                  >
+                    {isWinLocaleMatched ? '已与保护地区一致' : '与保护地区不一致'}
+                  </span>
+                )}
+              </div>
+
+              <div className="win-locale-grid">
+                <div className="win-locale-box">
+                  <div className="win-locale-icon">
+                    <Clock size={16} />
+                  </div>
+                  <div className="win-locale-info">
+                    <span className="win-locale-label">时区</span>
+                    <strong
+                      className="win-locale-val ellipsis"
+                      title={winLocale.timeZoneDisplayName}
+                    >
+                      {winLocale.timeZoneDisplayName}
+                    </strong>
+                  </div>
+                </div>
+
+                <div className="win-locale-box region-box">
+                  <div className="win-locale-icon">
+                    <CountryFlag code={winLocale.regionCode} size="sm" />
+                  </div>
+                  <div className="win-locale-info">
+                    <span className="win-locale-label">区域</span>
+                    <strong className="win-locale-val">{winLocale.regionName}</strong>
+                  </div>
+                </div>
+              </div>
+
+              <div className="locale-actions-row">
+                <button
+                  className="btn-sync-locale"
+                  disabled={!effectiveTargetCode || isSyncingLocale}
+                  onClick={() => void handleSyncLocale()}
+                  title={
+                    effectiveTargetCode
+                      ? '将 Windows 时区与区域同步至目标保护地区（多时区大国自动匹配城市时区）'
+                      : '请先选择代理节点或设置保护地区'
+                  }
+                >
+                  <RefreshCw className={isSyncingLocale ? 'spin' : ''} size={14} />
+                  <span>
+                    {isSyncingLocale
+                      ? '正在设置系统时区...'
+                      : effectiveTargetName
+                      ? `一键同步至 [${effectiveTargetName}]`
+                      : '请先选择代理节点'}
+                  </span>
+                </button>
+
+                <button
+                  className="btn-restore-locale"
+                  disabled={isSyncingLocale || isAlreadyChinaDefaultLocale}
+                  onClick={() => void handleRestoreLocale()}
+                  title={
+                    isAlreadyChinaDefaultLocale
+                      ? '当前系统已处于默认中国时区与区域'
+                      : '若当前代理非中国，将先强杀 Claude 与守护进程后再还原回中国时区与区域'
+                  }
+                >
+                  <RotateCcw size={14} />
+                  <span>{isAlreadyChinaDefaultLocale ? '已是中国时区' : '还原默认时区'}</span>
+                </button>
+              </div>
+
+              {localeFeedback && (
+                <div className={`locale-feedback ${localeFeedback.ok ? 'ok' : 'err'}`}>
+                  {localeFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
+                  <span>{localeFeedback.text}</span>
+                </div>
+              )}
+            </section>
+
+            {/* 3. 默认保护地区卡片 */}
             <section className="panel-card">
               <div className="panel-card-header">
                 <div className="panel-title">
@@ -421,7 +1052,7 @@ export const MainDashboard: React.FC = () => {
                   <button
                     className="btn-link-clear"
                     onClick={() => void window.guardAPI.setDefaultRegion(null)}
-                    title="取消默认地区锁定并暂停进程强杀守护"
+                    title="取消固定默认地区限制"
                   >
                     <Unlock size={13} />
                     <span>清除默认</span>
@@ -438,12 +1069,12 @@ export const MainDashboard: React.FC = () => {
                         <strong>
                           {config.defaultCountryName} ({config.defaultCountryCode})
                         </strong>
-                        <small>偏离该国家/地区时立即变红弹窗并按策略终止守护进程</small>
+                        <small>出口偏离该地区时立即告警并拦截受保护进程</small>
                       </div>
                     </>
                   ) : (
                     <div className="default-unset-hint">
-                      <span>尚未锁定默认地区。选好 VPN 代理后，点击下方按钮一键锁定。</span>
+                      <span>未锁定固定地区，首次选定节点后将自动初始化</span>
                     </div>
                   )}
                 </div>
@@ -488,155 +1119,6 @@ export const MainDashboard: React.FC = () => {
                 </div>
               </div>
             </section>
-
-            {/* 3. Windows 时区与区域同步卡片 */}
-            <section className="panel-card">
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <Globe size={15} />
-                  <span>Windows 时区与区域</span>
-                </div>
-                {config.defaultCountryCode && (
-                  <span
-                    className={`mini-badge ${isWinLocaleMatched ? 'connected' : 'warn-badge'}`}
-                  >
-                    {isWinLocaleMatched ? '已与保护地区一致' : '与默认保护地区不一致'}
-                  </span>
-                )}
-              </div>
-
-              <div className="win-locale-grid">
-                <div className="win-locale-box">
-                  <div className="win-locale-icon">
-                    <Clock size={16} />
-                  </div>
-                  <div className="win-locale-info">
-                    <span className="win-locale-label">时区</span>
-                    <strong
-                      className="win-locale-val ellipsis"
-                      title={winLocale.timeZoneDisplayName}
-                    >
-                      {winLocale.timeZoneDisplayName}
-                    </strong>
-                  </div>
-                </div>
-
-                <div className="win-locale-box region-box">
-                  <div className="win-locale-icon">
-                    <CountryFlag code={winLocale.regionCode} size="sm" />
-                  </div>
-                  <div className="win-locale-info">
-                    <span className="win-locale-label">区域</span>
-                    <strong className="win-locale-val">{winLocale.regionName}</strong>
-                  </div>
-                </div>
-              </div>
-
-              <div className="locale-actions-row">
-                <button
-                  className="btn-sync-locale"
-                  disabled={!config.defaultCountryCode || isSyncingLocale}
-                  onClick={() => void handleSyncLocale()}
-                  title={
-                    config.defaultCountryCode
-                      ? '将 Windows 时区与区域同步至默认保护地区（多时区大国自动匹配城市时区）'
-                      : '请先在上方设置默认保护地区'
-                  }
-                >
-                  <RefreshCw className={isSyncingLocale ? 'spin' : ''} size={14} />
-                  <span>
-                    {isSyncingLocale
-                      ? '正在设置系统时区...'
-                      : config.defaultCountryCode
-                      ? `一键同步至 [${config.defaultCountryName}]`
-                      : '请先设置默认保护地区'}
-                  </span>
-                </button>
-
-                <button
-                  className="btn-restore-locale"
-                  disabled={isSyncingLocale || isAlreadyChinaDefaultLocale}
-                  onClick={() => void handleRestoreLocale()}
-                  title={
-                    isAlreadyChinaDefaultLocale
-                      ? '当前系统已处于默认中国时区与区域'
-                      : '若当前出口非中国且开启了进程守护，将先确认强杀守护进程再还原回中国时区与区域'
-                  }
-                >
-                  <RotateCcw size={14} />
-                  <span>{isAlreadyChinaDefaultLocale ? '已是中国时区' : '还原默认时区'}</span>
-                </button>
-              </div>
-
-              {localeFeedback && (
-                <div className={`locale-feedback ${localeFeedback.ok ? 'ok' : 'err'}`}>
-                  {localeFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
-                  <span>{localeFeedback.text}</span>
-                </div>
-              )}
-            </section>
-
-            {/* 4. Clash 实时引擎与离线库状态卡片 */}
-            <section className="panel-card">
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <Radio size={15} className={clashInfo.connected ? 'pulse-green' : ''} />
-                  <span>本地实时监听引擎</span>
-                </div>
-                <span className={`mini-badge ${clashInfo.connected ? 'connected' : 'neutral'}`}>
-                  {clashInfo.connected ? `已接入 ${clashInfo.source}` : '系统代理 / 网卡监听模式'}
-                </span>
-              </div>
-
-              {clashInfo.connected ? (
-                <div className="clash-live-grid">
-                  <div className="kv-cell">
-                    <span className="kv-k">代理模式</span>
-                    <span className="kv-v mode-badge">{clashInfo.mode.toUpperCase()}</span>
-                  </div>
-                  <div className="kv-cell">
-                    <span className="kv-k">本地端口</span>
-                    <span className="kv-v">{clashInfo.mixedPort || '-'}</span>
-                  </div>
-                  <div className="kv-cell full-span">
-                    <span className="kv-k">生效节点链</span>
-                    <span className="kv-v ellipsis" title={clashInfo.nodeChain.join(' → ')}>
-                      {clashInfo.nodeChain.length > 0
-                        ? clashInfo.nodeChain.join(' → ')
-                        : clashInfo.activeNode || '自动'}
-                    </span>
-                  </div>
-                </div>
-              ) : (
-                <p className="subtle-desc">
-                  未检测到运行中的 Clash 控制接口，当前通过监听 Windows 系统代理注册表、网卡状态及轻量 Trace 心跳实时守护。
-                </p>
-              )}
-
-              <div className="engine-bottom-bar">
-                <span className="db-tag">离线库：{state.geoDbSource}</span>
-                <button
-                  className={`guard-quick-pill ${
-                    config.killProcessesEnabled && config.protectedProcessPatterns.length > 0
-                      ? 'active'
-                      : ''
-                  }`}
-                  onClick={() => setActiveTab('guard')}
-                >
-                  {config.killProcessesEnabled && config.protectedProcessPatterns.length > 0 ? (
-                    <>
-                      <ShieldCheck size={13} />
-                      <span>进程守护：{config.protectedProcessPatterns.length} 条规则生效</span>
-                    </>
-                  ) : (
-                    <>
-                      <ShieldOff size={13} />
-                      <span>配置进程守护</span>
-                    </>
-                  )}
-                </button>
-              </div>
-            </section>
           </div>
         )}
 
@@ -647,16 +1129,14 @@ export const MainDashboard: React.FC = () => {
               <div className="panel-card-header">
                 <div className="panel-title">
                   <ShieldAlert size={15} />
-                  <span>异常自动终止进程策略</span>
+                  <span>触发拦截条件</span>
                 </div>
               </div>
 
               <div className="setting-row">
                 <div>
-                  <strong>启用异常自动强杀进程（总开关）</strong>
-                  <p>
-                    已锁定默认地区后，触发异常时按进程树 (<code>taskkill /F /T</code>) 连带派生子进程一并强杀，异常未恢复期间禁止重开
-                  </p>
+                  <strong>启用额外进程守护</strong>
+                  <p>异常时按进程树强杀下方列表应用（Claude 已由专栏内置保护）</p>
                 </div>
                 <input
                   type="checkbox"
@@ -670,8 +1150,8 @@ export const MainDashboard: React.FC = () => {
 
               <div className="setting-row">
                 <div>
-                  <strong>代理断连 / 超时同样强杀</strong>
-                  <p>当已设置默认保护地区但代理连接失败或节点超时时，立即终止守护进程</p>
+                  <strong>代理断连或超时时强杀</strong>
+                  <p>代理连接断开或探测超时期间禁止运行</p>
                 </div>
                 <input
                   type="checkbox"
@@ -686,10 +1166,8 @@ export const MainDashboard: React.FC = () => {
 
               <div className="setting-row no-border-bottom">
                 <div>
-                  <strong>系统时区 / 区域不一致时同样强杀</strong>
-                  <p>
-                    还原默认时区若与保护地区不符将「先杀进程确认退出后再还原」；平时若忘改时区误启动受保护应用也会立即拦截
-                  </p>
+                  <strong>系统时区/区域不一致时强杀</strong>
+                  <p>系统时区或国家区域与代理出口不符时立即终止</p>
                 </div>
                 <input
                   type="checkbox"
@@ -708,7 +1186,7 @@ export const MainDashboard: React.FC = () => {
               <div className="panel-card-header">
                 <div className="panel-title">
                   <Lock size={15} />
-                  <span>受保护应用进程规则列表</span>
+                  <span>额外守护进程列表</span>
                 </div>
                 <span className="mini-badge neutral">
                   共 {config.protectedProcessPatterns.length} 条
@@ -729,7 +1207,7 @@ export const MainDashboard: React.FC = () => {
                         void handleAddPattern();
                       }
                     }}
-                    placeholder="输入进程名、通配符或正则，如 claude*.exe"
+                    placeholder="输入进程名、通配符或正则，如 *cursor*"
                   />
                   <button className="btn-save-inline" onClick={() => void handleAddPattern()}>
                     <Plus size={14} />
@@ -751,7 +1229,7 @@ export const MainDashboard: React.FC = () => {
                         <strong>
                           {livePatternCheck.mode === 'regex' ? ' 正则表达式 ' : ' 通配符 '}
                         </strong>
-                        模式（大小写不敏感，回车即可添加）
+                        模式（回车添加）
                       </span>
                     </div>
                   ) : (
@@ -762,15 +1240,14 @@ export const MainDashboard: React.FC = () => {
                   )
                 ) : (
                   <p className="pattern-syntax-tip">
-                    支持通配符（如 <code>claude*.exe</code>、<code>*cursor*</code>）与正则表达式（如{' '}
-                    <code>/^(claude|cursor).*\.exe$/</code>），均不区分大小写。
+                    支持通配符（如 <code>*cursor*</code>）或正则（<code>/pattern/</code>），大小写不敏感。
                   </p>
                 )}
               </div>
 
               {config.protectedProcessPatterns.length === 0 ? (
                 <div className="pattern-empty">
-                  暂无守护进程规则。添加如 <code>claude*.exe</code> 后，一旦 IP 地区跳变或系统时区不符将瞬间强杀该应用全部关联进程。
+                  Claude 已由专栏内置保护。如需联动保护其他应用，可在上方添加规则。
                 </div>
               ) : (
                 <div className="pattern-list">
@@ -811,7 +1288,7 @@ export const MainDashboard: React.FC = () => {
               <div className="panel-card-header">
                 <div className="panel-title">
                   <Settings size={15} />
-                  <span>代理流量检测通道</span>
+                  <span>全局回退检测通道（未指定 Clash 节点时生效）</span>
                 </div>
               </div>
 
@@ -825,9 +1302,7 @@ export const MainDashboard: React.FC = () => {
                   />
                   <div>
                     <strong>自动识别全局出口（推荐）</strong>
-                    <p>
-                      系统代理开启时经系统代理检测；系统代理关闭时走本机默认网卡路由（自动识别 TUN 虚拟网卡或国内直连暴露）
-                    </p>
+                    <p>优先走系统代理，未开启系统代理时自动检测默认网卡 / TUN 路由</p>
                   </div>
                 </label>
 
@@ -846,7 +1321,7 @@ export const MainDashboard: React.FC = () => {
                   />
                   <div>
                     <strong>手动指定本地代理端口</strong>
-                    <p>固定通过指定的 HTTP / SOCKS5 本地端口检测（适合不开系统代理与 TUN 的纯端口分流软件）</p>
+                    <p>固定通过指定的 HTTP / SOCKS5 本地端口检测</p>
                   </div>
                 </label>
 
@@ -897,8 +1372,8 @@ export const MainDashboard: React.FC = () => {
                     onChange={() => void handleSwitchNonManualMode('direct')}
                   />
                   <div>
-                    <strong>强制纯网卡直连（仅限全局 TUN 虚拟网卡）</strong>
-                    <p>忽略系统代理设置，始终直接检测操作系统默认网卡路由出口</p>
+                    <strong>强制纯网卡直连（仅限全局 TUN 模式）</strong>
+                    <p>忽略系统代理设置，直接检测系统默认网卡路由出口</p>
                   </div>
                 </label>
               </div>
@@ -909,14 +1384,14 @@ export const MainDashboard: React.FC = () => {
               <div className="panel-card-header">
                 <div className="panel-title">
                   <BellRing size={15} />
-                  <span>心跳巡检与强提醒设置</span>
+                  <span>巡检与提醒设置</span>
                 </div>
               </div>
 
               <div className="setting-row">
                 <div>
-                  <strong>无感 Trace 心跳间隔</strong>
-                  <p>用于捕获“动态住宅代理不换节点但后台静默换出口 IP”（地区解析纯离线零限流）</p>
+                  <strong>运行期后台巡检间隔</strong>
+                  <p>Claude 或守护进程运行期间，定时静默复核出口 IP 是否漂移</p>
                 </div>
                 <select
                   className="compact-select"
@@ -938,8 +1413,8 @@ export const MainDashboard: React.FC = () => {
 
               <div className="setting-row">
                 <div>
-                  <strong>软件自绘置顶警告弹窗</strong>
-                  <p>地区变更或进程拦截时在屏幕右下角弹出强置顶卡片（不受系统勿扰模式屏蔽）</p>
+                  <strong>置顶警告弹窗</strong>
+                  <p>地区异常或拦截进程时在屏幕右下角弹出置顶提醒</p>
                 </div>
                 <input
                   type="checkbox"
@@ -954,7 +1429,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>异常警告提示音</strong>
-                  <p>弹出地区变更、断连或进程拦截警告时播放短促提示音</p>
+                  <p>触发弹窗警告时播放短促提示音</p>
                 </div>
                 <input
                   type="checkbox"
@@ -968,8 +1443,8 @@ export const MainDashboard: React.FC = () => {
 
               <div className="setting-row">
                 <div>
-                  <strong>代理断连 / 超时同样报警</strong>
-                  <p>当已设置默认地区但代理连接失败或节点超时时，变红并弹窗提醒</p>
+                  <strong>代理断连或超时报警</strong>
+                  <p>代理连接失败或节点超时时弹窗提醒</p>
                 </div>
                 <input
                   type="checkbox"
@@ -983,8 +1458,8 @@ export const MainDashboard: React.FC = () => {
 
               <div className="setting-row">
                 <div>
-                  <strong>关闭窗口时最小化到系统托盘</strong>
-                  <p>点击右上角关闭按钮后继续在后台托盘守护监控</p>
+                  <strong>关闭窗口时最小化到托盘</strong>
+                  <p>点击右上角关闭按钮后隐藏至系统托盘继续守护</p>
                 </div>
                 <input
                   type="checkbox"
@@ -999,7 +1474,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>开机自动启动</strong>
-                  <p>登录 Windows 系统时自动启动（若开启最小化到托盘则静默驻留后台）</p>
+                  <p>登录 Windows 时自动运行本程序</p>
                 </div>
                 <input
                   type="checkbox"
@@ -1013,7 +1488,7 @@ export const MainDashboard: React.FC = () => {
 
               <div className="custom-probe-box">
                 <label>
-                  自定义回显探测 URL（留空默认使用 Cloudflare / AWS 全球基础设施互备）：
+                  自定义探测 URL（留空默认使用 Cloudflare / AWS 全球探测源）：
                 </label>
                 <div className="custom-probe-row">
                   <input

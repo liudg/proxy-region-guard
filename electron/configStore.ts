@@ -24,6 +24,10 @@ export const DEFAULT_CONFIG: AppConfig = {
   killOnDisconnect: true,
   killOnLocaleMismatch: true,
   protectedProcessPatterns: [],
+  selectedClashNode: null,
+  dedicatedProxyPort: 27897,
+  claudeExePath: '',
+  claudeExclusiveGuard: true,
 };
 
 function sanitizePatternList(raw: unknown): string[] {
@@ -70,6 +74,25 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     ? raw.defaultCountryCode.trim().toUpperCase()
     : null;
 
+  const selectedClashNode =
+    typeof raw.selectedClashNode === 'string' && raw.selectedClashNode.trim()
+      ? raw.selectedClashNode.trim()
+      : null;
+
+  const dedPortNum = Number(raw.dedicatedProxyPort);
+  const dedicatedProxyPort =
+    Number.isFinite(dedPortNum) && dedPortNum >= 1024 && dedPortNum <= 65535
+      ? Math.round(dedPortNum)
+      : DEFAULT_CONFIG.dedicatedProxyPort;
+
+  const claudeExePath =
+    typeof raw.claudeExePath === 'string' ? raw.claudeExePath.trim() : '';
+
+  const claudeExclusiveGuard =
+    typeof raw.claudeExclusiveGuard === 'boolean'
+      ? raw.claudeExclusiveGuard
+      : DEFAULT_CONFIG.claudeExclusiveGuard;
+
   return {
     defaultCountryCode: normalizedCode,
     defaultCountryName: normalizedCode ? getCountryNameZh(normalizedCode) : null,
@@ -106,6 +129,10 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
         ? raw.killOnLocaleMismatch
         : DEFAULT_CONFIG.killOnLocaleMismatch,
     protectedProcessPatterns: sanitizePatternList(raw.protectedProcessPatterns),
+    selectedClashNode,
+    dedicatedProxyPort,
+    claudeExePath,
+    claudeExclusiveGuard,
   };
 }
 

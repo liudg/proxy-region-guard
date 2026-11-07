@@ -16,6 +16,12 @@ const api: GuardBridgeAPI = {
   syncSystemLocaleToDefault: () => ipcRenderer.invoke('guard:sync-locale'),
   restoreDefaultChinaLocale: () => ipcRenderer.invoke('guard:restore-locale'),
 
+  selectClashNode: (nodeName: string | null) =>
+    ipcRenderer.invoke('guard:select-clash-node', nodeName),
+  launchClaude: () => ipcRenderer.invoke('guard:launch-claude'),
+  terminateClaudeNow: () => ipcRenderer.invoke('guard:terminate-claude'),
+  browseClaudeExe: () => ipcRenderer.invoke('guard:browse-claude-exe'),
+
   minimizeMain: () => ipcRenderer.send('window:minimize-main'),
   closeMain: () => ipcRenderer.send('window:close-main'),
   openMainFromAlert: () => ipcRenderer.send('window:open-main-from-alert'),

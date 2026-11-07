@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import {
   AlertTriangle,
   ArrowRight,
+  Ban,
   CheckCircle2,
   Clock,
   ShieldAlert,
@@ -38,7 +39,9 @@ function playAlertChime(type: AlertPayload['alertType']): void {
 
     const now = ctx.currentTime;
     const notes =
-      type === 'mismatch' || type === 'locale-mismatch' ? [880, 622.25, 880] : [660, 440];
+      type === 'mismatch' || type === 'locale-mismatch' || type === 'unauthorized-launch'
+        ? [880, 622.25, 880]
+        : [660, 440];
 
     notes.forEach((freq, idx) => {
       const osc = ctx.createOscillator();
@@ -102,6 +105,7 @@ export const AlertPopup: React.FC = () => {
   const isRecovered = payload.alertType === 'recovered';
   const isDisconnect = payload.alertType === 'disconnect';
   const isLocaleMismatch = payload.alertType === 'locale-mismatch';
+  const isUnauthorizedLaunch = payload.alertType === 'unauthorized-launch';
 
   const cardClass = isRecovered
     ? 'alert-recovered'
@@ -110,11 +114,13 @@ export const AlertPopup: React.FC = () => {
     : 'alert-mismatch';
 
   const titleText = isRecovered
-    ? '代理出口已恢复正常'
+    ? '代理与时区已恢复正常'
+    : isUnauthorizedLaunch
+    ? '已拦截外部启动 Claude！'
     : isDisconnect
     ? '代理连接异常断开警告'
     : isLocaleMismatch
-    ? '系统时区/区域不符 · 进程已拦截！'
+    ? '代理与系统时区/区域不一致！'
     : '代理 IP 地区变更警告！';
 
   return (
@@ -125,6 +131,8 @@ export const AlertPopup: React.FC = () => {
           <span className="alert-pulse-icon">
             {isRecovered ? (
               <CheckCircle2 size={18} />
+            ) : isUnauthorizedLaunch ? (
+              <Ban size={18} />
             ) : isDisconnect ? (
               <WifiOff size={18} />
             ) : isLocaleMismatch ? (
@@ -146,10 +154,21 @@ export const AlertPopup: React.FC = () => {
 
       {/* 核心地区对比区 */}
       <div className="alert-body">
-        {isDisconnect ? (
+        {isUnauthorizedLaunch ? (
           <div className="alert-disconnect-box">
             <div className="disconnect-expect-line">
-              <span>受保护默认地区：</span>
+              <span>安全规则：</span>
+              <strong>仅允许从卫士【Claude 专栏】启动</strong>
+            </div>
+            <div className="disconnect-err-msg">
+              <Ban size={15} />
+              <span>已拦截外部启动，请在卫士【Claude 专栏】完成校验后打开。</span>
+            </div>
+          </div>
+        ) : isDisconnect ? (
+          <div className="alert-disconnect-box">
+            <div className="disconnect-expect-line">
+              <span>保护地区：</span>
               <CountryFlag code={payload.expectedCode} size="sm" />
               <strong>
                 {payload.expectedName} ({payload.expectedCode})
@@ -157,13 +176,13 @@ export const AlertPopup: React.FC = () => {
             </div>
             <div className="disconnect-err-msg">
               <AlertTriangle size={15} />
-              <span>{payload.errorDetail || '无法通过代理连接网络，请立即检查 VPN 状态！'}</span>
+              <span>{payload.errorDetail || '无法通过指定代理节点连接网络，请检查 Clash 状态！'}</span>
             </div>
           </div>
         ) : isLocaleMismatch ? (
           <div className="alert-compare-grid">
             <div className="compare-box">
-              <span className="compare-label">默认保护地区</span>
+              <span className="compare-label">指定代理地区</span>
               <div className="compare-region-main">
                 <CountryFlag code={payload.expectedCode} size="md" />
                 <div className="compare-region-text">
@@ -178,7 +197,7 @@ export const AlertPopup: React.FC = () => {
             </div>
 
             <div className="compare-box actual danger">
-              <span className="compare-label">当前系统区域</span>
+              <span className="compare-label">当前系统时区/区域</span>
               <div className="compare-region-main">
                 <CountryFlag code={payload.sysRegionCode || 'CN'} size="md" />
                 <div className="compare-region-text">
@@ -193,7 +212,7 @@ export const AlertPopup: React.FC = () => {
         ) : (
           <div className="alert-compare-grid">
             <div className="compare-box">
-              <span className="compare-label">期望默认地区</span>
+              <span className="compare-label">期望保护地区</span>
               <div className="compare-region-main">
                 <CountryFlag code={payload.expectedCode} size="md" />
                 <div className="compare-region-text">
@@ -266,6 +285,7 @@ export const AlertPopup: React.FC = () => {
         {!isRecovered &&
           !isDisconnect &&
           !isLocaleMismatch &&
+          !isUnauthorizedLaunch &&
           isValidIsoCountryCode(payload.actualCode) && (
             <button
               className="btn-alert-secondary"
