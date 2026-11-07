@@ -53,14 +53,14 @@ async function main() {
     throw new Error(`未找到应用图标资源: ${icoPath}`);
   }
 
-  console.log('1/4 正在编译前后端生产代码...');
+  console.log('1/5 正在编译前后端生产代码...');
   await buildElectronMain();
   await viteBuild({
     root: rootDir,
     configFile: path.join(rootDir, 'vite.config.ts'),
   });
 
-  console.log('2/4 正在组装 Windows x64 正式发布目录...');
+  console.log('2/5 正在组装 Windows x64 正式发布目录...');
   const releaseRoot = path.join(rootDir, 'release');
   const appOutDir = path.join(releaseRoot, '代理地区卫士-win32-x64');
 
@@ -118,7 +118,7 @@ async function main() {
     }
   }
 
-  console.log('3/4 正在打包应用核心代码 (app.asar) 与离线 GeoIP 数据库...');
+  console.log('3/5 正在打包应用核心代码 (app.asar) 与离线 GeoIP 数据库...');
   const stageDir = path.join(releaseRoot, '.stage-app');
   if (fs.existsSync(stageDir)) {
     fs.rmSync(stageDir, { recursive: true, force: true });
@@ -164,14 +164,31 @@ async function main() {
   }
 
   if (!inPlaceUpdate) {
-    console.log('4/4 正在写入可执行文件名称与图标元数据...');
+    console.log('4/5 正在写入可执行文件名称与图标元数据...');
     fs.renameSync(srcExe, destExe);
     await stampExeResourcesWithRetry(destExe, icoPath);
   } else {
-    console.log('4/4 检测到卫士正在运行，已完成热更新打包 (resources/app.asar)...');
+    console.log('4/5 检测到卫士正在运行，已完成热更新打包 (resources/app.asar)...');
   }
 
-  console.log(`\n✅ 正式包构建成功！输出路径：\n${destExe}`);
+  const zipName = `代理地区卫士-v${prodPkg.version}-win32-x64.zip`;
+  const zipPath = path.join(releaseRoot, zipName);
+  console.log(`5/5 正在压缩生成分发压缩包 (${zipName})...`);
+  try {
+    if (fs.existsSync(zipPath)) {
+      fs.rmSync(zipPath, { force: true });
+    }
+    execFileSync('tar.exe', ['-a', '-cf', zipName, path.basename(appOutDir)], {
+      cwd: releaseRoot,
+      stdio: 'inherit',
+      windowsHide: true,
+    });
+    console.log(`📦 压缩分发包已输出: ${zipPath}`);
+  } catch (e) {
+    console.warn(`⚠️ 自动压缩分发包失败 (可手动压缩): ${e.message}`);
+  }
+
+  console.log(`\n✅ 正式发布包打包完成！\n程序目录: ${appOutDir}\n可执行文件: ${destExe}\n发布压缩包: ${zipPath}`);
 }
 
 function copyDirFiltered(src, dest) {
