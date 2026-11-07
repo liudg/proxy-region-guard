@@ -36,6 +36,11 @@ export interface AppConfig {
   dedicatedProxyPort: number;          // 为所选节点分配的本地独立专属代理端口（默认 27897）
   claudeExePath: string;               // 自定义 Claude Desktop 启动路径（留空则自动探测）
   claudeExclusiveGuard: boolean;       // 唯一入口守护：禁止任何外部途径启动 Claude，不一致立杀
+
+  // Antigravity 启动器专栏配置（纯代理绑定，无监控/预警/强杀）
+  antigravityClashNode: string | null; // Antigravity 独立指定的 Clash 节点名称
+  antigravityDedicatedPort: number;    // Antigravity 独立专属本地代理端口（默认 27898）
+  antigravityExePath: string;          // 自定义 Antigravity.exe 启动路径（留空则自动探测）
 }
 
 export interface WindowsLocaleState {
@@ -62,9 +67,12 @@ export interface ClashRuntimeInfo {
   activeNode: string | null;
   nodeChain: string[];    // 完整节点选择链，如 ["节点选择", "自动选择", "🇺🇸 美国 01"]
   availableNodes: ClashProxyNodeOption[]; // 从 Clash 读取的可选节点与策略组列表
-  boundNode: string | null;               // 当前独立专属端口实际绑定的节点名
-  dedicatedPort: number | null;           // 当前独立专属端口（如 27897）
-  dedicatedPortListening: boolean;        // 独立专属端口是否已就绪监听
+  boundNode: string | null;               // 当前 Claude 独立专属端口实际绑定的节点名
+  dedicatedPort: number | null;           // 当前 Claude 独立专属端口（如 27897）
+  dedicatedPortListening: boolean;        // Claude 独立专属端口是否已就绪监听
+  antigravityBoundNode: string | null;    // 当前 Antigravity 独立专属端口实际绑定的节点名
+  antigravityDedicatedPort: number | null;// 当前 Antigravity 独立专属端口（如 27898）
+  antigravityPortListening: boolean;      // Antigravity 独立专属端口是否已就绪监听
 }
 
 export interface ProbeResult {
@@ -90,6 +98,21 @@ export interface ClaudeRuntimeState {
   proxyCountryName: string | null;
   winRegionMatched: boolean;
   winTimeZoneMatched: boolean;
+}
+
+export interface AntigravityRuntimeState {
+  detectedExePath: string | null;
+  installType: 'standard' | 'custom' | 'not-found';
+  running: boolean;
+  uiProcessCount: number;         // Antigravity.exe 进程数量
+  languageServerCount: number;    // language_server*.exe 进程数量
+  totalProcessCount: number;      // 关联进程总数
+  proxiedSession: boolean;        // 当前运行的实例是否已注入专属代理参数
+  canLaunch: boolean;             // 是否满足启动条件（存在可执行文件 + 已选节点 + 专属端口就绪）
+  launchHint: string | null;      // 未满足启动条件时的操作指引（非告警）
+  isProbingNode: boolean;         // 是否正在探测所选节点的出口信息
+  nodeProbe: ProbeResult | null;  // 所选节点的出口 IP 与国家（纯展示，不触发任何报警或拦截）
+  nodeProbeError: string | null;  // 节点探测失败提示（纯展示）
 }
 
 export interface GuardEventLog {
@@ -130,6 +153,7 @@ export interface AppStateSnapshot {
   lastError: string | null;
   clashInfo: ClashRuntimeInfo;
   claudeState: ClaudeRuntimeState;
+  antigravityState: AntigravityRuntimeState;
   geoDbSource: string;
   logs: GuardEventLog[];
 }
@@ -142,6 +166,12 @@ export interface LocaleSyncResult {
 }
 
 export interface ClaudeLaunchResult {
+  ok: boolean;
+  message: string;
+  state: AppStateSnapshot;
+}
+
+export interface AntigravityLaunchResult {
   ok: boolean;
   message: string;
   state: AppStateSnapshot;
@@ -161,6 +191,12 @@ export interface GuardBridgeAPI {
   launchClaude: () => Promise<ClaudeLaunchResult>;
   terminateClaudeNow: () => Promise<ClaudeLaunchResult>;
   browseClaudeExe: () => Promise<AppStateSnapshot>;
+  // Antigravity 启动器专栏控制
+  selectAntigravityClashNode: (nodeName: string | null) => Promise<AppStateSnapshot>;
+  probeAntigravityNode: () => Promise<AppStateSnapshot>;
+  launchAntigravity: () => Promise<AntigravityLaunchResult>;
+  terminateAntigravityNow: () => Promise<AntigravityLaunchResult>;
+  browseAntigravityExe: () => Promise<AppStateSnapshot>;
   // 窗口控制（主面板与自绘警告窗通用）
   minimizeMain: () => void;
   closeMain: () => void;

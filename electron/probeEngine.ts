@@ -3,6 +3,8 @@ import * as net from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
   AlertPayload,
+  AntigravityLaunchResult,
+  AntigravityRuntimeState,
   AppStateSnapshot,
   ClashRuntimeInfo,
   ClaudeLaunchResult,
@@ -31,6 +33,13 @@ import {
   SystemProxyState,
 } from './systemProxy';
 import { ProcessKillReport, terminateProtectedProcesses } from './processGuard';
+import {
+  ANTIGRAVITY_PROCESS_PATTERNS,
+  detectAntigravityInstallation,
+  inspectRunningAntigravityProcesses,
+  markAntigravityLaunchedByGuard,
+  spawnAntigravityWithDedicatedProxy,
+} from './antigravityController';
 import {
   areAnyPidsAlive,
   CLAUDE_DESKTOP_PROCESS_PATTERNS,
@@ -108,10 +117,23 @@ export class ProbeEngine extends EventEmitter {
   private claudeSeenRunningSinceAuth = false;
   private claudeLaunchGraceUntil = 0;
 
+  // Antigravity 启动器专栏状态（纯代理指定，无监控预警、无时区限制、无断连强杀）
+  private antigravityDetectedExe: string | null = null;
+  private antigravityInstallType: AntigravityRuntimeState['installType'] = 'not-found';
+  private antigravityRunning = false;
+  private antigravityUiCount = 0;
+  private antigravityLsCount = 0;
+  private antigravityTotalCount = 0;
+  private antigravityProxiedSession = false;
+  private antigravityIsProbing = false;
+  private antigravityNodeProbe: ProbeResult | null = null;
+  private antigravityNodeProbeError: string | null = null;
+
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private localEnvTimer: NodeJS.Timeout | null = null;
   private claudeWatchTimer: NodeJS.Timeout | null = null;
   private clashDebounceTimer: NodeJS.Timeout | null = null;
+  private antigravityDebounceTimer: NodeJS.Timeout | null = null;
   private netDebounceTimer: NodeJS.Timeout | null = null;
 
   private cachedSysProxy: { state: SystemProxyState; readAt: number } | null = null;
@@ -138,6 +160,21 @@ export class ProbeEngine extends EventEmitter {
       }, 250);
     });
 
+    this.clashMonitor.on('antigravity-clash-ready', () => {
+      this.emitState();
+      const cfg = this.configStore.get();
+      const info = this.clashMonitor.getRuntimeInfo();
+      if (cfg.antigravityClashNode && info.antigravityPortListening && !this.antigravityIsProbing) {
+        if (this.antigravityDebounceTimer) {
+          clearTimeout(this.antigravityDebounceTimer);
+        }
+        this.antigravityDebounceTimer = setTimeout(() => {
+          this.antigravityDebounceTimer = null;
+          void this.probeAntigravityNodeNow();
+        }, 250);
+      }
+    });
+
     this.clashMonitor.on('clash-status-updated', () => {
       const info = this.clashMonitor.getRuntimeInfo();
       this.emitState();
@@ -157,11 +194,13 @@ export class ProbeEngine extends EventEmitter {
   public async start(): Promise<void> {
     this.stopped = false;
     const cfg = this.configStore.get();
-    const [sys, initialLocale, claudeInstall, claudeProc] = await Promise.all([
+    const [sys, initialLocale, claudeInstall, claudeProc, agInstall, agProc] = await Promise.all([
       this.getSystemProxyFresh(true),
       readWindowsLocaleState(),
       detectClaudeInstallation(cfg.claudeExePath),
       countRunningClaudeProcesses(),
+      detectAntigravityInstallation(cfg.antigravityExePath),
+      inspectRunningAntigravityProcesses(cfg.antigravityDedicatedPort),
     ]);
 
     this.winLocale = initialLocale;
@@ -171,10 +210,23 @@ export class ProbeEngine extends EventEmitter {
     this.claudeProcessCount = claudeProc.count;
     this.claudeRunningPids = claudeProc.pids;
 
+    this.antigravityDetectedExe = agInstall.exePath;
+    this.antigravityInstallType = agInstall.installType;
+    this.antigravityRunning = agProc.running;
+    this.antigravityUiCount = agProc.uiProcessCount;
+    this.antigravityLsCount = agProc.languageServerCount;
+    this.antigravityTotalCount = agProc.totalProcessCount;
+    this.antigravityProxiedSession = agProc.proxiedSession;
+
     this.lastSysProxySnapshot = `${sys.enabled}|${sys.proxyUrl || ''}`;
     this.lastNetFingerprint = getNetworkInterfaceFingerprint();
 
-    this.clashMonitor.start(cfg.selectedClashNode, cfg.dedicatedProxyPort);
+    this.clashMonitor.start(
+      cfg.selectedClashNode,
+      cfg.dedicatedProxyPort,
+      cfg.antigravityClashNode,
+      cfg.antigravityDedicatedPort
+    );
     this.startLocalEnvironmentWatcher();
     this.startClaudeExclusiveWatcher();
     this.restartHeartbeatTimer();
@@ -196,6 +248,7 @@ export class ProbeEngine extends EventEmitter {
     this.claudeLaunchGraceUntil = 0;
 
     // 卫士完全退出时，同步强杀全部 Claude 关联进程树，杜绝脱离监管后裸奔
+    // （注意：Antigravity 专栏不设强杀监管，卫士退出时保持 Antigravity 正常运行）
     if (shouldKillClaudeOnExit) {
       terminateClaudeProcessesSync();
     }
@@ -216,6 +269,10 @@ export class ProbeEngine extends EventEmitter {
     if (this.clashDebounceTimer) {
       clearTimeout(this.clashDebounceTimer);
       this.clashDebounceTimer = null;
+    }
+    if (this.antigravityDebounceTimer) {
+      clearTimeout(this.antigravityDebounceTimer);
+      this.antigravityDebounceTimer = null;
     }
     if (this.netDebounceTimer) {
       clearTimeout(this.netDebounceTimer);
@@ -251,8 +308,271 @@ export class ProbeEngine extends EventEmitter {
     this.emitState();
   }
 
+  public async refreshAntigravityInstallDetection(): Promise<void> {
+    const cfg = this.configStore.get();
+    const info = await detectAntigravityInstallation(cfg.antigravityExePath);
+    this.antigravityDetectedExe = info.exePath;
+    this.antigravityInstallType = info.installType;
+    this.emitState();
+  }
+
   /**
-   * 切换下拉框中指定的 Clash 节点：
+   * 切换 Antigravity 专属 Clash 节点：
+   * 仅在 Mihomo 中绑定 Antigravity 专属本地端口及 PROCESS-NAME 规则，并轻量获取一次节点出口信息用于展示，
+   * 不触发任何时区校验、默认地区变更、弹窗预警或进程强杀。
+   */
+  public async selectAntigravityClashNode(nodeName: string | null): Promise<AppStateSnapshot> {
+    const cleanNode = nodeName && nodeName.trim() ? nodeName.trim() : null;
+    const prevNode = this.configStore.get().antigravityClashNode;
+    const cfg = this.configStore.update({ antigravityClashNode: cleanNode });
+
+    if (prevNode !== cleanNode) {
+      this.antigravityNodeProbe = null;
+      this.antigravityNodeProbeError = null;
+    }
+
+    if (cleanNode) {
+      this.addLog(
+        'info',
+        `正在将 Antigravity 专属代理通道切换至节点：[${cleanNode}] (127.0.0.1:${cfg.antigravityDedicatedPort})...`
+      );
+      const bindRes = await this.clashMonitor.configureAntigravityNode(
+        cleanNode,
+        cfg.antigravityDedicatedPort
+      );
+      if (!bindRes.ok) {
+        const errText = bindRes.error || `绑定 Antigravity 节点 [${cleanNode}] 失败`;
+        this.antigravityNodeProbeError = errText;
+        this.addLog('warn', errText);
+        this.emitState();
+        return this.getSnapshot();
+      }
+
+      this.addLog(
+        'success',
+        `Antigravity 专属节点已锁定 [${cleanNode}] → 127.0.0.1:${cfg.antigravityDedicatedPort} (含 Antigravity.exe / language_server.exe 进程规则)`
+      );
+      return this.probeAntigravityNodeNow();
+    } else {
+      await this.clashMonitor.configureAntigravityNode(null, cfg.antigravityDedicatedPort);
+      this.antigravityNodeProbe = null;
+      this.antigravityNodeProbeError = null;
+      this.addLog('info', '已取消 Antigravity 专属 Clash 节点绑定');
+      this.emitState();
+      return this.getSnapshot();
+    }
+  }
+
+  /**
+   * 轻量探测 Antigravity 专属端口的出口 IP 与国家（纯界面展示，绝不触发任何警告或状态拦截）
+   */
+  public async probeAntigravityNodeNow(): Promise<AppStateSnapshot> {
+    const cfg = this.configStore.get();
+    if (!cfg.antigravityClashNode) {
+      this.antigravityNodeProbe = null;
+      this.antigravityNodeProbeError = null;
+      this.emitState();
+      return this.getSnapshot();
+    }
+
+    if (this.antigravityIsProbing) {
+      return this.getSnapshot();
+    }
+
+    this.antigravityIsProbing = true;
+    this.emitState();
+
+    try {
+      let clash = this.clashMonitor.getRuntimeInfo();
+      if (!clash.connected || !clash.antigravityPortListening) {
+        const bindRes = await this.clashMonitor.configureAntigravityNode(
+          cfg.antigravityClashNode,
+          cfg.antigravityDedicatedPort
+        );
+        clash = this.clashMonitor.getRuntimeInfo();
+        if (!bindRes.ok || !bindRes.listening) {
+          this.antigravityNodeProbe = null;
+          this.antigravityNodeProbeError =
+            bindRes.error ||
+            `专属端口 127.0.0.1:${cfg.antigravityDedicatedPort} 未就绪`;
+          return this.getSnapshot();
+        }
+      }
+
+      const proxyUrl = `http://127.0.0.1:${cfg.antigravityDedicatedPort}`;
+      const channelDesc = `Antigravity 专属端口 (127.0.0.1:${cfg.antigravityDedicatedPort})`;
+      const endpoints = this.buildEndpointsList();
+
+      let probeSuccess: ProbeResult | null = null;
+      let lastErrMsg = '探测超时';
+
+      for (const ep of endpoints) {
+        try {
+          const startedAt = Date.now();
+          const rawBody = await requestTextViaProxy(ep.url, proxyUrl, 5500);
+          const latencyMs = Date.now() - startedAt;
+
+          const parsed = parseTraceResponse(rawBody, ep.format);
+          if (!parsed.ip) {
+            throw new Error('响应中未解析到有效公网 IP');
+          }
+
+          const geo = this.geoIp.lookup(parsed.ip, parsed.loc);
+          probeSuccess = {
+            ip: parsed.ip,
+            countryCode: geo.countryCode,
+            countryName: geo.countryName,
+            edgeLoc: parsed.loc,
+            viaChannel: channelDesc,
+            latencyMs,
+            checkedAt: Date.now(),
+          };
+          break;
+        } catch (err) {
+          lastErrMsg = err instanceof Error ? err.message : String(err);
+        }
+      }
+
+      if (probeSuccess) {
+        this.antigravityNodeProbe = probeSuccess;
+        this.antigravityNodeProbeError = null;
+      } else {
+        this.antigravityNodeProbe = null;
+        this.antigravityNodeProbeError = simplifyNetworkError(lastErrMsg, channelDesc);
+      }
+    } finally {
+      this.antigravityIsProbing = false;
+      this.emitState();
+    }
+
+    return this.getSnapshot();
+  }
+
+  /**
+   * 通过指定专属代理节点启动（或重启）Antigravity：
+   * 1. 确保 Clash 专属端口 (如 127.0.0.1:27898) 与 PROCESS-NAME 规则已绑定
+   * 2. 若已有运行中的 Antigravity.exe / language_server.exe，先关闭旧实例以释放单实例锁
+   * 3. 注入 --proxy-server 与 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / GRPC_PROXY / NO_PROXY 拉起 Antigravity.exe
+   */
+  public async launchAntigravityFromGuard(): Promise<AntigravityLaunchResult> {
+    const cfg = this.configStore.get();
+
+    const install = await detectAntigravityInstallation(cfg.antigravityExePath);
+    this.antigravityDetectedExe = install.exePath;
+    this.antigravityInstallType = install.installType;
+
+    if (!install.exePath) {
+      const msg = '未检测到 Antigravity.exe 安装路径，请先点击下方「浏览」手动指定';
+      this.addLog('warn', msg);
+      this.emitState();
+      return { ok: false, message: msg, state: this.getSnapshot() };
+    }
+
+    if (!cfg.antigravityClashNode) {
+      const msg = '请先在下拉框中选择要为 Antigravity 绑定的 Clash 代理节点';
+      this.addLog('warn', msg);
+      this.emitState();
+      return { ok: false, message: msg, state: this.getSnapshot() };
+    }
+
+    const bindRes = await this.clashMonitor.configureAntigravityNode(
+      cfg.antigravityClashNode,
+      cfg.antigravityDedicatedPort
+    );
+    if (!bindRes.ok || !bindRes.listening) {
+      const msg = `无法建立节点 [${cfg.antigravityClashNode}] 的专属代理端口 (127.0.0.1:${
+        cfg.antigravityDedicatedPort
+      })：${bindRes.error || '端口未监听'}`;
+      this.addLog('warn', msg);
+      this.emitState();
+      return { ok: false, message: msg, state: this.getSnapshot() };
+    }
+
+    // 若当前已有 Antigravity.exe 或 language_server.exe 运行，需先终止旧进程，否则 Electron 单实例锁会使新进程直接退出
+    const beforeProc = await inspectRunningAntigravityProcesses(cfg.antigravityDedicatedPort);
+    if (beforeProc.running) {
+      markAntigravityLaunchedByGuard(null);
+      await this.executeProcessKillSafely(ANTIGRAVITY_PROCESS_PATTERNS);
+      for (let i = 0; i < 8; i++) {
+        const checkAlive = await inspectRunningAntigravityProcesses(cfg.antigravityDedicatedPort);
+        if (!checkAlive.running) break;
+        await sleep(160);
+      }
+    }
+
+    markAntigravityLaunchedByGuard(cfg.antigravityDedicatedPort);
+    const spawnRes = await spawnAntigravityWithDedicatedProxy(
+      install.exePath,
+      cfg.antigravityDedicatedPort
+    );
+
+    if (!spawnRes.ok) {
+      markAntigravityLaunchedByGuard(null);
+      const errMsg = `拉起 Antigravity 失败：${spawnRes.error || '未知错误'}`;
+      this.addLog('danger', errMsg);
+      this.emitState();
+      return { ok: false, message: errMsg, state: this.getSnapshot() };
+    }
+
+    let afterProc = await inspectRunningAntigravityProcesses(cfg.antigravityDedicatedPort);
+    for (let i = 0; i < 6; i++) {
+      if (afterProc.running) break;
+      await sleep(250);
+      afterProc = await inspectRunningAntigravityProcesses(cfg.antigravityDedicatedPort);
+    }
+
+    this.antigravityRunning = afterProc.running;
+    this.antigravityUiCount = afterProc.uiProcessCount;
+    this.antigravityLsCount = afterProc.languageServerCount;
+    this.antigravityTotalCount = afterProc.totalProcessCount;
+    this.antigravityProxiedSession = afterProc.running;
+
+    if (!this.antigravityNodeProbe && !this.antigravityIsProbing) {
+      void this.probeAntigravityNodeNow();
+    }
+
+    const okMsg = `已通过专属节点 [${cfg.antigravityClashNode}] (127.0.0.1:${cfg.antigravityDedicatedPort}) 启动 Antigravity，主进程与 language_server.exe 已全链路绑定代理`;
+    this.addLog('success', okMsg);
+    this.emitState();
+
+    return {
+      ok: true,
+      message: okMsg,
+      state: this.getSnapshot(),
+    };
+  }
+
+  /**
+   * 手动关闭 Antigravity 及其 language_server.exe 进程树
+   */
+  public async terminateAntigravityManually(): Promise<AntigravityLaunchResult> {
+    markAntigravityLaunchedByGuard(null);
+    const report = await this.executeProcessKillSafely(ANTIGRAVITY_PROCESS_PATTERNS);
+    const cfg = this.configStore.get();
+    const afterProc = await inspectRunningAntigravityProcesses(cfg.antigravityDedicatedPort);
+
+    this.antigravityRunning = afterProc.running;
+    this.antigravityUiCount = afterProc.uiProcessCount;
+    this.antigravityLsCount = afterProc.languageServerCount;
+    this.antigravityTotalCount = afterProc.totalProcessCount;
+    this.antigravityProxiedSession = afterProc.proxiedSession;
+
+    const msg =
+      report.killedCount > 0
+        ? `已关闭 Antigravity 关联进程：${report.killedSummary.join(', ')}`
+        : '当前无运行中的 Antigravity 进程';
+    this.addLog('info', msg);
+    this.emitState();
+
+    return {
+      ok: !this.antigravityRunning,
+      message: report.errorDetail || msg,
+      state: this.getSnapshot(),
+    };
+  }
+
+  /**
+   * 切换下拉框中指定的 Clash 节点（Claude 专栏）：
    * 1. 在 Mihomo 中将独立专属端口绑定到该节点（及进程规则锁死）
    * 2. 立即通过该专属通道探测真实出口 IP 与国家，并与系统时区/区域对比
    */
@@ -752,6 +1072,37 @@ export class ProbeEngine extends EventEmitter {
     };
   }
 
+  private buildAntigravityRuntimeState(clashInfo?: ClashRuntimeInfo): AntigravityRuntimeState {
+    const cfg = this.configStore.get();
+    const clash = clashInfo || this.clashMonitor.getRuntimeInfo();
+
+    let launchHint: string | null = null;
+    if (!this.antigravityDetectedExe) {
+      launchHint = '未检测到 Antigravity.exe 安装路径，请在下方手动浏览指定';
+    } else if (!cfg.antigravityClashNode) {
+      launchHint = '请先在下方下拉框中选择要绑定的 Clash 代理节点';
+    } else if (!clash.connected) {
+      launchHint = '未连接到 Clash Verge / Mihomo 控制接口，请确认 Clash 已启动';
+    } else if (!clash.antigravityPortListening) {
+      launchHint = `正在准备节点 [${cfg.antigravityClashNode}] 的专属代理端口 (127.0.0.1:${cfg.antigravityDedicatedPort})...`;
+    }
+
+    return {
+      detectedExePath: this.antigravityDetectedExe,
+      installType: this.antigravityInstallType,
+      running: this.antigravityRunning,
+      uiProcessCount: this.antigravityUiCount,
+      languageServerCount: this.antigravityLsCount,
+      totalProcessCount: this.antigravityTotalCount,
+      proxiedSession: this.antigravityProxiedSession,
+      canLaunch: launchHint === null,
+      launchHint,
+      isProbingNode: this.antigravityIsProbing,
+      nodeProbe: this.antigravityNodeProbe ? { ...this.antigravityNodeProbe } : null,
+      nodeProbeError: this.antigravityNodeProbeError,
+    };
+  }
+
   private startLocalEnvironmentWatcher(): void {
     const scheduleNext = (delayMs: number) => {
       if (this.stopped) return;
@@ -770,6 +1121,22 @@ export class ProbeEngine extends EventEmitter {
       const cfg = this.configStore.get();
 
       try {
+        // 0. 刷新 Antigravity 进程运行状态（仅状态展示，不做任何拦截或强杀）
+        const agProc = await inspectRunningAntigravityProcesses(cfg.antigravityDedicatedPort);
+        const agStateChanged =
+          agProc.running !== this.antigravityRunning ||
+          agProc.uiProcessCount !== this.antigravityUiCount ||
+          agProc.languageServerCount !== this.antigravityLsCount ||
+          agProc.proxiedSession !== this.antigravityProxiedSession;
+        if (agStateChanged) {
+          this.antigravityRunning = agProc.running;
+          this.antigravityUiCount = agProc.uiProcessCount;
+          this.antigravityLsCount = agProc.languageServerCount;
+          this.antigravityTotalCount = agProc.totalProcessCount;
+          this.antigravityProxiedSession = agProc.proxiedSession;
+          this.emitState();
+        }
+
         // 1. 每 ~7 秒同步一次外部手动修改的 Windows 时区与区域
         if (this.envTickCounter === 0 && !this.isSyncingLocale) {
           const latestLocale = await readWindowsLocaleState();
@@ -866,6 +1233,7 @@ export class ProbeEngine extends EventEmitter {
       lastError: this.lastError,
       clashInfo,
       claudeState: this.buildClaudeRuntimeState(clashInfo),
+      antigravityState: this.buildAntigravityRuntimeState(clashInfo),
       geoDbSource: this.geoIp.getSourceDescription(),
       logs: [...this.logs],
     };

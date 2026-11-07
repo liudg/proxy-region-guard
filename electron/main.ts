@@ -434,16 +434,28 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     : state.lastError || '检测中...';
 
   const nodeText = state.config.selectedClashNode
-    ? `指定节点: ${state.config.selectedClashNode}`
+    ? `Claude节点: ${state.config.selectedClashNode}`
     : state.clashInfo.connected
     ? `Clash全局: ${state.clashInfo.activeNode || state.clashInfo.mode}`
     : '未指定节点';
+
+  const agNodeText = state.config.antigravityClashNode
+    ? `Antigravity节点: ${state.config.antigravityClashNode}`
+    : '';
 
   const claudeText = state.claudeState.running
     ? 'Claude: 🟢 受控运行中'
     : state.claudeState.canLaunch
     ? 'Claude: 就绪可启动'
     : 'Claude: 待校验';
+
+  const agText = state.antigravityState.running
+    ? state.antigravityState.proxiedSession
+      ? 'Antigravity: 🟢 代理运行中'
+      : 'Antigravity: 🟡 外部运行中'
+    : state.antigravityState.canLaunch
+    ? 'Antigravity: 就绪可启动'
+    : 'Antigravity: 待选择节点';
 
   const statusLabelMap: Record<AppStateSnapshot['status'], string> = {
     ok: '🟢 代理与时区一致 (正常)',
@@ -456,8 +468,10 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
   const tooltip = [
     `代理地区卫士 · ${statusLabelMap[state.status]}`,
     nodeText,
+    agNodeText,
     `当前出口: ${curText}`,
     `系统区域: ${state.winLocale.regionName} (${state.winLocale.regionCode})`,
+    agText,
     claudeText,
   ]
     .filter(Boolean)
@@ -476,10 +490,15 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     state.status,
     curText,
     nodeText,
+    agNodeText,
     state.winLocale.regionName,
     claudeText,
+    agText,
     state.claudeState.canLaunch ? '1' : '0',
     state.claudeState.running ? '1' : '0',
+    state.antigravityState.canLaunch ? '1' : '0',
+    state.antigravityState.running ? '1' : '0',
+    state.antigravityState.proxiedSession ? '1' : '0',
     canSyncLocale ? syncTargetName : '',
     state.isSyncingLocale ? '1' : '0',
     state.config.autoLaunch ? '1' : '0',
@@ -499,6 +518,14 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       label: nodeText,
       enabled: false,
     },
+    ...(agNodeText
+      ? [
+          {
+            label: agNodeText,
+            enabled: false,
+          },
+        ]
+      : []),
     {
       label: `当前: ${curText}`,
       enabled: false,
@@ -509,10 +536,34 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     },
     { type: 'separator' },
     {
+      label: state.antigravityState.running
+        ? state.antigravityState.proxiedSession
+          ? '🟢 Antigravity 代理运行中 (点击重启)'
+          : '🔄 重启 Antigravity 以注入专属代理'
+        : state.antigravityState.canLaunch
+        ? `🚀 启动 Antigravity (${state.config.antigravityClashNode})`
+        : `🚀 启动 Antigravity (${state.antigravityState.launchHint || '待配置节点'})`,
+      enabled: state.antigravityState.canLaunch,
+      click: () => {
+        void probeEngine.launchAntigravityFromGuard();
+      },
+    },
+    ...(state.antigravityState.running
+      ? [
+          {
+            label: '🛑 关闭 Antigravity 进程',
+            click: () => {
+              void probeEngine.terminateAntigravityManually();
+            },
+          },
+        ]
+      : []),
+    { type: 'separator' },
+    {
       label: state.claudeState.running
         ? '🟢 Claude 正在受控运行 (点击重新激活)'
         : state.claudeState.canLaunch
-        ? '🚀 安全启动 Claude Desktop'
+        ? '🤖 安全启动 Claude Desktop'
         : `🔒 启动 Claude (${state.claudeState.launchBlockReason || '条件未满足'})`,
       enabled: state.claudeState.canLaunch,
       click: () => {
@@ -570,7 +621,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       click: () => showMainWindow(),
     },
     {
-      label: '完全退出程序 (同时关闭 Claude)',
+      label: '完全退出程序 (保持 Antigravity 运行)',
       click: () => {
         isQuitting = true;
         probeEngine?.stop();
@@ -639,6 +690,37 @@ function registerIpcHandlers(): void {
     return probeEngine.getSnapshot();
   });
 
+  // Antigravity 启动器专栏 IPC
+  ipcMain.handle('guard:select-antigravity-node', (_e, nodeName: string | null) =>
+    probeEngine.selectAntigravityClashNode(nodeName)
+  );
+
+  ipcMain.handle('guard:probe-antigravity-node', () =>
+    probeEngine.probeAntigravityNodeNow()
+  );
+
+  ipcMain.handle('guard:launch-antigravity', () =>
+    probeEngine.launchAntigravityFromGuard()
+  );
+
+  ipcMain.handle('guard:terminate-antigravity', () =>
+    probeEngine.terminateAntigravityManually()
+  );
+
+  ipcMain.handle('guard:browse-antigravity-exe', async () => {
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
+    const res = await dialog.showOpenDialog(win as BrowserWindow, {
+      title: '选择 Antigravity 可执行文件 (Antigravity.exe)',
+      filters: [{ name: '可执行文件 (*.exe)', extensions: ['exe'] }],
+      properties: ['openFile'],
+    });
+    if (!res.canceled && res.filePaths.length > 0) {
+      configStore.update({ antigravityExePath: res.filePaths[0] });
+      await probeEngine.refreshAntigravityInstallDetection();
+    }
+    return probeEngine.getSnapshot();
+  });
+
   ipcMain.handle('guard:update-config', async (_e, partial: Partial<AppConfig>) => {
     const prevCfg = configStore.get();
     let nextCfg = configStore.update(partial);
@@ -654,8 +736,19 @@ function registerIpcHandlers(): void {
       await probeEngine.refreshClaudeInstallDetection();
     }
 
+    if (prevCfg.antigravityExePath !== nextCfg.antigravityExePath) {
+      await probeEngine.refreshAntigravityInstallDetection();
+    }
+
     if (prevCfg.heartbeatIntervalSec !== nextCfg.heartbeatIntervalSec) {
       probeEngine.restartHeartbeatTimer();
+    }
+
+    if (
+      prevCfg.antigravityClashNode !== nextCfg.antigravityClashNode ||
+      prevCfg.antigravityDedicatedPort !== nextCfg.antigravityDedicatedPort
+    ) {
+      return probeEngine.selectAntigravityClashNode(nextCfg.antigravityClashNode);
     }
 
     if (
