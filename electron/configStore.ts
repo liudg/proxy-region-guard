@@ -28,6 +28,9 @@ export const DEFAULT_CONFIG: AppConfig = {
   dedicatedProxyPort: 27897,
   claudeExePath: '',
   claudeExclusiveGuard: true,
+  antigravityClashNode: null,
+  antigravityDedicatedPort: 27898,
+  antigravityExePath: '',
 };
 
 function sanitizePatternList(raw: unknown): string[] {
@@ -93,6 +96,24 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
       ? raw.claudeExclusiveGuard
       : DEFAULT_CONFIG.claudeExclusiveGuard;
 
+  const antigravityClashNode =
+    typeof raw.antigravityClashNode === 'string' && raw.antigravityClashNode.trim()
+      ? raw.antigravityClashNode.trim()
+      : null;
+
+  const agPortNum = Number(raw.antigravityDedicatedPort);
+  let antigravityDedicatedPort =
+    Number.isFinite(agPortNum) && agPortNum >= 1024 && agPortNum <= 65535
+      ? Math.round(agPortNum)
+      : DEFAULT_CONFIG.antigravityDedicatedPort;
+
+  if (antigravityDedicatedPort === dedicatedProxyPort) {
+    antigravityDedicatedPort = dedicatedProxyPort === 27898 ? 27899 : 27898;
+  }
+
+  const antigravityExePath =
+    typeof raw.antigravityExePath === 'string' ? raw.antigravityExePath.trim() : '';
+
   return {
     defaultCountryCode: normalizedCode,
     defaultCountryName: normalizedCode ? getCountryNameZh(normalizedCode) : null,
@@ -133,6 +154,9 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     dedicatedProxyPort,
     claudeExePath,
     claudeExclusiveGuard,
+    antigravityClashNode,
+    antigravityDedicatedPort,
+    antigravityExePath,
   };
 }
 

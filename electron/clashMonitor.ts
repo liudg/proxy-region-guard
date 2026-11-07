@@ -5,6 +5,7 @@ import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { ClashProxyNodeOption, ClashRuntimeInfo } from '../src/shared/types';
+import { ANTIGRAVITY_TUN_PROCESS_NAMES } from './antigravityController';
 import { CLAUDE_TUN_PROCESS_NAMES } from './claudeController';
 
 interface JsYamlModule {
@@ -43,10 +44,15 @@ const CONNECTED_POLL_MS = 1500;
 const DISCONNECTED_POLL_MS = 4500;
 const YAML_HEADER_READ_BYTES = 16 * 1024;
 const MAX_CONTROLLER_RESPONSE_BYTES = 16 * 1024 * 1024;
-const DEDICATED_LISTENER_NAME = 'proxy-region-guard-claude-in';
+const CLAUDE_LISTENER_NAME = 'proxy-region-guard-claude-in';
+const ANTIGRAVITY_LISTENER_NAME = 'proxy-region-guard-antigravity-in';
 const AUTO_REBIND_RETRY_COOLDOWN_MS = 8000;
-const CLAUDE_PROCESS_RULE_PREFIXES = CLAUDE_TUN_PROCESS_NAMES.map((p) =>
-  `PROCESS-NAME,${p.toLowerCase()},`
+
+const MANAGED_PROCESS_RULE_PREFIXES = Array.from(
+  new Set([
+    ...CLAUDE_TUN_PROCESS_NAMES.map((p) => `process-name,${p.toLowerCase()},`),
+    ...ANTIGRAVITY_TUN_PROCESS_NAMES.map((p) => `process-name,${p.toLowerCase()},`),
+  ])
 );
 
 function isVergeUiSettingsYaml(filePath: string): boolean {
@@ -80,10 +86,18 @@ export class ClashMonitor extends EventEmitter {
   private lastGroupsSignature = '';
   private yamlCache = new Map<string, CachedYamlMeta>();
 
+  // Claude 专属节点与端口状态
   private desiredNodeName: string | null = null;
   private desiredDedicatedPort = 27897;
   private boundNodeName: string | null = null;
   private boundPort: number | null = null;
+
+  // Antigravity 专属节点与端口状态
+  private desiredAntigravityNode: string | null = null;
+  private desiredAntigravityPort = 27898;
+  private boundAntigravityNode: string | null = null;
+  private boundAntigravityPort: number | null = null;
+
   private lastAutoBindFailAt = 0;
   private lastAutoBindFailKey = '';
 
@@ -98,15 +112,25 @@ export class ClashMonitor extends EventEmitter {
     boundNode: null,
     dedicatedPort: null,
     dedicatedPortListening: false,
+    antigravityBoundNode: null,
+    antigravityDedicatedPort: null,
+    antigravityPortListening: false,
   };
 
   public getRuntimeInfo(): ClashRuntimeInfo {
     return structuredClone(this.info);
   }
 
-  public start(initialNode: string | null = null, dedicatedPort = 27897): void {
-    this.desiredNodeName = initialNode;
-    this.desiredDedicatedPort = dedicatedPort;
+  public start(
+    initialClaudeNode: string | null = null,
+    claudePort = 27897,
+    initialAntigravityNode: string | null = null,
+    antigravityPort = 27898
+  ): void {
+    this.desiredNodeName = initialClaudeNode;
+    this.desiredDedicatedPort = claudePort;
+    this.desiredAntigravityNode = initialAntigravityNode;
+    this.desiredAntigravityPort = antigravityPort;
     this.stopped = false;
     this.scheduleNextTick(0);
   }
@@ -120,7 +144,7 @@ export class ClashMonitor extends EventEmitter {
   }
 
   /**
-   * 设置或切换指定的 Clash 节点，并在 Mihomo 内核中建立/更新独立专属入站端口
+   * 设置或切换 Claude 指定的 Clash 节点，并在 Mihomo 内核中建立/更新独立专属入站端口
    */
   public async configureDedicatedNode(
     nodeName: string | null,
@@ -149,24 +173,60 @@ export class ClashMonitor extends EventEmitter {
       };
     }
 
+    const res = await this.queueSyncDedicatedListeners(true);
+    this.emit('clash-status-updated');
+
     if (!this.desiredNodeName) {
-      await this.removeDedicatedListenerIfBound();
-      this.boundNodeName = null;
-      this.boundPort = null;
-      this.info.boundNode = null;
-      this.info.dedicatedPort = null;
-      this.info.dedicatedPortListening = false;
-      this.emit('clash-status-updated');
       return { ok: true, listening: false };
     }
+    return {
+      ok: res.claudeListening,
+      listening: res.claudeListening,
+      error: res.claudeError || res.generalError,
+    };
+  }
 
-    const res = await this.ensureDedicatedListenerBound(
-      this.desiredNodeName,
-      this.desiredDedicatedPort,
-      true
-    );
+  /**
+   * 设置或切换 Antigravity 指定的 Clash 节点，并在 Mihomo 内核中建立/更新独立专属入站端口及进程规则
+   */
+  public async configureAntigravityNode(
+    nodeName: string | null,
+    dedicatedPort: number
+  ): Promise<{ ok: boolean; listening: boolean; error?: string }> {
+    this.desiredAntigravityNode = nodeName ? nodeName.trim() : null;
+    this.desiredAntigravityPort = dedicatedPort;
+
+    if (!this.currentEndpoint) {
+      const found = await this.findWorkingEndpoint();
+      if (found) {
+        this.currentEndpoint = found;
+      }
+    }
+
+    if (!this.currentEndpoint) {
+      this.boundAntigravityNode = null;
+      this.boundAntigravityPort = null;
+      this.info.antigravityBoundNode = null;
+      this.info.antigravityDedicatedPort = dedicatedPort;
+      this.info.antigravityPortListening = false;
+      return {
+        ok: false,
+        listening: false,
+        error: '未检测到运行中的 Clash Verge / Mihomo 控制接口',
+      };
+    }
+
+    const res = await this.queueSyncDedicatedListeners(true);
     this.emit('clash-status-updated');
-    return res;
+
+    if (!this.desiredAntigravityNode) {
+      return { ok: true, listening: false };
+    }
+    return {
+      ok: res.antigravityListening,
+      listening: res.antigravityListening,
+      error: res.antigravityError || res.generalError,
+    };
   }
 
   private scheduleNextTick(delayMs: number): void {
@@ -217,52 +277,88 @@ export class ClashMonitor extends EventEmitter {
         const availableNodes = extractAvailableNodes(proxiesMap);
         const nextGroupsSig = buildAllGroupsSignature(proxiesMap);
 
-        // 如果用户指定了专属节点，检查该专属端口是否处于监听状态；若因 Clash 重载配置丢失则自动重绑
-        let dedicatedListening = false;
-        let boundChanged = false;
-        const prevBoundNode = this.boundNodeName;
-        const prevBoundPort = this.boundPort;
-        if (this.desiredNodeName) {
-          const nodeExists = Boolean(proxiesMap[this.desiredNodeName]);
-          if (nodeExists) {
-            const portAlive = await isLocalPortListening(this.desiredDedicatedPort);
-            if (
-              !portAlive ||
-              this.boundNodeName !== this.desiredNodeName ||
-              this.boundPort !== this.desiredDedicatedPort
-            ) {
-              const targetKey = `${this.desiredNodeName}|${this.desiredDedicatedPort}`;
-              const now = Date.now();
-              const inCooldown =
-                this.lastAutoBindFailKey === targetKey &&
-                now - this.lastAutoBindFailAt < AUTO_REBIND_RETRY_COOLDOWN_MS;
-              if (!inCooldown) {
-                const bindRes = await this.ensureDedicatedListenerBound(
-                  this.desiredNodeName,
-                  this.desiredDedicatedPort,
-                  false
-                );
-                dedicatedListening = bindRes.listening;
-                if (dedicatedListening) {
-                  this.lastAutoBindFailAt = 0;
-                  this.lastAutoBindFailKey = '';
-                  if (
-                    prevBoundNode !== this.boundNodeName ||
-                    prevBoundPort !== this.boundPort ||
-                    !this.info.dedicatedPortListening
-                  ) {
-                    boundChanged = true;
-                  }
-                } else {
-                  this.lastAutoBindFailAt = Date.now();
-                  this.lastAutoBindFailKey = targetKey;
-                }
-              }
-            } else {
-              dedicatedListening = true;
-            }
+        const prevBoundClaudeNode = this.boundNodeName;
+        const prevBoundClaudePort = this.boundPort;
+        const prevBoundAgNode = this.boundAntigravityNode;
+        const prevBoundAgPort = this.boundAntigravityPort;
+
+        let claudeListening = false;
+        let antigravityListening = false;
+        let needsSync = false;
+
+        if (this.desiredNodeName && proxiesMap[this.desiredNodeName]) {
+          const alive = await isLocalPortListening(this.desiredDedicatedPort);
+          if (
+            !alive ||
+            this.boundNodeName !== this.desiredNodeName ||
+            this.boundPort !== this.desiredDedicatedPort
+          ) {
+            needsSync = true;
           } else {
-            dedicatedListening = false;
+            claudeListening = true;
+          }
+        }
+
+        if (this.desiredAntigravityNode && proxiesMap[this.desiredAntigravityNode]) {
+          const alive = await isLocalPortListening(this.desiredAntigravityPort);
+          if (
+            !alive ||
+            this.boundAntigravityNode !== this.desiredAntigravityNode ||
+            this.boundAntigravityPort !== this.desiredAntigravityPort
+          ) {
+            needsSync = true;
+          } else {
+            antigravityListening = true;
+          }
+        }
+
+        let claudeBoundChanged = false;
+        let agBoundChanged = false;
+
+        if (needsSync) {
+          const targetKey = `${this.desiredNodeName || ''}:${this.desiredDedicatedPort}|${
+            this.desiredAntigravityNode || ''
+          }:${this.desiredAntigravityPort}`;
+          const now = Date.now();
+          const inCooldown =
+            this.lastAutoBindFailKey === targetKey &&
+            now - this.lastAutoBindFailAt < AUTO_REBIND_RETRY_COOLDOWN_MS;
+
+          if (!inCooldown) {
+            const syncRes = await this.queueSyncDedicatedListeners(false);
+            claudeListening = syncRes.claudeListening;
+            antigravityListening = syncRes.antigravityListening;
+
+            const allDesiredOk =
+              (!this.desiredNodeName ||
+                !proxiesMap[this.desiredNodeName] ||
+                claudeListening) &&
+              (!this.desiredAntigravityNode ||
+                !proxiesMap[this.desiredAntigravityNode] ||
+                antigravityListening);
+
+            if (allDesiredOk) {
+              this.lastAutoBindFailAt = 0;
+              this.lastAutoBindFailKey = '';
+            } else {
+              this.lastAutoBindFailAt = Date.now();
+              this.lastAutoBindFailKey = targetKey;
+            }
+
+            if (
+              prevBoundClaudeNode !== this.boundNodeName ||
+              prevBoundClaudePort !== this.boundPort ||
+              this.info.dedicatedPortListening !== claudeListening
+            ) {
+              claudeBoundChanged = true;
+            }
+            if (
+              prevBoundAgNode !== this.boundAntigravityNode ||
+              prevBoundAgPort !== this.boundAntigravityPort ||
+              this.info.antigravityPortListening !== antigravityListening
+            ) {
+              agBoundChanged = true;
+            }
           }
         }
 
@@ -272,7 +368,8 @@ export class ClashMonitor extends EventEmitter {
         const prevChainKey = this.info.nodeChain.join(' > ');
         const nextChainKey = resolved.chain.join(' > ');
         const prevGroupsSig = this.lastGroupsSignature;
-        const prevListening = this.info.dedicatedPortListening;
+        const prevClaudeListening = this.info.dedicatedPortListening;
+        const prevAgListening = this.info.antigravityPortListening;
         const prevAvailCount = this.info.availableNodes.length;
 
         this.lastGroupsSignature = nextGroupsSig;
@@ -286,24 +383,33 @@ export class ClashMonitor extends EventEmitter {
           availableNodes,
           boundNode: this.desiredNodeName,
           dedicatedPort: this.desiredNodeName ? this.desiredDedicatedPort : null,
-          dedicatedPortListening: dedicatedListening,
+          dedicatedPortListening: claudeListening,
+          antigravityBoundNode: this.desiredAntigravityNode,
+          antigravityDedicatedPort: this.desiredAntigravityNode
+            ? this.desiredAntigravityPort
+            : null,
+          antigravityPortListening: antigravityListening,
         };
 
+        if (agBoundChanged || prevAgListening !== antigravityListening) {
+          this.emit('antigravity-clash-ready');
+        }
+
         if (!prevConnected) {
-          if (boundChanged) {
+          if (claudeBoundChanged) {
             this.emit(
               'clash-change',
-              dedicatedListening
+              claudeListening
                 ? `Clash 已连接并绑定专属节点: ${this.desiredNodeName} (127.0.0.1:${this.desiredDedicatedPort})`
                 : `Clash 已连接，但指定节点通道未就绪: ${this.desiredNodeName}`
             );
           } else {
             this.emit('clash-status-updated');
           }
-        } else if (boundChanged || prevListening !== dedicatedListening) {
+        } else if (claudeBoundChanged || prevClaudeListening !== claudeListening) {
           this.emit(
             'clash-change',
-            dedicatedListening
+            claudeListening
               ? `已绑定专属节点通道: ${this.desiredNodeName} (127.0.0.1:${this.desiredDedicatedPort})`
               : `指定节点通道异常: ${this.desiredNodeName}`
           );
@@ -318,14 +424,28 @@ export class ClashMonitor extends EventEmitter {
             `Clash 节点变更: ${prevNode || '无'} → ${resolved.leafNode || '直连'}`
           );
         } else if (prevGroupsSig && prevGroupsSig !== nextGroupsSig) {
-          // 若用户选中的是某个策略组，或者处于未指定节点的全局监听模式，策略组切换时触发重测
-          const selectedItem = this.desiredNodeName ? proxiesMap[this.desiredNodeName] : null;
-          if (!this.desiredNodeName || (selectedItem && GROUP_TYPES.has(selectedItem.type))) {
+          const selectedClaudeItem = this.desiredNodeName
+            ? proxiesMap[this.desiredNodeName]
+            : null;
+          const selectedAgItem = this.desiredAntigravityNode
+            ? proxiesMap[this.desiredAntigravityNode]
+            : null;
+          if (selectedAgItem && GROUP_TYPES.has(selectedAgItem.type)) {
+            this.emit('antigravity-clash-ready');
+          }
+          if (
+            !this.desiredNodeName ||
+            (selectedClaudeItem && GROUP_TYPES.has(selectedClaudeItem.type))
+          ) {
             this.emit('clash-change', 'Clash 策略组节点切换');
           } else {
             this.emit('clash-status-updated');
           }
-        } else if (prevAvailCount !== availableNodes.length) {
+        } else if (
+          prevAvailCount !== availableNodes.length ||
+          agBoundChanged ||
+          prevAgListening !== antigravityListening
+        ) {
           this.emit('clash-status-updated');
         }
       } catch {
@@ -342,13 +462,15 @@ export class ClashMonitor extends EventEmitter {
     }
   }
 
-  private async ensureDedicatedListenerBound(
-    nodeName: string,
-    port: number,
-    forceRebind: boolean
-  ): Promise<{ ok: boolean; listening: boolean; error?: string }> {
+  private async queueSyncDedicatedListeners(forceRebind: boolean): Promise<{
+    claudeListening: boolean;
+    antigravityListening: boolean;
+    claudeError?: string;
+    antigravityError?: string;
+    generalError?: string;
+  }> {
     const operation = this.listenerApplyQueue.then(() =>
-      this.applyDedicatedListenerBound(nodeName, port, forceRebind)
+      this.applySyncDedicatedListeners(forceRebind)
     );
     this.listenerApplyQueue = operation.then(
       () => undefined,
@@ -357,149 +479,194 @@ export class ClashMonitor extends EventEmitter {
     return operation;
   }
 
-  private async applyDedicatedListenerBound(
-    nodeName: string,
-    port: number,
-    forceRebind: boolean
-  ): Promise<{ ok: boolean; listening: boolean; error?: string }> {
+  private async applySyncDedicatedListeners(forceRebind: boolean): Promise<{
+    claudeListening: boolean;
+    antigravityListening: boolean;
+    claudeError?: string;
+    antigravityError?: string;
+    generalError?: string;
+  }> {
     if (!this.currentEndpoint) {
-      const alive = await isLocalPortListening(port);
+      const claudeAlive = this.desiredNodeName
+        ? await isLocalPortListening(this.desiredDedicatedPort)
+        : false;
+      const agAlive = this.desiredAntigravityNode
+        ? await isLocalPortListening(this.desiredAntigravityPort)
+        : false;
       return {
-        ok: false,
-        listening: alive,
-        error: '尚未连接到 Clash 控制接口，无法确认专属节点绑定状态',
+        claudeListening: claudeAlive,
+        antigravityListening: agAlive,
+        generalError: '尚未连接到 Clash 控制接口，无法确认专属节点绑定状态',
       };
     }
 
-    if (
-      !forceRebind &&
-      this.boundNodeName === nodeName &&
-      this.boundPort === port &&
-      (await isLocalPortListening(port))
-    ) {
-      this.info.boundNode = nodeName;
-      this.info.dedicatedPort = port;
-      this.info.dedicatedPortListening = true;
-      return { ok: true, listening: true };
+    const claudeAlreadyOk = !this.desiredNodeName
+      ? !this.boundNodeName
+      : !forceRebind &&
+        this.boundNodeName === this.desiredNodeName &&
+        this.boundPort === this.desiredDedicatedPort &&
+        (await isLocalPortListening(this.desiredDedicatedPort));
+
+    const agAlreadyOk = !this.desiredAntigravityNode
+      ? !this.boundAntigravityNode
+      : !forceRebind &&
+        this.boundAntigravityNode === this.desiredAntigravityNode &&
+        this.boundAntigravityPort === this.desiredAntigravityPort &&
+        (await isLocalPortListening(this.desiredAntigravityPort));
+
+    if (claudeAlreadyOk && agAlreadyOk) {
+      const claudeListening = Boolean(this.desiredNodeName);
+      const antigravityListening = Boolean(this.desiredAntigravityNode);
+      this.info.boundNode = this.desiredNodeName;
+      this.info.dedicatedPort = this.desiredNodeName ? this.desiredDedicatedPort : null;
+      this.info.dedicatedPortListening = claudeListening;
+      this.info.antigravityBoundNode = this.desiredAntigravityNode;
+      this.info.antigravityDedicatedPort = this.desiredAntigravityNode
+        ? this.desiredAntigravityPort
+        : null;
+      this.info.antigravityPortListening = antigravityListening;
+      return { claudeListening, antigravityListening };
     }
 
     try {
       const yamlPath = this.findActiveClashYamlFile();
       if (!yamlPath) {
         return {
-          ok: false,
-          listening: false,
-          error: '未找到 Clash / Mihomo 运行时配置文件',
+          claudeListening: false,
+          antigravityListening: false,
+          generalError: '未找到 Clash / Mihomo 运行时配置文件',
         };
       }
 
-      // 1. 记录当前所有 Selector 策略组的选中状态，确保重载配置后原样保持，不打断用户日常代理
       const proxiesRes = await this.requestJson<{ proxies?: Record<string, ClashProxyItem> }>(
         this.currentEndpoint,
         '/proxies'
       );
       const proxiesMap = proxiesRes?.proxies || {};
-      if (!proxiesMap[nodeName]) {
-        return {
-          ok: false,
-          listening: false,
-          error: `当前 Clash 配置中不存在节点 "${nodeName}"，请重新选择`,
-        };
-      }
-
       const savedSelections = extractSelectorSelections(proxiesMap);
 
-      // 2. 读取运行时 YAML 并注入专属入站 Listener + Claude 进程规则
-      const doc = this.loadAndPrepareCoreYaml(yamlPath, port);
+      const portsToStrip = [
+        this.desiredDedicatedPort,
+        this.boundPort,
+        this.desiredAntigravityPort,
+        this.boundAntigravityPort,
+      ].filter((p): p is number => typeof p === 'number' && p > 0);
+
+      const doc = this.loadAndPrepareCoreYaml(yamlPath, portsToStrip);
       if (!doc) {
         return {
-          ok: false,
-          listening: false,
-          error: `配置文件无效或非内核配置: ${path.basename(yamlPath)}`,
+          claudeListening: false,
+          antigravityListening: false,
+          generalError: `配置文件无效或非内核配置: ${path.basename(yamlPath)}`,
         };
       }
 
       const existingListeners = Array.isArray(doc['listeners'])
         ? (doc['listeners'] as Array<Record<string, unknown>>)
         : [];
-      existingListeners.push({
-        name: DEDICATED_LISTENER_NAME,
-        type: 'mixed',
-        port,
-        listen: '127.0.0.1',
-        proxy: nodeName,
-        udp: true,
-      });
+      const prependedRules: string[] = [];
+
+      let claudeError: string | undefined;
+      let antigravityError: string | undefined;
+      let shouldBindClaude = false;
+      let shouldBindAg = false;
+
+      if (this.desiredNodeName) {
+        if (!proxiesMap[this.desiredNodeName]) {
+          claudeError = `当前 Clash 配置中不存在节点 "${this.desiredNodeName}"，请重新选择`;
+        } else {
+          shouldBindClaude = true;
+          existingListeners.push({
+            name: CLAUDE_LISTENER_NAME,
+            type: 'mixed',
+            port: this.desiredDedicatedPort,
+            listen: '127.0.0.1',
+            proxy: this.desiredNodeName,
+            udp: true,
+          });
+          for (const proc of CLAUDE_TUN_PROCESS_NAMES) {
+            prependedRules.push(`PROCESS-NAME,${proc},${this.desiredNodeName}`);
+          }
+        }
+      }
+
+      if (this.desiredAntigravityNode) {
+        if (!proxiesMap[this.desiredAntigravityNode]) {
+          antigravityError = `当前 Clash 配置中不存在节点 "${this.desiredAntigravityNode}"，请重新选择`;
+        } else {
+          shouldBindAg = true;
+          existingListeners.push({
+            name: ANTIGRAVITY_LISTENER_NAME,
+            type: 'mixed',
+            port: this.desiredAntigravityPort,
+            listen: '127.0.0.1',
+            proxy: this.desiredAntigravityNode,
+            udp: true,
+          });
+          for (const proc of ANTIGRAVITY_TUN_PROCESS_NAMES) {
+            prependedRules.push(`PROCESS-NAME,${proc},${this.desiredAntigravityNode}`);
+          }
+        }
+      }
+
       doc['listeners'] = existingListeners;
 
-      // 针对开启 TUN 模式的情况：将 Claude 进程名规则置于首部，避免子组件绕过代理参数时漏网（不污染浏览器域名规则）
-      const claudeProcessRules = CLAUDE_TUN_PROCESS_NAMES.map(
-        (proc) => `PROCESS-NAME,${proc},${nodeName}`
-      );
+      if (prependedRules.length > 0 && doc['find-process-mode'] === 'off') {
+        doc['find-process-mode'] = 'strict';
+      }
+
       const existingRules = Array.isArray(doc['rules']) ? (doc['rules'] as string[]) : [];
-      doc['rules'] = [...claudeProcessRules, ...existingRules];
+      doc['rules'] = [...prependedRules, ...existingRules];
 
       await this.reloadClashDocAndRestoreSelections(doc, savedSelections);
 
-      const listening = await waitPortListening(port, 1200);
-      this.boundNodeName = listening ? nodeName : null;
-      this.boundPort = listening ? port : null;
+      const [claudeListening, antigravityListening] = await Promise.all([
+        shouldBindClaude ? waitPortListening(this.desiredDedicatedPort, 1200) : Promise.resolve(false),
+        shouldBindAg
+          ? waitPortListening(this.desiredAntigravityPort, 1200)
+          : Promise.resolve(false),
+      ]);
+
+      this.boundNodeName = claudeListening ? this.desiredNodeName : null;
+      this.boundPort = claudeListening ? this.desiredDedicatedPort : null;
       this.info.boundNode = this.boundNodeName;
-      this.info.dedicatedPort = port;
-      this.info.dedicatedPortListening = listening;
-      if (listening) {
-        this.lastAutoBindFailAt = 0;
-        this.lastAutoBindFailKey = '';
+      this.info.dedicatedPort = this.desiredNodeName ? this.desiredDedicatedPort : null;
+      this.info.dedicatedPortListening = claudeListening;
+
+      this.boundAntigravityNode = antigravityListening ? this.desiredAntigravityNode : null;
+      this.boundAntigravityPort = antigravityListening ? this.desiredAntigravityPort : null;
+      this.info.antigravityBoundNode = this.boundAntigravityNode;
+      this.info.antigravityDedicatedPort = this.desiredAntigravityNode
+        ? this.desiredAntigravityPort
+        : null;
+      this.info.antigravityPortListening = antigravityListening;
+
+      if (shouldBindClaude && !claudeListening && !claudeError) {
+        claudeError = `专属代理端口 127.0.0.1:${this.desiredDedicatedPort} 未能成功启动监听`;
+      }
+      if (shouldBindAg && !antigravityListening && !antigravityError) {
+        antigravityError = `Antigravity 专属代理端口 127.0.0.1:${this.desiredAntigravityPort} 未能成功启动监听`;
       }
 
       return {
-        ok: listening,
-        listening,
-        error: listening ? undefined : `专属代理端口 127.0.0.1:${port} 未能成功启动监听`,
+        claudeListening,
+        antigravityListening,
+        claudeError,
+        antigravityError,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       return {
-        ok: false,
-        listening: false,
-        error: `绑定 Clash 专属节点失败: ${msg}`,
+        claudeListening: false,
+        antigravityListening: false,
+        generalError: `绑定 Clash 专属节点失败: ${msg}`,
       };
     }
   }
 
-  private async removeDedicatedListenerIfBound(): Promise<void> {
-    const operation = this.listenerApplyQueue.then(async () => {
-      if (!this.currentEndpoint || !this.boundNodeName) return;
-      try {
-        const yamlPath = this.findActiveClashYamlFile();
-        if (!yamlPath) return;
-
-        const proxiesRes = await this.requestJson<{ proxies?: Record<string, ClashProxyItem> }>(
-          this.currentEndpoint,
-          '/proxies'
-        );
-        const savedSelections = extractSelectorSelections(proxiesRes?.proxies || {});
-        const doc = this.loadAndPrepareCoreYaml(
-          yamlPath,
-          this.boundPort ?? this.desiredDedicatedPort
-        );
-        if (!doc) return;
-
-        await this.reloadClashDocAndRestoreSelections(doc, savedSelections);
-      } catch {
-        // ignore cleanup errors
-      }
-    });
-    this.listenerApplyQueue = operation.then(
-      () => undefined,
-      () => undefined
-    );
-    return operation;
-  }
-
   private loadAndPrepareCoreYaml(
     yamlPath: string,
-    portToStrip: number
+    portsToStrip: number[]
   ): Record<string, unknown> | null {
     if (!fs.existsSync(yamlPath) || isVergeUiSettingsYaml(yamlPath)) {
       return null;
@@ -531,9 +698,14 @@ export class ClashMonitor extends EventEmitter {
       doc['secret'] = this.currentEndpoint.secret;
     }
 
+    const stripPortSet = new Set(portsToStrip);
     if (Array.isArray(doc['listeners'])) {
       doc['listeners'] = (doc['listeners'] as Array<Record<string, unknown>>).filter(
-        (l) => l && l['name'] !== DEDICATED_LISTENER_NAME && Number(l['port']) !== portToStrip
+        (l) =>
+          l &&
+          l['name'] !== CLAUDE_LISTENER_NAME &&
+          l['name'] !== ANTIGRAVITY_LISTENER_NAME &&
+          !stripPortSet.has(Number(l['port']))
       );
     }
 
@@ -541,7 +713,7 @@ export class ClashMonitor extends EventEmitter {
       doc['rules'] = (doc['rules'] as unknown[]).filter((r) => {
         if (typeof r !== 'string') return false;
         const lower = r.toLowerCase();
-        return !CLAUDE_PROCESS_RULE_PREFIXES.some((prefix) => lower.startsWith(prefix));
+        return !MANAGED_PROCESS_RULE_PREFIXES.some((prefix) => lower.startsWith(prefix));
       });
     }
 
@@ -610,6 +782,8 @@ export class ClashMonitor extends EventEmitter {
     this.lastGroupsSignature = '';
     this.boundNodeName = null;
     this.boundPort = null;
+    this.boundAntigravityNode = null;
+    this.boundAntigravityPort = null;
     this.info = {
       connected: false,
       source: '未连接',
@@ -621,6 +795,11 @@ export class ClashMonitor extends EventEmitter {
       boundNode: this.desiredNodeName,
       dedicatedPort: this.desiredNodeName ? this.desiredDedicatedPort : null,
       dedicatedPortListening: false,
+      antigravityBoundNode: this.desiredAntigravityNode,
+      antigravityDedicatedPort: this.desiredAntigravityNode
+        ? this.desiredAntigravityPort
+        : null,
+      antigravityPortListening: false,
     };
   }
 
