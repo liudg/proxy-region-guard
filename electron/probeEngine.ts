@@ -4,6 +4,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import {
   AlertPayload,
   AppStateSnapshot,
+  ClashRuntimeInfo,
   ClaudeLaunchResult,
   ClaudeRuntimeState,
   GuardEventLog,
@@ -31,6 +32,7 @@ import {
 } from './systemProxy';
 import { ProcessKillReport, terminateProtectedProcesses } from './processGuard';
 import {
+  areAnyPidsAlive,
   CLAUDE_DESKTOP_PROCESS_PATTERNS,
   countRunningClaudeProcesses,
   detectClaudeInstallation,
@@ -100,6 +102,8 @@ export class ProbeEngine extends EventEmitter {
   private claudeInstallType: ClaudeRuntimeState['installType'] = 'not-found';
   private claudeRunning = false;
   private claudeProcessCount = 0;
+  private claudeRunningPids: number[] = [];
+  private claudeFastCheckTicks = 0;
   private claudeAuthorizedSession = false;
   private claudeSeenRunningSinceAuth = false;
   private claudeLaunchGraceUntil = 0;
@@ -165,6 +169,7 @@ export class ProbeEngine extends EventEmitter {
     this.claudeInstallType = claudeInstall.installType;
     this.claudeRunning = claudeProc.running;
     this.claudeProcessCount = claudeProc.count;
+    this.claudeRunningPids = claudeProc.pids;
 
     this.lastSysProxySnapshot = `${sys.enabled}|${sys.proxyUrl || ''}`;
     this.lastNetFingerprint = getNetworkInterfaceFingerprint();
@@ -201,11 +206,11 @@ export class ProbeEngine extends EventEmitter {
       this.heartbeatTimer = null;
     }
     if (this.localEnvTimer) {
-      clearInterval(this.localEnvTimer);
+      clearTimeout(this.localEnvTimer);
       this.localEnvTimer = null;
     }
     if (this.claudeWatchTimer) {
-      clearInterval(this.claudeWatchTimer);
+      clearTimeout(this.claudeWatchTimer);
       this.claudeWatchTimer = null;
     }
     if (this.clashDebounceTimer) {
@@ -391,6 +396,8 @@ export class ProbeEngine extends EventEmitter {
 
     this.claudeRunning = afterProc.running;
     this.claudeProcessCount = afterProc.count;
+    this.claudeRunningPids = afterProc.pids;
+    this.claudeFastCheckTicks = 0;
     if (afterProc.running) {
       this.claudeSeenRunningSinceAuth = true;
     }
@@ -431,11 +438,12 @@ export class ProbeEngine extends EventEmitter {
     this.claudeAuthorizedSession = false;
     this.claudeSeenRunningSinceAuth = false;
     this.claudeLaunchGraceUntil = 0;
+    this.claudeFastCheckTicks = 0;
   }
 
   private async getSystemProxyFresh(force = false): Promise<SystemProxyState> {
     const now = Date.now();
-    if (!force && this.cachedSysProxy && now - this.cachedSysProxy.readAt < 1500) {
+    if (!force && this.cachedSysProxy && now - this.cachedSysProxy.readAt < 2500) {
       return this.cachedSysProxy.state;
     }
     const state = await readWindowsSystemProxy();
@@ -444,109 +452,168 @@ export class ProbeEngine extends EventEmitter {
   }
 
   /**
-   * 1 秒高频巡检：
+   * 轻量非重叠巡检：
    * 1. 严防任何未通过本卫士【Claude 专栏】启动的外部 Claude 进程（唯一启动入口硬性保障）
    * 2. 当 Claude 退出后自动回收 `claudeAuthorizedSession`，确保下次仍须从专栏启动
    * 3. 当 Claude 运行期间出现「指定代理 vs 系统时区/区域」不一致或断连时，毫秒级强杀
    */
   private startClaudeExclusiveWatcher(): void {
-    this.claudeWatchTimer = setInterval(async () => {
-      if (this.activeKillCount > 0) return;
-      try {
-        const proc = await countRunningClaudeProcesses();
-        const prevRunning = this.claudeRunning;
-        const prevCount = this.claudeProcessCount;
-        this.claudeRunning = proc.running;
-        this.claudeProcessCount = proc.count;
+    const scheduleNext = (delayMs: number) => {
+      if (this.stopped) return;
+      if (this.claudeWatchTimer) {
+        clearTimeout(this.claudeWatchTimer);
+      }
+      this.claudeWatchTimer = setTimeout(() => {
+        this.claudeWatchTimer = null;
+        void runWatchTick();
+      }, delayMs);
+    };
 
-        if (proc.running) {
-          if (this.claudeAuthorizedSession) {
-            this.claudeSeenRunningSinceAuth = true;
+    const runWatchTick = async () => {
+      if (this.stopped) return;
+      let nextDelay = 2000;
+
+      if (this.activeKillCount === 0) {
+        try {
+          let proc: { running: boolean; count: number; pids: number[] };
+
+          if (
+            this.claudeAuthorizedSession &&
+            this.claudeSeenRunningSinceAuth &&
+            this.claudeRunningPids.length > 0 &&
+            this.claudeFastCheckTicks < 4
+          ) {
+            this.claudeFastCheckTicks++;
+            const fast = areAnyPidsAlive(this.claudeRunningPids);
+            if (fast.aliveCount > 0) {
+              proc = {
+                running: true,
+                count: this.claudeProcessCount,
+                pids: fast.alivePids,
+              };
+            } else {
+              this.claudeFastCheckTicks = 0;
+              proc = await countRunningClaudeProcesses();
+            }
+          } else {
+            this.claudeFastCheckTicks = 0;
+            proc = await countRunningClaudeProcesses();
           }
-        } else if (
-          this.claudeAuthorizedSession &&
-          (this.claudeSeenRunningSinceAuth || Date.now() > this.claudeLaunchGraceUntil)
-        ) {
-          // 用户已关闭 Claude，立即回收唯一入口会话授权锁，并连带清理残留的 cowork-svc.exe 等后台进程
-          this.unsetClaudeAuthLock();
-          await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
-          this.addLog('info', '检测到 Claude 已退出，已自动清理关联后台进程并回收启动授权锁（下次需从专栏启动）');
-          this.emitState();
-          return;
-        }
 
-        const cfg = this.configStore.get();
+          const prevRunning = this.claudeRunning;
+          const prevCount = this.claudeProcessCount;
+          this.claudeRunning = proc.running;
+          this.claudeProcessCount = proc.count;
+          this.claudeRunningPids = proc.pids;
 
-        // 拦截 1：开启唯一启动入口拦截时，未通过卫士专栏授权启动的外部 Claude -> 立即无条件强杀！
-        if (proc.running && !this.claudeAuthorizedSession && cfg.claudeExclusiveGuard) {
-          const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
-          const reason = '拦截到从外部直接启动 Claude！本卫士【Claude 专栏】是唯一允许的启动入口';
-          if (report.killedCount > 0) {
-            this.addLog(
-              'danger',
-              `${reason}，已立即强杀：${report.killedSummary.join(', ')}`
-            );
-          } else if (report.errorDetail) {
-            this.addLog('warn', `${reason}，但终止受阻：${report.errorDetail}`);
-          }
-          this.emitState();
-
-          if (cfg.alertPopupEnabled && (report.killedCount > 0 || report.errorDetail)) {
-            this.emitAlert({
-              alertType: 'unauthorized-launch',
-              expectedCode: this.lastProbe?.countryCode || cfg.defaultCountryCode,
-              expectedName: this.lastProbe?.countryName || cfg.defaultCountryName,
-              triggerReason: reason,
-              killedProcesses: report.killedCount > 0 ? report.killedSummary : undefined,
-              killError: report.errorDetail,
-            });
-          }
-          return;
-        }
-
-        // 拦截 2：无论是否开启唯一启动入口，只要 Claude 在运行，一旦出现「代理地区 ↔ 系统时区/区域」不一致或断连，立即剥夺授权并强杀！
-        if (proc.running && this.status !== 'checking') {
-          const check = this.evaluateClaudeSafety(
-            this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
-          );
-          if (!check.safe) {
+          if (proc.running) {
+            if (this.claudeAuthorizedSession) {
+              this.claudeSeenRunningSinceAuth = true;
+            }
+          } else if (
+            this.claudeAuthorizedSession &&
+            (this.claudeSeenRunningSinceAuth || Date.now() > this.claudeLaunchGraceUntil)
+          ) {
+            // 用户已关闭 Claude，立即回收唯一入口会话授权锁，并连带清理残留的 cowork-svc.exe 等后台进程
             this.unsetClaudeAuthLock();
+            await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
+            this.addLog(
+              'info',
+              '检测到 Claude 已退出，已自动清理关联后台进程并回收启动授权锁（下次需从专栏启动）'
+            );
+            this.emitState();
+            scheduleNext(2000);
+            return;
+          }
 
+          const cfg = this.configStore.get();
+
+          // 拦截 1：开启唯一启动入口拦截时，未通过卫士专栏授权启动的外部 Claude -> 立即无条件强杀！
+          if (proc.running && !this.claudeAuthorizedSession && cfg.claudeExclusiveGuard) {
             const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
+            const reason = '拦截到从外部直接启动 Claude！本卫士【Claude 专栏】是唯一允许的启动入口';
             if (report.killedCount > 0) {
               this.addLog(
                 'danger',
-                `Claude 安全校验失效 (${check.reason})，已立即强杀：${report.killedSummary.join(', ')}`
+                `${reason}，已立即强杀：${report.killedSummary.join(', ')}`
               );
             } else if (report.errorDetail) {
-              this.addLog('warn', report.errorDetail);
+              this.addLog('warn', `${reason}，但终止受阻：${report.errorDetail}`);
             }
             this.emitState();
 
             if (cfg.alertPopupEnabled && (report.killedCount > 0 || report.errorDetail)) {
-              const expectedCode = this.lastProbe?.countryCode || cfg.defaultCountryCode;
-              const expectedName = this.lastProbe?.countryName || cfg.defaultCountryName;
               this.emitAlert({
-                alertType: check.alertType,
-                expectedCode,
-                expectedName,
-                triggerReason: check.reason,
-                errorDetail: check.alertType === 'disconnect' ? this.lastError || undefined : undefined,
+                alertType: 'unauthorized-launch',
+                expectedCode: this.lastProbe?.countryCode || cfg.defaultCountryCode,
+                expectedName: this.lastProbe?.countryName || cfg.defaultCountryName,
+                triggerReason: reason,
                 killedProcesses: report.killedCount > 0 ? report.killedSummary : undefined,
                 killError: report.errorDetail,
               });
             }
+            scheduleNext(1500);
             return;
           }
-        }
 
-        if (prevRunning !== this.claudeRunning || prevCount !== this.claudeProcessCount) {
-          this.emitState();
+          // 拦截 2：无论是否开启唯一启动入口，只要 Claude 在运行，一旦出现「代理地区 ↔ 系统时区/区域」不一致或断连，立即剥夺授权并强杀！
+          if (proc.running && this.status !== 'checking') {
+            const check = this.evaluateClaudeSafety(
+              this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
+            );
+            if (!check.safe) {
+              this.unsetClaudeAuthLock();
+
+              const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
+              if (report.killedCount > 0) {
+                this.addLog(
+                  'danger',
+                  `Claude 安全校验失效 (${check.reason})，已立即强杀：${report.killedSummary.join(', ')}`
+                );
+              } else if (report.errorDetail) {
+                this.addLog('warn', report.errorDetail);
+              }
+              this.emitState();
+
+              if (cfg.alertPopupEnabled && (report.killedCount > 0 || report.errorDetail)) {
+                const expectedCode = this.lastProbe?.countryCode || cfg.defaultCountryCode;
+                const expectedName = this.lastProbe?.countryName || cfg.defaultCountryName;
+                this.emitAlert({
+                  alertType: check.alertType,
+                  expectedCode,
+                  expectedName,
+                  triggerReason: check.reason,
+                  errorDetail:
+                    check.alertType === 'disconnect' ? this.lastError || undefined : undefined,
+                  killedProcesses: report.killedCount > 0 ? report.killedSummary : undefined,
+                  killError: report.errorDetail,
+                });
+              }
+              scheduleNext(1500);
+              return;
+            }
+          }
+
+          if (prevRunning !== this.claudeRunning || prevCount !== this.claudeProcessCount) {
+            this.emitState();
+          }
+
+          if (this.claudeRunning || Date.now() < this.claudeLaunchGraceUntil) {
+            nextDelay = 1200;
+          } else if (cfg.claudeExclusiveGuard && this.claudeInstallType !== 'not-found') {
+            nextDelay = 2000;
+          } else {
+            nextDelay = 5000;
+          }
+        } catch {
+          // ignore transient watcher error
         }
-      } catch {
-        // ignore transient watcher error
       }
-    }, 1000);
+
+      scheduleNext(nextDelay);
+    };
+
+    scheduleNext(1200);
   }
 
   private evaluateClaudeSafety(requireDedicatedNode = true): {
@@ -620,9 +687,9 @@ export class ProbeEngine extends EventEmitter {
     };
   }
 
-  private buildClaudeRuntimeState(): ClaudeRuntimeState {
+  private buildClaudeRuntimeState(clashInfo?: ClashRuntimeInfo): ClaudeRuntimeState {
     const cfg = this.configStore.get();
-    const clash = this.clashMonitor.getRuntimeInfo();
+    const clash = clashInfo || this.clashMonitor.getRuntimeInfo();
     const proxyCountryCode =
       this.lastProbe && isValidIsoCountryCode(this.lastProbe.countryCode)
         ? this.lastProbe.countryCode.toUpperCase()
@@ -686,12 +753,24 @@ export class ProbeEngine extends EventEmitter {
   }
 
   private startLocalEnvironmentWatcher(): void {
-    this.localEnvTimer = setInterval(async () => {
+    const scheduleNext = (delayMs: number) => {
+      if (this.stopped) return;
+      if (this.localEnvTimer) {
+        clearTimeout(this.localEnvTimer);
+      }
+      this.localEnvTimer = setTimeout(() => {
+        this.localEnvTimer = null;
+        void runEnvTick();
+      }, delayMs);
+    };
+
+    const runEnvTick = async () => {
+      if (this.stopped) return;
       this.envTickCounter = (this.envTickCounter + 1) % 2;
       const cfg = this.configStore.get();
 
       try {
-        // 1. 每 4 秒同步一次外部手动修改的 Windows 时区与区域
+        // 1. 每 ~7 秒同步一次外部手动修改的 Windows 时区与区域
         if (this.envTickCounter === 0 && !this.isSyncingLocale) {
           const latestLocale = await readWindowsLocaleState();
           const localeChanged =
@@ -728,6 +807,7 @@ export class ProbeEngine extends EventEmitter {
             const desc = sys.enabled ? `开启 (${sys.proxyUrl})` : '已关闭';
             this.addLog('info', `系统代理设置变更：${desc}`);
             void this.checkNow(`系统代理变更: ${desc}`);
+            scheduleNext(3500);
             return;
           }
           this.lastSysProxySnapshot = sysSnap;
@@ -748,7 +828,11 @@ export class ProbeEngine extends EventEmitter {
       } catch {
         // ignore transient polling errors
       }
-    }, 2000);
+
+      scheduleNext(3500);
+    };
+
+    scheduleNext(3500);
   }
 
   /**
@@ -771,16 +855,17 @@ export class ProbeEngine extends EventEmitter {
   }
 
   public getSnapshot(): AppStateSnapshot {
+    const clashInfo = this.clashMonitor.getRuntimeInfo();
     return {
       status: this.status,
       isChecking: this.isChecking,
       isSyncingLocale: this.isSyncingLocale,
       config: this.configStore.get(),
-      winLocale: structuredClone(this.winLocale),
-      lastProbe: this.lastProbe ? structuredClone(this.lastProbe) : null,
+      winLocale: { ...this.winLocale },
+      lastProbe: this.lastProbe ? { ...this.lastProbe } : null,
       lastError: this.lastError,
-      clashInfo: this.clashMonitor.getRuntimeInfo(),
-      claudeState: this.buildClaudeRuntimeState(),
+      clashInfo,
+      claudeState: this.buildClaudeRuntimeState(clashInfo),
       geoDbSource: this.geoIp.getSourceDescription(),
       logs: [...this.logs],
     };
@@ -1211,6 +1296,8 @@ export class ProbeEngine extends EventEmitter {
         const claudeNow = await countRunningClaudeProcesses();
         this.claudeRunning = claudeNow.running;
         this.claudeProcessCount = claudeNow.count;
+        this.claudeRunningPids = claudeNow.pids;
+        this.claudeFastCheckTicks = 0;
         return report;
       } finally {
         this.activeKillCount--;

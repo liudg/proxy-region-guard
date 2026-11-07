@@ -1,8 +1,13 @@
-import React from 'react';
+import React, { Suspense } from 'react';
 import ReactDOM from 'react-dom/client';
-import { MainDashboard } from './components/MainDashboard';
-import { AlertPopup } from './components/AlertPopup';
 import './styles.css';
+
+const MainDashboard = React.lazy(() =>
+  import('./components/MainDashboard').then((m) => ({ default: m.MainDashboard }))
+);
+const AlertPopup = React.lazy(() =>
+  import('./components/AlertPopup').then((m) => ({ default: m.AlertPopup }))
+);
 
 const isAlertRoute = window.location.hash.includes('alert');
 if (isAlertRoute) {
@@ -11,5 +16,7 @@ if (isAlertRoute) {
 }
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
-  <React.StrictMode>{isAlertRoute ? <AlertPopup /> : <MainDashboard />}</React.StrictMode>
+  <React.StrictMode>
+    <Suspense fallback={null}>{isAlertRoute ? <AlertPopup /> : <MainDashboard />}</Suspense>
+  </React.StrictMode>
 );

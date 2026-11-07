@@ -39,10 +39,10 @@ interface CachedYamlMeta {
   secret?: string;
 }
 
-const CONNECTED_POLL_MS = 1500;
-const DISCONNECTED_POLL_MS = 4500;
+const CONNECTED_POLL_MS = 3000;
+const DISCONNECTED_POLL_MS = 6000;
 const YAML_HEADER_READ_BYTES = 16 * 1024;
-const MAX_CONTROLLER_RESPONSE_BYTES = 16 * 1024 * 1024;
+const MAX_CONTROLLER_RESPONSE_BYTES = 4 * 1024 * 1024;
 const DEDICATED_LISTENER_NAME = 'proxy-region-guard-claude-in';
 const AUTO_REBIND_RETRY_COOLDOWN_MS = 8000;
 const CLAUDE_PROCESS_RULE_PREFIXES = CLAUDE_TUN_PROCESS_NAMES.map((p) =>
@@ -101,7 +101,11 @@ export class ClashMonitor extends EventEmitter {
   };
 
   public getRuntimeInfo(): ClashRuntimeInfo {
-    return structuredClone(this.info);
+    return {
+      ...this.info,
+      nodeChain: [...this.info.nodeChain],
+      availableNodes: this.info.availableNodes,
+    };
   }
 
   public start(initialNode: string | null = null, dedicatedPort = 27897): void {

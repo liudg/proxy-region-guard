@@ -9,6 +9,12 @@ const rootDir = path.resolve(__dirname, '..');
 export function getElectronEsbuildOptions() {
   const outDir = path.join(rootDir, 'dist-electron');
   fs.mkdirSync(outDir, { recursive: true });
+  for (const mapFile of ['main.js.map', 'preload.js.map']) {
+    const mapPath = path.join(outDir, mapFile);
+    if (fs.existsSync(mapPath)) {
+      fs.rmSync(mapPath, { force: true });
+    }
+  }
 
   return {
     entryPoints: [
@@ -21,7 +27,8 @@ export function getElectronEsbuildOptions() {
     format: 'cjs',
     outdir: outDir,
     external: ['electron'],
-    sourcemap: true,
+    minify: true,
+    sourcemap: false,
     logLevel: 'info',
   };
 }

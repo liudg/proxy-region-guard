@@ -56,43 +56,72 @@ export function decodeWinConsoleBuffer(buf: Buffer | string | null | undefined):
   }
 }
 
-export function listRunningProcesses(): Promise<RunningProcEntry[]> {
-  return new Promise((resolve) => {
-    if (process.platform !== 'win32') {
-      resolve([]);
-      return;
-    }
+const PROCESS_LIST_CACHE_TTL_MS = 800;
+let cachedProcList: { entries: RunningProcEntry[]; readAt: number } | null = null;
+let inflightProcListPromise: Promise<RunningProcEntry[]> | null = null;
 
+export function parseTasklistCsvOutput(
+  stdout: Buffer | string | null | undefined
+): RunningProcEntry[] {
+  if (!stdout || (Buffer.isBuffer(stdout) && stdout.length === 0)) {
+    return [];
+  }
+  const text = decodeWinConsoleBuffer(stdout);
+  const list: RunningProcEntry[] = [];
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line.startsWith('"')) continue;
+    // 格式: "Image Name","PID","Session Name","Session#","Mem Usage"
+    const match = line.match(/^"([^"]+)","(\d+)"/);
+    if (!match) continue;
+    const imageName = match[1].trim();
+    const pid = Number(match[2]);
+    if (imageName && Number.isInteger(pid) && pid > 4) {
+      list.push({ imageName, pid });
+    }
+  }
+
+  return list;
+}
+
+export function listRunningProcesses(forceFresh = false): Promise<RunningProcEntry[]> {
+  if (process.platform !== 'win32') {
+    return Promise.resolve([]);
+  }
+
+  const now = Date.now();
+  if (!forceFresh && cachedProcList && now - cachedProcList.readAt < PROCESS_LIST_CACHE_TTL_MS) {
+    return Promise.resolve(cachedProcList.entries);
+  }
+
+  if (!forceFresh && inflightProcListPromise) {
+    return inflightProcListPromise;
+  }
+
+  const promise = new Promise<RunningProcEntry[]>((resolve) => {
     execFile(
       'tasklist.exe',
       ['/FO', 'CSV', '/NH'],
-      { encoding: 'buffer', windowsHide: true, timeout: 3500, maxBuffer: 4 * 1024 * 1024 },
+      { encoding: 'buffer', windowsHide: true, timeout: 3500, maxBuffer: 512 * 1024 },
       (err, stdout) => {
         if (err && (!stdout || stdout.length === 0)) {
           resolve([]);
           return;
         }
-
-        const text = decodeWinConsoleBuffer(stdout);
-        const list: RunningProcEntry[] = [];
-
-        for (const rawLine of text.split(/\r?\n/)) {
-          const line = rawLine.trim();
-          if (!line.startsWith('"')) continue;
-          // 格式: "Image Name","PID","Session Name","Session#","Mem Usage"
-          const match = line.match(/^"([^"]+)","(\d+)"/);
-          if (!match) continue;
-          const imageName = match[1].trim();
-          const pid = Number(match[2]);
-          if (imageName && Number.isInteger(pid) && pid > 4) {
-            list.push({ imageName, pid });
-          }
-        }
-
+        const list = parseTasklistCsvOutput(stdout);
+        cachedProcList = { entries: list, readAt: Date.now() };
         resolve(list);
       }
     );
+  }).finally(() => {
+    if (inflightProcListPromise === promise) {
+      inflightProcListPromise = null;
+    }
   });
+
+  inflightProcListPromise = promise;
+  return promise;
 }
 
 function runTaskkillTreeBatch(
@@ -208,7 +237,7 @@ export async function terminateProtectedProcesses(patterns: string[]): Promise<P
   let survivingPidSet = new Set<number>();
   if (anyError) {
     await sleep(60);
-    const afterRunning = await listRunningProcesses();
+    const afterRunning = await listRunningProcesses(true);
     survivingPidSet = new Set(afterRunning.map((p) => p.pid));
   }
 

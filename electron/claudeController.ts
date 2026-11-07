@@ -5,7 +5,7 @@ import * as path from 'node:path';
 import { ClaudeRuntimeState } from '../src/shared/types';
 import {
   decodeWinConsoleBuffer,
-  listRunningProcesses,
+  parseTasklistCsvOutput,
 } from './processGuard';
 
 export const CLAUDE_DESKTOP_PROCESS_PATTERNS = [
@@ -165,23 +165,82 @@ export async function detectClaudeInstallation(
   };
 }
 
-export async function countRunningClaudeProcesses(): Promise<{
+export function isPidAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 4) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException)?.code;
+    return code === 'EPERM';
+  }
+}
+
+export function areAnyPidsAlive(pids: number[]): { aliveCount: number; alivePids: number[] } {
+  const alivePids: number[] = [];
+  for (const pid of pids) {
+    if (isPidAlive(pid)) {
+      alivePids.push(pid);
+    }
+  }
+  return { aliveCount: alivePids.length, alivePids };
+}
+
+let inflightClaudeCountPromise: Promise<{
+  running: boolean;
+  count: number;
+  pids: number[];
+}> | null = null;
+
+export function countRunningClaudeProcesses(): Promise<{
   running: boolean;
   count: number;
   pids: number[];
 }> {
-  const procs = await listRunningProcesses();
-  const matchedPids: number[] = [];
-  for (const p of procs) {
-    if (CLAUDE_UI_PROCESS_NAMES.has(p.imageName.toLowerCase())) {
-      matchedPids.push(p.pid);
-    }
+  if (process.platform !== 'win32') {
+    return Promise.resolve({ running: false, count: 0, pids: [] });
   }
-  return {
-    running: matchedPids.length > 0,
-    count: matchedPids.length,
-    pids: matchedPids,
-  };
+
+  if (inflightClaudeCountPromise) {
+    return inflightClaudeCountPromise;
+  }
+
+  const promise = new Promise<{
+    running: boolean;
+    count: number;
+    pids: number[];
+  }>((resolve) => {
+    execFile(
+      'tasklist.exe',
+      ['/FO', 'CSV', '/NH', '/FI', 'IMAGENAME eq claude*'],
+      { encoding: 'buffer', windowsHide: true, timeout: 3000, maxBuffer: 64 * 1024 },
+      (err, stdout) => {
+        if (err && (!stdout || stdout.length === 0)) {
+          resolve({ running: false, count: 0, pids: [] });
+          return;
+        }
+        const procs = parseTasklistCsvOutput(stdout);
+        const matchedPids: number[] = [];
+        for (const p of procs) {
+          if (CLAUDE_UI_PROCESS_NAMES.has(p.imageName.toLowerCase())) {
+            matchedPids.push(p.pid);
+          }
+        }
+        resolve({
+          running: matchedPids.length > 0,
+          count: matchedPids.length,
+          pids: matchedPids,
+        });
+      }
+    );
+  }).finally(() => {
+    if (inflightClaudeCountPromise === promise) {
+      inflightClaudeCountPromise = null;
+    }
+  });
+
+  inflightClaudeCountPromise = promise;
+  return promise;
 }
 
 /**

@@ -74,8 +74,20 @@ async function main() {
     // 忽略未运行时的返回码
   }
 
+  const srcExe = path.join(appOutDir, 'electron.exe');
+  const destExe = path.join(appOutDir, '代理地区卫士.exe');
+
   let inPlaceUpdate = false;
-  if (fs.existsSync(appOutDir)) {
+  if (fs.existsSync(destExe)) {
+    try {
+      const fd = fs.openSync(destExe, 'r+');
+      fs.closeSync(fd);
+    } catch {
+      inPlaceUpdate = true;
+    }
+  }
+
+  if (!inPlaceUpdate && fs.existsSync(appOutDir)) {
     try {
       fs.rmSync(appOutDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 150 });
     } catch {
@@ -151,8 +163,6 @@ async function main() {
     // 若正在运行且 mmdb 已被映射锁定，保留既有相同文件
   }
 
-  const srcExe = path.join(appOutDir, 'electron.exe');
-  const destExe = path.join(appOutDir, '代理地区卫士.exe');
   if (!inPlaceUpdate) {
     console.log('4/4 正在写入可执行文件名称与图标元数据...');
     fs.renameSync(srcExe, destExe);

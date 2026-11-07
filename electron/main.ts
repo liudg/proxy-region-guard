@@ -88,6 +88,18 @@ if (process.platform === 'win32') {
   app.setAppUserModelId('com.antigravity.proxy-region-guard');
 }
 
+// 限制 V8 老生代堆上限并禁用无需使用的 Chromium 后台特性，显著降低主进程与渲染进程内存占用
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=96');
+app.commandLine.appendSwitch(
+  'disable-features',
+  'SpareRendererForSitePerProcess,WinDelaySpellcheckServiceInit,WinRetrieveSuggestionsOnlyOnDemand,CalculateNativeWinOcclusion,HardwareMediaKeyHandling,MediaSessionService'
+);
+app.commandLine.appendSwitch('disable-spell-checking');
+app.commandLine.appendSwitch('renderer-process-limit', '2');
+
+const MAIN_HIDDEN_DESTROY_DELAY_MS = 4000;
+const ALERT_HIDDEN_DESTROY_DELAY_MS = 8000;
+
 let mainWindow: BrowserWindow | null = null;
 let alertWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -100,11 +112,41 @@ let clashMonitor!: ClashMonitor;
 let probeEngine!: ProbeEngine;
 
 let latestAlertPayload: AlertPayload | null = null;
+let mainDestroyTimer: NodeJS.Timeout | null = null;
 let alertAutoCloseTimer: NodeJS.Timeout | null = null;
+let alertDestroyTimer: NodeJS.Timeout | null = null;
 let alertLoadHooked = false;
 let alertUserDragged = false;
 let suppressAlertMoveTrack = false;
 let lastTrayMenuSignature = '';
+
+function clearMainDestroyTimer(): void {
+  if (mainDestroyTimer) {
+    clearTimeout(mainDestroyTimer);
+    mainDestroyTimer = null;
+  }
+}
+
+function clearAlertDestroyTimer(): void {
+  if (alertDestroyTimer) {
+    clearTimeout(alertDestroyTimer);
+    alertDestroyTimer = null;
+  }
+}
+
+function hideMainWindowToTray(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.hide();
+  clearMainDestroyTimer();
+  mainDestroyTimer = setTimeout(() => {
+    mainDestroyTimer = null;
+    if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
+      mainWindow.destroy();
+      mainWindow = null;
+    }
+  }, MAIN_HIDDEN_DESTROY_DELAY_MS);
+  mainDestroyTimer.unref?.();
+}
 
 function getPreloadPath(): string {
   return path.join(__dirname, 'preload.js');
@@ -122,7 +164,9 @@ function loadRendererRoute(win: BrowserWindow, hash?: string): void {
 }
 
 function createMainWindow(revealOnReady = true): void {
-  const icon = createWindowAppIcon('unset');
+  clearMainDestroyTimer();
+  const curStatus = probeEngine ? probeEngine.getSnapshot().status : 'unset';
+  const icon = createWindowAppIcon(curStatus);
 
   mainWindow = new BrowserWindow({
     width: 530,
@@ -141,6 +185,7 @@ function createMainWindow(revealOnReady = true): void {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      spellcheck: false,
     },
   });
 
@@ -167,22 +212,31 @@ function createMainWindow(revealOnReady = true): void {
     fallbackTimer = setTimeout(reveal, 600);
   }
 
+  mainWindow.on('show', () => {
+    clearMainDestroyTimer();
+    if (probeEngine && mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('guard:state-changed', probeEngine.getSnapshot());
+    }
+  });
+
   mainWindow.on('close', (e) => {
     if (!isQuitting && configStore?.get().closeToTray) {
       e.preventDefault();
-      mainWindow?.hide();
+      hideMainWindowToTray();
     }
   });
 
   mainWindow.on('closed', () => {
+    clearMainDestroyTimer();
     mainWindow = null;
   });
 }
 
 function showMainWindow(): void {
   if (!isBootstrapped) return;
+  clearMainDestroyTimer();
   if (!mainWindow || mainWindow.isDestroyed()) {
-    createMainWindow();
+    createMainWindow(true);
     return;
   }
   if (mainWindow.isMinimized()) {
@@ -196,6 +250,15 @@ function hideAlertWindow(): void {
   alertUserDragged = false;
   if (alertWindow && !alertWindow.isDestroyed()) {
     alertWindow.hide();
+    clearAlertDestroyTimer();
+    alertDestroyTimer = setTimeout(() => {
+      alertDestroyTimer = null;
+      if (alertWindow && !alertWindow.isDestroyed() && !alertWindow.isVisible()) {
+        alertWindow.destroy();
+        alertWindow = null;
+      }
+    }, ALERT_HIDDEN_DESTROY_DELAY_MS);
+    alertDestroyTimer.unref?.();
   }
 }
 
@@ -218,6 +281,7 @@ function computeAlertWindowHeight(payload: AlertPayload): number {
 }
 
 function ensureAlertWindow(): BrowserWindow {
+  clearAlertDestroyTimer();
   if (alertWindow && !alertWindow.isDestroyed()) {
     return alertWindow;
   }
@@ -244,6 +308,7 @@ function ensureAlertWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      spellcheck: false,
     },
   });
 
@@ -258,6 +323,7 @@ function ensureAlertWindow(): BrowserWindow {
   });
 
   alertWindow.on('closed', () => {
+    clearAlertDestroyTimer();
     alertWindow = null;
     alertLoadHooked = false;
     alertUserDragged = false;
@@ -279,6 +345,7 @@ function positionAlertWindow(win: BrowserWindow): void {
 }
 
 function showCustomAlertPopup(payload: AlertPayload): void {
+  clearAlertDestroyTimer();
   if (alertAutoCloseTimer) {
     clearTimeout(alertAutoCloseTimer);
     alertAutoCloseTimer = null;
@@ -339,8 +406,8 @@ function setupTray(): void {
   tray.setToolTip('代理地区卫士 · 正在初始化...');
 
   tray.on('click', () => {
-    if (mainWindow && mainWindow.isVisible() && mainWindow.isFocused()) {
-      mainWindow.hide();
+    if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && mainWindow.isFocused()) {
+      hideMainWindowToTray();
     } else {
       showMainWindow();
     }
@@ -517,7 +584,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
 
 function broadcastState(state: AppStateSnapshot): void {
   refreshTrayFromState(state);
-  if (mainWindow && !mainWindow.isDestroyed()) {
+  if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
     mainWindow.webContents.send('guard:state-changed', state);
   }
 }
@@ -640,7 +707,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.on('window:close-main', () => {
     if (configStore.get().closeToTray) {
-      mainWindow?.hide();
+      hideMainWindowToTray();
     } else {
       isQuitting = true;
       probeEngine?.stop();
@@ -701,10 +768,10 @@ if (tryRelaunchAsWindowsAdmin()) {
       isBootstrapped = true;
 
       const startHiddenInTray = isLaunchedFromAutoStart() && configStore.get().closeToTray;
-      createMainWindow(!startHiddenInTray);
+      if (!startHiddenInTray) {
+        createMainWindow(true);
+      }
       setupTray();
-
-      ensureAlertWindow();
 
       await probeEngine.start();
     });
