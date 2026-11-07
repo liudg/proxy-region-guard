@@ -42,9 +42,13 @@ export interface AppConfig {
   claudeExclusiveGuard: boolean;           // 唯一入口守护：禁止任何外部途径启动 Claude，不一致立杀
 
   // Antigravity 启动器专栏配置（纯代理绑定，无监控/预警/强杀）
-  antigravityClashNode: string | null;     // Antigravity 独立指定的 Clash 节点名称
-  antigravityDedicatedPort: number;        // Antigravity 独立专属本地代理端口（默认 27898）
-  antigravityExePath: string;              // 自定义 Antigravity.exe 启动路径（留空则自动探测）
+  antigravityClashNode: string | null;        // Antigravity 独立指定的 Clash 节点名称
+  antigravityClashProfileUid: string | null;  // Antigravity 选定节点所属的 Clash 订阅组 UID（支持跨订阅固定）
+  antigravityClashProfileName: string | null; // Antigravity 选定节点所属的 Clash 订阅组名称
+  antigravityClashNodeRaw?: Record<string, unknown> | null;          // 缓存的 Antigravity 节点底层完整配置
+  antigravityClashNodeDialerRaw?: Array<Record<string, unknown>> | null; // 缓存的 Antigravity 链式前置节点定义
+  antigravityDedicatedPort: number;           // Antigravity 独立专属本地代理端口（默认 27898）
+  antigravityExePath: string;                 // 自定义 Antigravity.exe 启动路径（留空则自动探测）
 }
 
 export interface WindowsLocaleState {
@@ -94,6 +98,8 @@ export interface ClashRuntimeInfo {
   dedicatedPort: number | null;             // 当前 Claude 独立专属端口（如 27897）
   dedicatedPortListening: boolean;          // Claude 独立专属端口是否已就绪监听
   antigravityBoundNode: string | null;      // 当前 Antigravity 独立专属端口实际绑定的节点名
+  antigravityBoundProfileUid: string | null;  // 当前 Antigravity 绑定节点所属的订阅组 UID
+  antigravityBoundProfileName: string | null; // 当前 Antigravity 绑定节点所属的订阅组名称
   antigravityDedicatedPort: number | null;  // 当前 Antigravity 独立专属端口（如 27898）
   antigravityPortListening: boolean;        // Antigravity 独立专属端口是否已就绪监听
 }
@@ -218,7 +224,10 @@ export interface GuardBridgeAPI {
   terminateClaudeNow: () => Promise<ClaudeLaunchResult>;
   browseClaudeExe: () => Promise<AppStateSnapshot>;
   // Antigravity 启动器专栏控制
-  selectAntigravityClashNode: (nodeName: string | null) => Promise<AppStateSnapshot>;
+  selectAntigravityClashNode: (
+    nodeName: string | null,
+    profileUid?: string | null
+  ) => Promise<AppStateSnapshot>;
   probeAntigravityNode: () => Promise<AppStateSnapshot>;
   launchAntigravity: () => Promise<AntigravityLaunchResult>;
   terminateAntigravityNow: () => Promise<AntigravityLaunchResult>;

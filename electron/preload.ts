@@ -22,8 +22,8 @@ const api: GuardBridgeAPI = {
   terminateClaudeNow: () => ipcRenderer.invoke('guard:terminate-claude'),
   browseClaudeExe: () => ipcRenderer.invoke('guard:browse-claude-exe'),
 
-  selectAntigravityClashNode: (nodeName: string | null) =>
-    ipcRenderer.invoke('guard:select-antigravity-node', nodeName),
+  selectAntigravityClashNode: (nodeName: string | null, profileUid?: string | null) =>
+    ipcRenderer.invoke('guard:select-antigravity-node', nodeName, profileUid),
   probeAntigravityNode: () => ipcRenderer.invoke('guard:probe-antigravity-node'),
   launchAntigravity: () => ipcRenderer.invoke('guard:launch-antigravity'),
   terminateAntigravityNow: () => ipcRenderer.invoke('guard:terminate-antigravity'),

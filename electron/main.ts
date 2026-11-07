@@ -441,8 +441,10 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     ? `Clash全局: ${state.clashInfo.activeNode || state.clashInfo.mode}`
     : '未指定节点';
 
+  const agProfilePrefix =
+    state.config.antigravityClashProfileName || state.clashInfo.antigravityBoundProfileName;
   const agNodeText = state.config.antigravityClashNode
-    ? `Antigravity节点: ${state.config.antigravityClashNode}`
+    ? `Antigravity节点: ${agProfilePrefix ? `${agProfilePrefix} / ` : ''}${state.config.antigravityClashNode}`
     : '';
 
   const claudeText = state.claudeState.running
@@ -695,8 +697,10 @@ function registerIpcHandlers(): void {
   });
 
   // Antigravity 启动器专栏 IPC
-  ipcMain.handle('guard:select-antigravity-node', (_e, nodeName: string | null) =>
-    probeEngine.selectAntigravityClashNode(nodeName)
+  ipcMain.handle(
+    'guard:select-antigravity-node',
+    (_e, nodeName: string | null, profileUid?: string | null) =>
+      probeEngine.selectAntigravityClashNode(nodeName, profileUid)
   );
 
   ipcMain.handle('guard:probe-antigravity-node', () =>
@@ -750,9 +754,13 @@ function registerIpcHandlers(): void {
 
     if (
       prevCfg.antigravityClashNode !== nextCfg.antigravityClashNode ||
+      prevCfg.antigravityClashProfileUid !== nextCfg.antigravityClashProfileUid ||
       prevCfg.antigravityDedicatedPort !== nextCfg.antigravityDedicatedPort
     ) {
-      return probeEngine.selectAntigravityClashNode(nextCfg.antigravityClashNode);
+      return probeEngine.selectAntigravityClashNode(
+        nextCfg.antigravityClashNode,
+        nextCfg.antigravityClashProfileUid
+      );
     }
 
     if (

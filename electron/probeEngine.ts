@@ -229,7 +229,11 @@ export class ProbeEngine extends EventEmitter {
       cfg.selectedClashProfileUid,
       cfg.selectedClashProfileName,
       cfg.selectedClashNodeRaw || null,
-      cfg.selectedClashNodeDialerRaw || null
+      cfg.selectedClashNodeDialerRaw || null,
+      cfg.antigravityClashProfileUid,
+      cfg.antigravityClashProfileName,
+      cfg.antigravityClashNodeRaw || null,
+      cfg.antigravityClashNodeDialerRaw || null
     );
     this.startLocalEnvironmentWatcher();
     this.startClaudeExclusiveWatcher();
@@ -321,16 +325,27 @@ export class ProbeEngine extends EventEmitter {
   }
 
   /**
-   * 切换 Antigravity 专属 Clash 节点：
-   * 仅在 Mihomo 中绑定 Antigravity 专属本地端口及 PROCESS-NAME 规则，并轻量获取一次节点出口信息用于展示，
+   * 切换 Antigravity 专属 Clash 节点（支持跨订阅组选择任意具体节点）：
+   * 仅在 Mihomo 中动态注入该节点的完整配置、专属本地端口及 PROCESS-NAME 规则，并轻量获取一次节点出口信息用于展示，
    * 不触发任何时区校验、默认地区变更、弹窗预警或进程强杀。
    */
-  public async selectAntigravityClashNode(nodeName: string | null): Promise<AppStateSnapshot> {
+  public async selectAntigravityClashNode(
+    nodeName: string | null,
+    profileUid?: string | null
+  ): Promise<AppStateSnapshot> {
     const cleanNode = nodeName && nodeName.trim() ? nodeName.trim() : null;
-    const prevNode = this.configStore.get().antigravityClashNode;
-    const cfg = this.configStore.update({ antigravityClashNode: cleanNode });
+    const prevCfg = this.configStore.get();
+    const effectiveProfileUid =
+      profileUid !== undefined
+        ? profileUid && profileUid.trim()
+          ? profileUid.trim()
+          : null
+        : prevCfg.antigravityClashProfileUid;
 
-    if (prevNode !== cleanNode) {
+    if (
+      prevCfg.antigravityClashNode !== cleanNode ||
+      prevCfg.antigravityClashProfileUid !== effectiveProfileUid
+    ) {
       this.antigravityNodeProbe = null;
       this.antigravityNodeProbeError = null;
     }
@@ -338,14 +353,30 @@ export class ProbeEngine extends EventEmitter {
     if (cleanNode) {
       this.addLog(
         'info',
-        `正在将 Antigravity 专属代理通道切换至节点：[${cleanNode}] (127.0.0.1:${cfg.antigravityDedicatedPort})...`
+        `正在将 Antigravity 专属代理通道切换至节点：[${cleanNode}] (127.0.0.1:${prevCfg.antigravityDedicatedPort})...`
       );
       const bindRes = await this.clashMonitor.configureAntigravityNode(
         cleanNode,
-        cfg.antigravityDedicatedPort
+        prevCfg.antigravityDedicatedPort,
+        effectiveProfileUid,
+        true
       );
+
+      const cfg = this.configStore.update({
+        antigravityClashNode: cleanNode,
+        antigravityClashProfileUid: bindRes.profileUid ?? effectiveProfileUid,
+        antigravityClashProfileName: bindRes.profileName ?? prevCfg.antigravityClashProfileName,
+        antigravityClashNodeRaw: bindRes.nodeRaw ?? prevCfg.antigravityClashNodeRaw,
+        antigravityClashNodeDialerRaw:
+          bindRes.dialerRaw ?? prevCfg.antigravityClashNodeDialerRaw,
+      });
+
+      const fullLabel = cfg.antigravityClashProfileName
+        ? `${cfg.antigravityClashProfileName} / ${cleanNode}`
+        : cleanNode;
+
       if (!bindRes.ok) {
-        const errText = bindRes.error || `绑定 Antigravity 节点 [${cleanNode}] 失败`;
+        const errText = bindRes.error || `绑定 Antigravity 节点 [${fullLabel}] 失败`;
         this.antigravityNodeProbeError = errText;
         this.addLog('warn', errText);
         this.emitState();
@@ -354,11 +385,23 @@ export class ProbeEngine extends EventEmitter {
 
       this.addLog(
         'success',
-        `Antigravity 专属节点已锁定 [${cleanNode}] → 127.0.0.1:${cfg.antigravityDedicatedPort} (含 Antigravity.exe / language_server.exe 进程规则)`
+        `Antigravity 专属节点已锁定 [${fullLabel}] → 127.0.0.1:${cfg.antigravityDedicatedPort} (含 Antigravity.exe / language_server.exe 进程规则)`
       );
       return this.probeAntigravityNodeNow();
     } else {
-      await this.clashMonitor.configureAntigravityNode(null, cfg.antigravityDedicatedPort);
+      const cfg = this.configStore.update({
+        antigravityClashNode: null,
+        antigravityClashProfileUid: null,
+        antigravityClashProfileName: null,
+        antigravityClashNodeRaw: null,
+        antigravityClashNodeDialerRaw: null,
+      });
+      await this.clashMonitor.configureAntigravityNode(
+        null,
+        cfg.antigravityDedicatedPort,
+        null,
+        true
+      );
       this.antigravityNodeProbe = null;
       this.antigravityNodeProbeError = null;
       this.addLog('info', '已取消 Antigravity 专属 Clash 节点绑定');
@@ -391,7 +434,9 @@ export class ProbeEngine extends EventEmitter {
       if (!clash.connected || !clash.antigravityPortListening) {
         const bindRes = await this.clashMonitor.configureAntigravityNode(
           cfg.antigravityClashNode,
-          cfg.antigravityDedicatedPort
+          cfg.antigravityDedicatedPort,
+          cfg.antigravityClashProfileUid,
+          false
         );
         clash = this.clashMonitor.getRuntimeInfo();
         if (!bindRes.ok || !bindRes.listening) {
@@ -459,7 +504,7 @@ export class ProbeEngine extends EventEmitter {
    * 3. 注入 --proxy-server 与 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / GRPC_PROXY / NO_PROXY 拉起 Antigravity.exe
    */
   public async launchAntigravityFromGuard(): Promise<AntigravityLaunchResult> {
-    const cfg = this.configStore.get();
+    let cfg = this.configStore.get();
 
     const install = await detectAntigravityInstallation(cfg.antigravityExePath);
     this.antigravityDetectedExe = install.exePath;
@@ -481,8 +526,18 @@ export class ProbeEngine extends EventEmitter {
 
     const bindRes = await this.clashMonitor.configureAntigravityNode(
       cfg.antigravityClashNode,
-      cfg.antigravityDedicatedPort
+      cfg.antigravityDedicatedPort,
+      cfg.antigravityClashProfileUid,
+      false
     );
+    if (bindRes.nodeRaw && !cfg.antigravityClashNodeRaw) {
+      cfg = this.configStore.update({
+        antigravityClashProfileUid: bindRes.profileUid ?? cfg.antigravityClashProfileUid,
+        antigravityClashProfileName: bindRes.profileName ?? cfg.antigravityClashProfileName,
+        antigravityClashNodeRaw: bindRes.nodeRaw,
+        antigravityClashNodeDialerRaw: bindRes.dialerRaw ?? null,
+      });
+    }
     if (!bindRes.ok || !bindRes.listening) {
       const msg = `无法建立节点 [${cfg.antigravityClashNode}] 的专属代理端口 (127.0.0.1:${
         cfg.antigravityDedicatedPort

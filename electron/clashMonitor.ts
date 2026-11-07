@@ -126,6 +126,38 @@ const GROUP_TYPES_LOWER = new Set([
   'compatible',
 ]);
 
+export type DedicatedChannelId = 'claude' | 'antigravity';
+
+export interface DedicatedNodeBindResult {
+  ok: boolean;
+  listening: boolean;
+  profileUid?: string | null;
+  profileName?: string | null;
+  nodeRaw?: Record<string, unknown> | null;
+  dialerRaw?: Array<Record<string, unknown>> | null;
+  error?: string;
+}
+
+interface DedicatedChannelSlot {
+  id: DedicatedChannelId;
+  label: string;
+  listenerName: string;
+  internalProxyName: string;
+  dialerPrefix: string;
+  processNames: readonly string[];
+  desiredNodeName: string | null;
+  desiredProfileUid: string | null;
+  desiredProfileName: string | null;
+  desiredNodeRaw: Record<string, unknown> | null;
+  desiredDialerRaw: Array<Record<string, unknown>> | null;
+  desiredPort: number;
+  boundNodeName: string | null;
+  boundProfileUid: string | null;
+  boundProfileName: string | null;
+  boundInternalProxyName: string | null;
+  boundPort: number | null;
+}
+
 export class ClashMonitor extends EventEmitter {
   private currentEndpoint: ControllerEndpoint | null = null;
   private pollTimer: NodeJS.Timeout | null = null;
@@ -145,26 +177,47 @@ export class ClashMonitor extends EventEmitter {
   private profileRawLookup = new Map<string, ResolvedProfileData>();
   private activeProfileSavedSelections: Array<{ group: string; now: string }> = [];
 
-  // Claude 专属节点与端口状态
-  private desiredNodeName: string | null = null;
-  private desiredProfileUid: string | null = null;
-  private desiredProfileName: string | null = null;
-  private desiredNodeRaw: Record<string, unknown> | null = null;
-  private desiredDialerRaw: Array<Record<string, unknown>> | null = null;
-  private desiredDedicatedPort = 27897;
-
-  private boundNodeName: string | null = null;
-  private boundProfileUid: string | null = null;
-  private boundProfileName: string | null = null;
-  private boundInternalProxyName: string | null = null;
-  private boundPort: number | null = null;
-
-  // Antigravity 专属节点与端口状态
-  private desiredAntigravityNode: string | null = null;
-  private desiredAntigravityPort = 27898;
-  private boundAntigravityNode: string | null = null;
-  private boundAntigravityInternalProxyName: string | null = null;
-  private boundAntigravityPort: number | null = null;
+  // 通用双通道（Claude & Antigravity）专属节点与端口槽位
+  private slots: Record<DedicatedChannelId, DedicatedChannelSlot> = {
+    claude: {
+      id: 'claude',
+      label: 'Claude',
+      listenerName: CLAUDE_LISTENER_NAME,
+      internalProxyName: DEDICATED_PROXY_INTERNAL_NAME,
+      dialerPrefix: DEDICATED_DIALER_PREFIX,
+      processNames: CLAUDE_TUN_PROCESS_NAMES,
+      desiredNodeName: null,
+      desiredProfileUid: null,
+      desiredProfileName: null,
+      desiredNodeRaw: null,
+      desiredDialerRaw: null,
+      desiredPort: 27897,
+      boundNodeName: null,
+      boundProfileUid: null,
+      boundProfileName: null,
+      boundInternalProxyName: null,
+      boundPort: null,
+    },
+    antigravity: {
+      id: 'antigravity',
+      label: 'Antigravity',
+      listenerName: ANTIGRAVITY_LISTENER_NAME,
+      internalProxyName: ANTIGRAVITY_PROXY_INTERNAL_NAME,
+      dialerPrefix: ANTIGRAVITY_DIALER_PREFIX,
+      processNames: ANTIGRAVITY_TUN_PROCESS_NAMES,
+      desiredNodeName: null,
+      desiredProfileUid: null,
+      desiredProfileName: null,
+      desiredNodeRaw: null,
+      desiredDialerRaw: null,
+      desiredPort: 27898,
+      boundNodeName: null,
+      boundProfileUid: null,
+      boundProfileName: null,
+      boundInternalProxyName: null,
+      boundPort: null,
+    },
+  };
 
   private rebindGraceUntil = 0;
   private lastAutoBindFailAt = 0;
@@ -187,6 +240,8 @@ export class ClashMonitor extends EventEmitter {
     dedicatedPort: null,
     dedicatedPortListening: false,
     antigravityBoundNode: null,
+    antigravityBoundProfileUid: null,
+    antigravityBoundProfileName: null,
     antigravityDedicatedPort: null,
     antigravityPortListening: false,
   };
@@ -207,16 +262,28 @@ export class ClashMonitor extends EventEmitter {
     initialProfileUid: string | null = null,
     initialProfileName: string | null = null,
     initialNodeRaw: Record<string, unknown> | null = null,
-    initialDialerRaw: Array<Record<string, unknown>> | null = null
+    initialDialerRaw: Array<Record<string, unknown>> | null = null,
+    initialAgProfileUid: string | null = null,
+    initialAgProfileName: string | null = null,
+    initialAgNodeRaw: Record<string, unknown> | null = null,
+    initialAgDialerRaw: Array<Record<string, unknown>> | null = null
   ): void {
-    this.desiredNodeName = initialClaudeNode ? initialClaudeNode.trim() : null;
-    this.desiredDedicatedPort = claudePort;
-    this.desiredAntigravityNode = initialAntigravityNode ? initialAntigravityNode.trim() : null;
-    this.desiredAntigravityPort = antigravityPort;
-    this.desiredProfileUid = initialProfileUid ? initialProfileUid.trim() : null;
-    this.desiredProfileName = initialProfileName ? initialProfileName.trim() : null;
-    this.desiredNodeRaw = initialNodeRaw ? structuredClone(initialNodeRaw) : null;
-    this.desiredDialerRaw = initialDialerRaw ? structuredClone(initialDialerRaw) : null;
+    const claudeSlot = this.slots.claude;
+    claudeSlot.desiredNodeName = initialClaudeNode ? initialClaudeNode.trim() : null;
+    claudeSlot.desiredPort = claudePort;
+    claudeSlot.desiredProfileUid = initialProfileUid ? initialProfileUid.trim() : null;
+    claudeSlot.desiredProfileName = initialProfileName ? initialProfileName.trim() : null;
+    claudeSlot.desiredNodeRaw = initialNodeRaw ? structuredClone(initialNodeRaw) : null;
+    claudeSlot.desiredDialerRaw = initialDialerRaw ? structuredClone(initialDialerRaw) : null;
+
+    const agSlot = this.slots.antigravity;
+    agSlot.desiredNodeName = initialAntigravityNode ? initialAntigravityNode.trim() : null;
+    agSlot.desiredPort = antigravityPort;
+    agSlot.desiredProfileUid = initialAgProfileUid ? initialAgProfileUid.trim() : null;
+    agSlot.desiredProfileName = initialAgProfileName ? initialAgProfileName.trim() : null;
+    agSlot.desiredNodeRaw = initialAgNodeRaw ? structuredClone(initialAgNodeRaw) : null;
+    agSlot.desiredDialerRaw = initialAgDialerRaw ? structuredClone(initialAgDialerRaw) : null;
+
     this.stopped = false;
 
     // 启动时先扫描一次本地 Clash Verge Rev 订阅库，确保即使内核未连接也能立即展示全部订阅组
@@ -239,45 +306,38 @@ export class ClashMonitor extends EventEmitter {
   }
 
   /**
-   * 设置或切换 Claude 指定的 Clash 节点（支持任意未激活订阅组的节点），
-   * 将该节点的完整定义与独立专属入站端口动态注入 Mihomo 内核
+   * 通用跨订阅节点与专属入站端口配置引擎（Claude 与 Antigravity 共用同一套底层逻辑）
    */
-  public async configureDedicatedNode(
+  public async configureChannelNode(
+    channelId: DedicatedChannelId,
     nodeName: string | null,
     dedicatedPort: number,
     profileUid?: string | null,
     forceRebind = true
-  ): Promise<{
-    ok: boolean;
-    listening: boolean;
-    profileUid?: string | null;
-    profileName?: string | null;
-    nodeRaw?: Record<string, unknown> | null;
-    dialerRaw?: Array<Record<string, unknown>> | null;
-    error?: string;
-  }> {
+  ): Promise<DedicatedNodeBindResult> {
+    const slot = this.slots[channelId];
     const cleanNode = nodeName ? nodeName.trim() : null;
     const cleanProfileUid =
       profileUid !== undefined
         ? profileUid && profileUid.trim()
           ? profileUid.trim()
           : null
-        : this.desiredProfileUid;
+        : slot.desiredProfileUid;
 
     const isSameSelection =
-      this.desiredNodeName === cleanNode && this.desiredProfileUid === cleanProfileUid;
+      slot.desiredNodeName === cleanNode && slot.desiredProfileUid === cleanProfileUid;
 
-    this.desiredNodeName = cleanNode;
-    this.desiredProfileUid = cleanNode ? cleanProfileUid : null;
+    slot.desiredNodeName = cleanNode;
+    slot.desiredProfileUid = cleanNode ? cleanProfileUid : null;
     if (!cleanNode) {
-      this.desiredProfileName = null;
-      this.desiredNodeRaw = null;
-      this.desiredDialerRaw = null;
+      slot.desiredProfileName = null;
+      slot.desiredNodeRaw = null;
+      slot.desiredDialerRaw = null;
     } else if (!isSameSelection) {
-      this.desiredNodeRaw = null;
-      this.desiredDialerRaw = null;
+      slot.desiredNodeRaw = null;
+      slot.desiredDialerRaw = null;
     }
-    this.desiredDedicatedPort = dedicatedPort;
+    slot.desiredPort = dedicatedPort;
 
     if (!this.currentEndpoint) {
       const found = await this.findWorkingEndpoint();
@@ -287,43 +347,38 @@ export class ClashMonitor extends EventEmitter {
       }
     }
 
-    if (this.desiredNodeName) {
+    if (slot.desiredNodeName) {
       this.refreshOfflineProfilesState({});
-      const resolvedMeta = this.resolveTargetNodeDefinition(
-        this.desiredNodeName,
-        this.desiredProfileUid
-      );
+      const resolvedMeta = this.resolveSlotTargetNodeDefinition(slot);
       if (resolvedMeta) {
-        this.desiredProfileUid = resolvedMeta.profileUid;
-        this.desiredProfileName = resolvedMeta.profileName;
-        this.desiredNodeRaw = structuredClone(resolvedMeta.rawProxy);
-        this.desiredDialerRaw = structuredClone(resolvedMeta.dialerChain);
+        slot.desiredProfileUid = resolvedMeta.profileUid;
+        slot.desiredProfileName = resolvedMeta.profileName;
+        slot.desiredNodeRaw = structuredClone(resolvedMeta.rawProxy);
+        slot.desiredDialerRaw = structuredClone(resolvedMeta.dialerChain);
       }
     }
 
     if (!this.currentEndpoint) {
-      this.boundNodeName = null;
-      this.boundProfileUid = null;
-      this.boundProfileName = null;
-      this.boundInternalProxyName = null;
-      this.boundPort = null;
-      this.rebindGraceUntil = 0;
-      this.info.boundNode = this.desiredNodeName;
-      this.info.boundProfileUid = this.desiredProfileUid;
-      this.info.boundProfileName = this.desiredProfileName;
-      this.info.dedicatedPort = this.desiredNodeName ? dedicatedPort : null;
-      this.info.dedicatedPortListening = false;
+      slot.boundNodeName = null;
+      slot.boundProfileUid = null;
+      slot.boundProfileName = null;
+      slot.boundInternalProxyName = null;
+      slot.boundPort = null;
+      if (channelId === 'claude') {
+        this.rebindGraceUntil = 0;
+      }
+      this.syncSlotInfoFields(false, false);
       this.emit('clash-status-updated');
-      if (!this.desiredNodeName) {
+      if (!slot.desiredNodeName) {
         return { ok: true, listening: false };
       }
       return {
         ok: false,
         listening: false,
-        profileUid: this.desiredProfileUid,
-        profileName: this.desiredProfileName,
-        nodeRaw: this.desiredNodeRaw,
-        dialerRaw: this.desiredDialerRaw,
+        profileUid: slot.desiredProfileUid,
+        profileName: slot.desiredProfileName,
+        nodeRaw: slot.desiredNodeRaw,
+        dialerRaw: slot.desiredDialerRaw,
         error: '未检测到运行中的 Clash Verge / Mihomo 控制接口',
       };
     }
@@ -331,65 +386,80 @@ export class ClashMonitor extends EventEmitter {
     const res = await this.queueSyncDedicatedListeners(forceRebind);
     this.emit('clash-status-updated');
 
-    if (!this.desiredNodeName) {
-      this.rebindGraceUntil = 0;
+    if (!slot.desiredNodeName) {
+      if (channelId === 'claude') {
+        this.rebindGraceUntil = 0;
+      }
       return { ok: true, listening: false };
     }
+
+    const listening = channelId === 'claude' ? res.claudeListening : res.antigravityListening;
+    const channelErr = channelId === 'claude' ? res.claudeError : res.antigravityError;
+
     return {
-      ok: res.claudeListening,
-      listening: res.claudeListening,
-      profileUid: this.desiredProfileUid,
-      profileName: this.desiredProfileName,
-      nodeRaw: this.desiredNodeRaw,
-      dialerRaw: this.desiredDialerRaw,
-      error: res.claudeError || res.generalError,
+      ok: listening,
+      listening,
+      profileUid: slot.desiredProfileUid,
+      profileName: slot.desiredProfileName,
+      nodeRaw: slot.desiredNodeRaw,
+      dialerRaw: slot.desiredDialerRaw,
+      error: channelErr || res.generalError,
     };
   }
 
   /**
-   * 设置或切换 Antigravity 指定的 Clash 节点，并在 Mihomo 内核中建立/更新独立专属入站端口及进程规则
+   * 设置或切换 Claude 指定的 Clash 节点（支持任意未激活订阅组的节点）
+   */
+  public async configureDedicatedNode(
+    nodeName: string | null,
+    dedicatedPort: number,
+    profileUid?: string | null,
+    forceRebind = true
+  ): Promise<DedicatedNodeBindResult> {
+    return this.configureChannelNode('claude', nodeName, dedicatedPort, profileUid, forceRebind);
+  }
+
+  /**
+   * 设置或切换 Antigravity 指定的 Clash 节点（同样支持任意未激活订阅组的节点）
    */
   public async configureAntigravityNode(
     nodeName: string | null,
-    dedicatedPort: number
-  ): Promise<{ ok: boolean; listening: boolean; error?: string }> {
-    this.desiredAntigravityNode = nodeName ? nodeName.trim() : null;
-    this.desiredAntigravityPort = dedicatedPort;
+    dedicatedPort: number,
+    profileUid?: string | null,
+    forceRebind = true
+  ): Promise<DedicatedNodeBindResult> {
+    return this.configureChannelNode(
+      'antigravity',
+      nodeName,
+      dedicatedPort,
+      profileUid,
+      forceRebind
+    );
+  }
 
-    if (!this.currentEndpoint) {
-      const found = await this.findWorkingEndpoint();
-      if (found) {
-        this.currentEndpoint = found;
-        this.ensureConfigDirWatcher();
-      }
-    }
+  private syncSlotInfoFields(claudeListening: boolean, antigravityListening: boolean): void {
+    const claude = this.slots.claude;
+    const ag = this.slots.antigravity;
 
-    if (!this.currentEndpoint) {
-      this.boundAntigravityNode = null;
-      this.boundAntigravityInternalProxyName = null;
-      this.boundAntigravityPort = null;
-      this.info.antigravityBoundNode = null;
-      this.info.antigravityDedicatedPort = dedicatedPort;
-      this.info.antigravityPortListening = false;
-      this.emit('clash-status-updated');
-      return {
-        ok: false,
-        listening: false,
-        error: '未检测到运行中的 Clash Verge / Mihomo 控制接口',
-      };
-    }
+    this.info.boundNode = claude.desiredNodeName;
+    this.info.boundProfileUid = claude.desiredNodeName
+      ? claude.boundProfileUid || claude.desiredProfileUid
+      : null;
+    this.info.boundProfileName = claude.desiredNodeName
+      ? claude.boundProfileName || claude.desiredProfileName
+      : null;
+    this.info.dedicatedPort = claude.desiredNodeName ? claude.desiredPort : null;
+    this.info.dedicatedPortListening = claudeListening;
 
-    const res = await this.queueSyncDedicatedListeners(true);
-    this.emit('clash-status-updated');
-
-    if (!this.desiredAntigravityNode) {
-      return { ok: true, listening: false };
-    }
-    return {
-      ok: res.antigravityListening,
-      listening: res.antigravityListening,
-      error: res.antigravityError || res.generalError,
-    };
+    this.info.antigravityBoundNode = ag.desiredNodeName;
+    this.info.antigravityBoundProfileUid = ag.desiredNodeName
+      ? ag.boundProfileUid || ag.desiredProfileUid
+      : null;
+    this.info.antigravityBoundProfileName = ag.desiredNodeName
+      ? ag.boundProfileName || ag.desiredProfileName
+      : null;
+    this.info.antigravityDedicatedPort = ag.desiredNodeName ? ag.desiredPort : null;
+    this.info.antigravityPortListening = antigravityListening;
   }
 
   private ensureConfigDirWatcher(): void {
@@ -409,7 +479,7 @@ export class ClashMonitor extends EventEmitter {
           lower === 'config.yaml'
         ) {
           // 当用户在 Clash Verge Rev 中切换订阅组或重载配置时，留出 360ms 让 Clash Verge 完成自身重载后立即无缝补回专属节点
-          if (this.boundNodeName && this.info.dedicatedPortListening) {
+          if (this.slots.claude.boundNodeName && this.info.dedicatedPortListening) {
             this.rebindGraceUntil = Date.now() + RELOAD_GRACE_WINDOW_MS;
           }
           if (this.configWatchDebounceTimer) {
@@ -494,60 +564,45 @@ export class ClashMonitor extends EventEmitter {
         const nextGroupsSig = buildAllGroupsSignature(proxiesMap);
         const nextProfilesSig = buildProfilesSignature(profilesScan.profileGroups);
 
-        const prevBoundClaudeNode = this.boundNodeName;
-        const prevBoundProfile = this.boundProfileUid;
-        const prevBoundClaudePort = this.boundPort;
-        const prevBoundAgNode = this.boundAntigravityNode;
-        const prevBoundAgPort = this.boundAntigravityPort;
+        const claudeSlot = this.slots.claude;
+        const agSlot = this.slots.antigravity;
+
+        const prevBoundClaudeNode = claudeSlot.boundNodeName;
+        const prevBoundProfile = claudeSlot.boundProfileUid;
+        const prevBoundClaudePort = claudeSlot.boundPort;
+        const prevBoundAgNode = agSlot.boundNodeName;
+        const prevBoundAgProfile = agSlot.boundProfileUid;
+        const prevBoundAgPort = agSlot.boundPort;
 
         let claudeListening = false;
         let antigravityListening = false;
         let needsSync = false;
 
-        if (this.desiredNodeName) {
-          const expectedInternal = this.boundInternalProxyName || DEDICATED_PROXY_INTERNAL_NAME;
+        for (const slot of [claudeSlot, agSlot]) {
+          if (!slot.desiredNodeName) continue;
+          const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
           const nodeAliveInKernel = Boolean(
-            proxiesMap[expectedInternal] || proxiesMap[this.desiredNodeName]
+            proxiesMap[expectedInternal] || proxiesMap[slot.desiredNodeName]
           );
           const portAlive = nodeAliveInKernel
-            ? await isLocalPortListening(this.desiredDedicatedPort)
+            ? await isLocalPortListening(slot.desiredPort)
             : false;
           const desiredProfileMatches =
-            !this.desiredProfileUid ||
-            !this.boundProfileUid ||
-            this.desiredProfileUid === this.boundProfileUid;
+            !slot.desiredProfileUid ||
+            !slot.boundProfileUid ||
+            slot.desiredProfileUid === slot.boundProfileUid;
 
           if (
             !nodeAliveInKernel ||
             !portAlive ||
-            this.boundNodeName !== this.desiredNodeName ||
+            slot.boundNodeName !== slot.desiredNodeName ||
             !desiredProfileMatches ||
-            this.boundPort !== this.desiredDedicatedPort
+            slot.boundPort !== slot.desiredPort
           ) {
             needsSync = true;
-          } else {
+          } else if (slot.id === 'claude') {
             claudeListening = true;
             this.rebindGraceUntil = 0;
-          }
-        }
-
-        if (this.desiredAntigravityNode) {
-          const expectedAgInternal =
-            this.boundAntigravityInternalProxyName || ANTIGRAVITY_PROXY_INTERNAL_NAME;
-          const agAliveInKernel = Boolean(
-            proxiesMap[expectedAgInternal] || proxiesMap[this.desiredAntigravityNode]
-          );
-          const agPortAlive = agAliveInKernel
-            ? await isLocalPortListening(this.desiredAntigravityPort)
-            : false;
-
-          if (
-            !agAliveInKernel ||
-            !agPortAlive ||
-            this.boundAntigravityNode !== this.desiredAntigravityNode ||
-            this.boundAntigravityPort !== this.desiredAntigravityPort
-          ) {
-            needsSync = true;
           } else {
             antigravityListening = true;
           }
@@ -557,9 +612,11 @@ export class ClashMonitor extends EventEmitter {
         let agBoundChanged = false;
 
         if (needsSync) {
-          const targetKey = `${this.desiredProfileUid || ''}:::${this.desiredNodeName || ''}:${
-            this.desiredDedicatedPort
-          }|${this.desiredAntigravityNode || ''}:${this.desiredAntigravityPort}`;
+          const targetKey = `${claudeSlot.desiredProfileUid || ''}:::${
+            claudeSlot.desiredNodeName || ''
+          }:${claudeSlot.desiredPort}|${agSlot.desiredProfileUid || ''}:::${
+            agSlot.desiredNodeName || ''
+          }:${agSlot.desiredPort}`;
           const now = Date.now();
           const inCooldown =
             this.lastAutoBindFailKey === targetKey &&
@@ -578,8 +635,8 @@ export class ClashMonitor extends EventEmitter {
             antigravityListening = syncRes.antigravityListening;
 
             const allDesiredOk =
-              (!this.desiredNodeName || claudeListening) &&
-              (!this.desiredAntigravityNode || antigravityListening);
+              (!claudeSlot.desiredNodeName || claudeListening) &&
+              (!agSlot.desiredNodeName || antigravityListening);
 
             if (allDesiredOk) {
               this.lastAutoBindFailAt = 0;
@@ -589,10 +646,10 @@ export class ClashMonitor extends EventEmitter {
               this.lastAutoBindFailAt = Date.now();
               this.lastAutoBindFailKey = targetKey;
               if (
-                this.desiredNodeName &&
+                claudeSlot.desiredNodeName &&
                 !claudeListening &&
                 Date.now() < this.rebindGraceUntil &&
-                prevBoundClaudeNode === this.desiredNodeName
+                prevBoundClaudeNode === claudeSlot.desiredNodeName
               ) {
                 claudeListening = true;
                 fastRetryMs = 400;
@@ -600,24 +657,25 @@ export class ClashMonitor extends EventEmitter {
             }
 
             if (
-              prevBoundClaudeNode !== this.boundNodeName ||
-              prevBoundProfile !== this.boundProfileUid ||
-              prevBoundClaudePort !== this.boundPort ||
+              prevBoundClaudeNode !== claudeSlot.boundNodeName ||
+              prevBoundProfile !== claudeSlot.boundProfileUid ||
+              prevBoundClaudePort !== claudeSlot.boundPort ||
               this.info.dedicatedPortListening !== claudeListening
             ) {
               claudeBoundChanged = true;
             }
             if (
-              prevBoundAgNode !== this.boundAntigravityNode ||
-              prevBoundAgPort !== this.boundAntigravityPort ||
+              prevBoundAgNode !== agSlot.boundNodeName ||
+              prevBoundAgProfile !== agSlot.boundProfileUid ||
+              prevBoundAgPort !== agSlot.boundPort ||
               this.info.antigravityPortListening !== antigravityListening
             ) {
               agBoundChanged = true;
             }
           } else if (
-            this.desiredNodeName &&
+            claudeSlot.desiredNodeName &&
             Date.now() < this.rebindGraceUntil &&
-            prevBoundClaudeNode === this.desiredNodeName
+            prevBoundClaudeNode === claudeSlot.desiredNodeName
           ) {
             claudeListening = true;
             fastRetryMs = 450;
@@ -649,19 +707,23 @@ export class ClashMonitor extends EventEmitter {
           nodeChain: resolved.chain,
           availableNodes: profilesScan.availableNodes,
           profileGroups: profilesScan.profileGroups,
-          boundNode: this.desiredNodeName,
-          boundProfileUid: this.desiredNodeName
-            ? this.boundProfileUid || this.desiredProfileUid
+          boundNode: claudeSlot.desiredNodeName,
+          boundProfileUid: claudeSlot.desiredNodeName
+            ? claudeSlot.boundProfileUid || claudeSlot.desiredProfileUid
             : null,
-          boundProfileName: this.desiredNodeName
-            ? this.boundProfileName || this.desiredProfileName
+          boundProfileName: claudeSlot.desiredNodeName
+            ? claudeSlot.boundProfileName || claudeSlot.desiredProfileName
             : null,
-          dedicatedPort: this.desiredNodeName ? this.desiredDedicatedPort : null,
+          dedicatedPort: claudeSlot.desiredNodeName ? claudeSlot.desiredPort : null,
           dedicatedPortListening: claudeListening,
-          antigravityBoundNode: this.desiredAntigravityNode,
-          antigravityDedicatedPort: this.desiredAntigravityNode
-            ? this.desiredAntigravityPort
+          antigravityBoundNode: agSlot.desiredNodeName,
+          antigravityBoundProfileUid: agSlot.desiredNodeName
+            ? agSlot.boundProfileUid || agSlot.desiredProfileUid
             : null,
+          antigravityBoundProfileName: agSlot.desiredNodeName
+            ? agSlot.boundProfileName || agSlot.desiredProfileName
+            : null,
+          antigravityDedicatedPort: agSlot.desiredNodeName ? agSlot.desiredPort : null,
           antigravityPortListening: antigravityListening,
         };
 
@@ -669,14 +731,14 @@ export class ClashMonitor extends EventEmitter {
           this.emit('antigravity-clash-ready');
         }
 
-        const displayBoundLabel = this.formatBoundDisplayLabel();
+        const displayBoundLabel = this.formatBoundDisplayLabel(claudeSlot);
 
         if (!prevConnected) {
           if (claudeBoundChanged) {
             this.emit(
               'clash-change',
               claudeListening
-                ? `Clash 已连接并锁定专属节点: ${displayBoundLabel} (127.0.0.1:${this.desiredDedicatedPort})`
+                ? `Clash 已连接并锁定专属节点: ${displayBoundLabel} (127.0.0.1:${claudeSlot.desiredPort})`
                 : `Clash 已连接，但指定节点通道未就绪: ${displayBoundLabel}`
             );
           } else {
@@ -686,13 +748,13 @@ export class ClashMonitor extends EventEmitter {
           this.emit(
             'clash-change',
             claudeListening
-              ? `已绑定专属节点通道: ${displayBoundLabel} (127.0.0.1:${this.desiredDedicatedPort})`
+              ? `已绑定专属节点通道: ${displayBoundLabel} (127.0.0.1:${claudeSlot.desiredPort})`
               : `指定节点通道异常: ${displayBoundLabel}`
           );
-        } else if (!this.desiredNodeName && prevMode !== mode) {
+        } else if (!claudeSlot.desiredNodeName && prevMode !== mode) {
           this.emit('clash-change', `Clash 代理模式变更: ${prevMode} → ${mode}`);
         } else if (
-          !this.desiredNodeName &&
+          !claudeSlot.desiredNodeName &&
           (prevNode !== resolved.leafNode || prevChainKey !== nextChainKey)
         ) {
           this.emit(
@@ -700,13 +762,13 @@ export class ClashMonitor extends EventEmitter {
             `Clash 节点变更: ${prevNode || '无'} → ${resolved.leafNode || '直连'}`
           );
         } else if (prevGroupsSig && prevGroupsSig !== nextGroupsSig) {
-          const selectedAgItem = this.desiredAntigravityNode
-            ? proxiesMap[this.desiredAntigravityNode]
+          const selectedAgItem = agSlot.desiredNodeName
+            ? proxiesMap[agSlot.desiredNodeName]
             : null;
           if (selectedAgItem && GROUP_TYPES.has(selectedAgItem.type)) {
             this.emit('antigravity-clash-ready');
           }
-          if (!this.desiredNodeName) {
+          if (!claudeSlot.desiredNodeName) {
             this.emit('clash-change', 'Clash 策略组节点切换');
           } else {
             this.emit('clash-status-updated');
@@ -726,8 +788,8 @@ export class ClashMonitor extends EventEmitter {
         if (this.info.connected) {
           // 若处于 Clash 切换订阅或 TUN 重启瞬间的宽限期内，先快速重连而不立即触发断连告警
           if (
-            this.desiredNodeName &&
-            this.boundNodeName &&
+            this.slots.claude.desiredNodeName &&
+            this.slots.claude.boundNodeName &&
             Date.now() < this.rebindGraceUntil
           ) {
             fastRetryMs = 400;
@@ -749,9 +811,9 @@ export class ClashMonitor extends EventEmitter {
     }
   }
 
-  private formatBoundDisplayLabel(): string {
-    const pName = this.boundProfileName || this.desiredProfileName;
-    const nName = this.desiredNodeName || '';
+  private formatBoundDisplayLabel(slot: DedicatedChannelSlot): string {
+    const pName = slot.boundProfileName || slot.desiredProfileName;
+    const nName = slot.desiredNodeName || '';
     return pName ? `${pName} / ${nName}` : nName;
   }
 
@@ -791,12 +853,15 @@ export class ClashMonitor extends EventEmitter {
     antigravityError?: string;
     generalError?: string;
   }> {
+    const claudeSlot = this.slots.claude;
+    const agSlot = this.slots.antigravity;
+
     if (!this.currentEndpoint) {
-      const claudeAlive = this.desiredNodeName
-        ? await isLocalPortListening(this.desiredDedicatedPort)
+      const claudeAlive = claudeSlot.desiredNodeName
+        ? await isLocalPortListening(claudeSlot.desiredPort)
         : false;
-      const agAlive = this.desiredAntigravityNode
-        ? await isLocalPortListening(this.desiredAntigravityPort)
+      const agAlive = agSlot.desiredNodeName
+        ? await isLocalPortListening(agSlot.desiredPort)
         : false;
       return {
         claudeListening: claudeAlive,
@@ -805,34 +870,28 @@ export class ClashMonitor extends EventEmitter {
       };
     }
 
-    const claudeAlreadyOk = !this.desiredNodeName
-      ? !this.boundNodeName
-      : !forceRebind &&
-        this.boundNodeName === this.desiredNodeName &&
-        (!this.desiredProfileUid || this.boundProfileUid === this.desiredProfileUid) &&
-        this.boundPort === this.desiredDedicatedPort &&
-        (await isLocalPortListening(this.desiredDedicatedPort));
+    const isSlotAlreadyOk = async (slot: DedicatedChannelSlot): Promise<boolean> => {
+      if (!slot.desiredNodeName) {
+        return !slot.boundNodeName;
+      }
+      if (forceRebind) return false;
+      return (
+        slot.boundNodeName === slot.desiredNodeName &&
+        (!slot.desiredProfileUid || slot.boundProfileUid === slot.desiredProfileUid) &&
+        slot.boundPort === slot.desiredPort &&
+        (await isLocalPortListening(slot.desiredPort))
+      );
+    };
 
-    const agAlreadyOk = !this.desiredAntigravityNode
-      ? !this.boundAntigravityNode
-      : !forceRebind &&
-        this.boundAntigravityNode === this.desiredAntigravityNode &&
-        this.boundAntigravityPort === this.desiredAntigravityPort &&
-        (await isLocalPortListening(this.desiredAntigravityPort));
+    const [claudeAlreadyOk, agAlreadyOk] = await Promise.all([
+      isSlotAlreadyOk(claudeSlot),
+      isSlotAlreadyOk(agSlot),
+    ]);
 
     if (claudeAlreadyOk && agAlreadyOk) {
-      const claudeListening = Boolean(this.desiredNodeName);
-      const antigravityListening = Boolean(this.desiredAntigravityNode);
-      this.info.boundNode = this.desiredNodeName;
-      this.info.boundProfileUid = this.desiredNodeName ? this.boundProfileUid : null;
-      this.info.boundProfileName = this.desiredNodeName ? this.boundProfileName : null;
-      this.info.dedicatedPort = this.desiredNodeName ? this.desiredDedicatedPort : null;
-      this.info.dedicatedPortListening = claudeListening;
-      this.info.antigravityBoundNode = this.desiredAntigravityNode;
-      this.info.antigravityDedicatedPort = this.desiredAntigravityNode
-        ? this.desiredAntigravityPort
-        : null;
-      this.info.antigravityPortListening = antigravityListening;
+      const claudeListening = Boolean(claudeSlot.desiredNodeName);
+      const antigravityListening = Boolean(agSlot.desiredNodeName);
+      this.syncSlotInfoFields(claudeListening, antigravityListening);
       return { claudeListening, antigravityListening };
     }
 
@@ -860,10 +919,10 @@ export class ClashMonitor extends EventEmitter {
       );
 
       const portsToStrip = [
-        this.desiredDedicatedPort,
-        this.boundPort,
-        this.desiredAntigravityPort,
-        this.boundAntigravityPort,
+        claudeSlot.desiredPort,
+        claudeSlot.boundPort,
+        agSlot.desiredPort,
+        agSlot.boundPort,
       ].filter((p): p is number => typeof p === 'number' && p > 0);
 
       const doc = this.loadAndPrepareCoreYaml(yamlPath, portsToStrip);
@@ -883,109 +942,68 @@ export class ClashMonitor extends EventEmitter {
         : [];
       const prependedRules: string[] = [];
 
-      let claudeError: string | undefined;
-      let antigravityError: string | undefined;
-      let shouldBindClaude = false;
-      let shouldBindAg = false;
-      let claudeTargetProxy = this.desiredNodeName || '';
-      let agTargetProxy = this.desiredAntigravityNode || '';
+      const slotOutcome: Record<
+        DedicatedChannelId,
+        { shouldBind: boolean; targetProxy: string; error?: string }
+      > = {
+        claude: { shouldBind: false, targetProxy: '' },
+        antigravity: { shouldBind: false, targetProxy: '' },
+      };
 
-      if (this.desiredNodeName) {
-        const resolvedClaude = this.resolveTargetNodeDefinition(
-          this.desiredNodeName,
-          this.desiredProfileUid
-        );
-        if (resolvedClaude) {
-          this.desiredProfileUid = resolvedClaude.profileUid;
-          this.desiredProfileName = resolvedClaude.profileName;
-          this.desiredNodeRaw = structuredClone(resolvedClaude.rawProxy);
-          this.desiredDialerRaw = structuredClone(resolvedClaude.dialerChain);
+      // 统一遍历所有专属通道槽位，执行跨订阅节点提取、链式前置节点注入、独立入站监听及进程规则绑定
+      for (const slot of [claudeSlot, agSlot]) {
+        if (!slot.desiredNodeName) continue;
+
+        const resolved = this.resolveSlotTargetNodeDefinition(slot);
+        if (resolved) {
+          slot.desiredProfileUid = resolved.profileUid;
+          slot.desiredProfileName = resolved.profileName;
+          slot.desiredNodeRaw = structuredClone(resolved.rawProxy);
+          slot.desiredDialerRaw = structuredClone(resolved.dialerChain);
         }
 
-        if (this.desiredNodeRaw) {
-          shouldBindClaude = true;
-          const dialerChain = this.desiredDialerRaw || [];
+        let shouldBind = false;
+        let targetProxy = slot.desiredNodeName;
+
+        if (slot.desiredNodeRaw) {
+          shouldBind = true;
+          const dialerChain = slot.desiredDialerRaw || [];
           for (let i = 0; i < dialerChain.length; i++) {
             const hopClone = structuredClone(dialerChain[i]);
-            hopClone['name'] = `${DEDICATED_DIALER_PREFIX}${i}__`;
+            hopClone['name'] = `${slot.dialerPrefix}${i}__`;
             if (i + 1 < dialerChain.length) {
-              hopClone['dialer-proxy'] = `${DEDICATED_DIALER_PREFIX}${i + 1}__`;
+              hopClone['dialer-proxy'] = `${slot.dialerPrefix}${i + 1}__`;
             }
             existingProxies.push(hopClone);
           }
 
-          const injectedNode = structuredClone(this.desiredNodeRaw);
-          injectedNode['name'] = DEDICATED_PROXY_INTERNAL_NAME;
+          const injectedNode = structuredClone(slot.desiredNodeRaw);
+          injectedNode['name'] = slot.internalProxyName;
           if (dialerChain.length > 0) {
-            injectedNode['dialer-proxy'] = `${DEDICATED_DIALER_PREFIX}0__`;
+            injectedNode['dialer-proxy'] = `${slot.dialerPrefix}0__`;
           }
           existingProxies.push(injectedNode);
-          claudeTargetProxy = DEDICATED_PROXY_INTERNAL_NAME;
-        } else if (proxiesMap[this.desiredNodeName]) {
-          shouldBindClaude = true;
-          claudeTargetProxy = this.desiredNodeName;
+          targetProxy = slot.internalProxyName;
+        } else if (proxiesMap[slot.desiredNodeName]) {
+          shouldBind = true;
+          targetProxy = slot.desiredNodeName;
         } else {
-          claudeError = `在所有 Clash 订阅组中均未找到节点 "${this.desiredNodeName}"，请重新选择`;
+          slotOutcome[slot.id].error = `在所有 Clash 订阅组中均未找到节点 "${slot.desiredNodeName}"，请重新选择`;
         }
 
-        if (shouldBindClaude) {
+        if (shouldBind) {
+          slotOutcome[slot.id].shouldBind = true;
+          slotOutcome[slot.id].targetProxy = targetProxy;
           existingListeners.push({
-            name: CLAUDE_LISTENER_NAME,
+            name: slot.listenerName,
             type: 'mixed',
-            port: this.desiredDedicatedPort,
+            port: slot.desiredPort,
             listen: '127.0.0.1',
-            proxy: claudeTargetProxy,
+            proxy: targetProxy,
             udp: true,
           });
-          for (const proc of CLAUDE_TUN_PROCESS_NAMES) {
-            prependedRules.push(`PROCESS-NAME,${proc},${claudeTargetProxy}`);
-          }
-        }
-      }
-
-      if (this.desiredAntigravityNode) {
-        const resolvedAg = this.resolveTargetNodeDefinition(
-          this.desiredAntigravityNode,
-          null,
-          false
-        );
-        if (resolvedAg) {
-          shouldBindAg = true;
-          const dialerChain = resolvedAg.dialerChain || [];
-          for (let i = 0; i < dialerChain.length; i++) {
-            const hopClone = structuredClone(dialerChain[i]);
-            hopClone['name'] = `${ANTIGRAVITY_DIALER_PREFIX}${i}__`;
-            if (i + 1 < dialerChain.length) {
-              hopClone['dialer-proxy'] = `${ANTIGRAVITY_DIALER_PREFIX}${i + 1}__`;
-            }
-            existingProxies.push(hopClone);
-          }
-
-          const injectedAgNode = structuredClone(resolvedAg.rawProxy);
-          injectedAgNode['name'] = ANTIGRAVITY_PROXY_INTERNAL_NAME;
-          if (dialerChain.length > 0) {
-            injectedAgNode['dialer-proxy'] = `${ANTIGRAVITY_DIALER_PREFIX}0__`;
-          }
-          existingProxies.push(injectedAgNode);
-          agTargetProxy = ANTIGRAVITY_PROXY_INTERNAL_NAME;
-        } else if (proxiesMap[this.desiredAntigravityNode]) {
-          shouldBindAg = true;
-          agTargetProxy = this.desiredAntigravityNode;
-        } else {
-          antigravityError = `当前 Clash 配置中不存在节点 "${this.desiredAntigravityNode}"，请重新选择`;
-        }
-
-        if (shouldBindAg) {
-          existingListeners.push({
-            name: ANTIGRAVITY_LISTENER_NAME,
-            type: 'mixed',
-            port: this.desiredAntigravityPort,
-            listen: '127.0.0.1',
-            proxy: agTargetProxy,
-            udp: true,
-          });
-          for (const proc of ANTIGRAVITY_TUN_PROCESS_NAMES) {
-            prependedRules.push(`PROCESS-NAME,${proc},${agTargetProxy}`);
+          for (const proc of slot.processNames) {
+            prependedRules.push(`PROCESS-NAME,${proc},${targetProxy}`);
           }
         }
       }
@@ -1003,34 +1021,28 @@ export class ClashMonitor extends EventEmitter {
       await this.reloadClashDocAndRestoreSelections(doc, savedSelections);
 
       const [claudeListening, antigravityListening] = await Promise.all([
-        shouldBindClaude
-          ? waitPortListening(this.desiredDedicatedPort, 1500)
+        slotOutcome.claude.shouldBind
+          ? waitPortListening(claudeSlot.desiredPort, 1500)
           : Promise.resolve(false),
-        shouldBindAg
-          ? waitPortListening(this.desiredAntigravityPort, 1500)
+        slotOutcome.antigravity.shouldBind
+          ? waitPortListening(agSlot.desiredPort, 1500)
           : Promise.resolve(false),
       ]);
 
-      this.boundNodeName = claudeListening ? this.desiredNodeName : null;
-      this.boundProfileUid = claudeListening ? this.desiredProfileUid : null;
-      this.boundProfileName = claudeListening ? this.desiredProfileName : null;
-      this.boundInternalProxyName = claudeListening ? claudeTargetProxy : null;
-      this.boundPort = claudeListening ? this.desiredDedicatedPort : null;
+      const updateSlotBoundState = (slot: DedicatedChannelSlot, listening: boolean) => {
+        slot.boundNodeName = listening ? slot.desiredNodeName : null;
+        slot.boundProfileUid = listening ? slot.desiredProfileUid : null;
+        slot.boundProfileName = listening ? slot.desiredProfileName : null;
+        slot.boundInternalProxyName = listening ? slotOutcome[slot.id].targetProxy : null;
+        slot.boundPort = listening ? slot.desiredPort : null;
+        if (slotOutcome[slot.id].shouldBind && !listening && !slotOutcome[slot.id].error) {
+          slotOutcome[slot.id].error = `${slot.label} 专属代理端口 127.0.0.1:${slot.desiredPort} 未能成功启动监听`;
+        }
+      };
 
-      this.info.boundNode = this.boundNodeName;
-      this.info.boundProfileUid = this.boundProfileUid;
-      this.info.boundProfileName = this.boundProfileName;
-      this.info.dedicatedPort = this.desiredNodeName ? this.desiredDedicatedPort : null;
-      this.info.dedicatedPortListening = claudeListening;
-
-      this.boundAntigravityNode = antigravityListening ? this.desiredAntigravityNode : null;
-      this.boundAntigravityInternalProxyName = antigravityListening ? agTargetProxy : null;
-      this.boundAntigravityPort = antigravityListening ? this.desiredAntigravityPort : null;
-      this.info.antigravityBoundNode = this.boundAntigravityNode;
-      this.info.antigravityDedicatedPort = this.desiredAntigravityNode
-        ? this.desiredAntigravityPort
-        : null;
-      this.info.antigravityPortListening = antigravityListening;
+      updateSlotBoundState(claudeSlot, claudeListening);
+      updateSlotBoundState(agSlot, antigravityListening);
+      this.syncSlotInfoFields(claudeListening, antigravityListening);
 
       if (claudeListening) {
         this.lastAutoBindFailAt = 0;
@@ -1038,18 +1050,11 @@ export class ClashMonitor extends EventEmitter {
         this.rebindGraceUntil = 0;
       }
 
-      if (shouldBindClaude && !claudeListening && !claudeError) {
-        claudeError = `专属代理端口 127.0.0.1:${this.desiredDedicatedPort} 未能成功启动监听`;
-      }
-      if (shouldBindAg && !antigravityListening && !antigravityError) {
-        antigravityError = `Antigravity 专属代理端口 127.0.0.1:${this.desiredAntigravityPort} 未能成功启动监听`;
-      }
-
       return {
         claudeListening,
         antigravityListening,
-        claudeError,
-        antigravityError,
+        claudeError: slotOutcome.claude.error,
+        antigravityError: slotOutcome.antigravity.error,
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -1083,16 +1088,16 @@ export class ClashMonitor extends EventEmitter {
     return out;
   }
 
-  private resolveTargetNodeDefinition(
-    nodeName: string,
-    preferredProfileUid: string | null,
-    useClaudeCacheFallback = true
-  ): {
+  private resolveSlotTargetNodeDefinition(slot: DedicatedChannelSlot): {
     profileUid: string | null;
     profileName: string | null;
     rawProxy: Record<string, unknown>;
     dialerChain: Array<Record<string, unknown>>;
   } | null {
+    const nodeName = slot.desiredNodeName;
+    if (!nodeName) return null;
+    const preferredProfileUid = slot.desiredProfileUid;
+
     // 1. 优先从用户指定的订阅组 UID 中精确匹配
     if (preferredProfileUid && this.profileRawLookup.has(preferredProfileUid)) {
       const targetProf = this.profileRawLookup.get(preferredProfileUid)!;
@@ -1133,13 +1138,13 @@ export class ClashMonitor extends EventEmitter {
       }
     }
 
-    // 4. 兜底使用已持久化的缓存节点定义
-    if (useClaudeCacheFallback && this.desiredNodeRaw) {
+    // 4. 兜底使用该通道槽位已持久化的缓存节点定义
+    if (slot.desiredNodeRaw) {
       return {
-        profileUid: this.desiredProfileUid,
-        profileName: this.desiredProfileName,
-        rawProxy: structuredClone(this.desiredNodeRaw),
-        dialerChain: this.desiredDialerRaw ? structuredClone(this.desiredDialerRaw) : [],
+        profileUid: slot.desiredProfileUid,
+        profileName: slot.desiredProfileName,
+        rawProxy: structuredClone(slot.desiredNodeRaw),
+        dialerChain: slot.desiredDialerRaw ? structuredClone(slot.desiredDialerRaw) : [],
       };
     }
 
@@ -1520,15 +1525,17 @@ export class ClashMonitor extends EventEmitter {
       }
     }
 
-    // 若已绑定专属节点且 Mihomo 内核中存在 __guard_claude_dedicated_proxy__，同步其最新测速延迟到对应节点
-    const dedicatedLive = activeProxiesMap[DEDICATED_PROXY_INTERNAL_NAME];
-    const dedicatedDelay = extractProxyDelay(dedicatedLive);
-    if (dedicatedDelay && this.desiredNodeName) {
-      for (const prof of resolvedProfiles) {
-        if (!this.desiredProfileUid || prof.uid === this.desiredProfileUid) {
-          for (const n of prof.nodes) {
-            if (n.name === this.desiredNodeName && !n.delay) {
-              n.delay = dedicatedDelay;
+    // 若已绑定专属节点且 Mihomo 内核中存在注入的专属代理，同步其最新测速延迟到对应节点
+    for (const slot of [this.slots.claude, this.slots.antigravity]) {
+      const dedicatedLive = activeProxiesMap[slot.internalProxyName];
+      const dedicatedDelay = extractProxyDelay(dedicatedLive);
+      if (dedicatedDelay && slot.desiredNodeName) {
+        for (const prof of resolvedProfiles) {
+          if (!slot.desiredProfileUid || prof.uid === slot.desiredProfileUid) {
+            for (const n of prof.nodes) {
+              if (n.name === slot.desiredNodeName && !n.delay) {
+                n.delay = dedicatedDelay;
+              }
             }
           }
         }
@@ -1762,11 +1769,11 @@ export class ClashMonitor extends EventEmitter {
 
   private resetDisconnectedState(): void {
     this.lastGroupsSignature = '';
-    this.boundNodeName = null;
-    this.boundInternalProxyName = null;
-    this.boundPort = null;
-    this.boundAntigravityNode = null;
-    this.boundAntigravityPort = null;
+    for (const slot of [this.slots.claude, this.slots.antigravity]) {
+      slot.boundNodeName = null;
+      slot.boundInternalProxyName = null;
+      slot.boundPort = null;
+    }
     this.info = {
       connected: false,
       source: '未连接',
@@ -1778,14 +1785,16 @@ export class ClashMonitor extends EventEmitter {
       nodeChain: [],
       availableNodes: this.info.availableNodes,
       profileGroups: this.info.profileGroups,
-      boundNode: this.desiredNodeName,
-      boundProfileUid: this.desiredProfileUid,
-      boundProfileName: this.desiredProfileName,
-      dedicatedPort: this.desiredNodeName ? this.desiredDedicatedPort : null,
+      boundNode: this.slots.claude.desiredNodeName,
+      boundProfileUid: this.slots.claude.desiredProfileUid,
+      boundProfileName: this.slots.claude.desiredProfileName,
+      dedicatedPort: this.slots.claude.desiredNodeName ? this.slots.claude.desiredPort : null,
       dedicatedPortListening: false,
-      antigravityBoundNode: this.desiredAntigravityNode,
-      antigravityDedicatedPort: this.desiredAntigravityNode
-        ? this.desiredAntigravityPort
+      antigravityBoundNode: this.slots.antigravity.desiredNodeName,
+      antigravityBoundProfileUid: this.slots.antigravity.desiredProfileUid,
+      antigravityBoundProfileName: this.slots.antigravity.desiredProfileName,
+      antigravityDedicatedPort: this.slots.antigravity.desiredNodeName
+        ? this.slots.antigravity.desiredPort
         : null,
       antigravityPortListening: false,
     };

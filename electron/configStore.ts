@@ -33,6 +33,10 @@ export const DEFAULT_CONFIG: AppConfig = {
   claudeExePath: '',
   claudeExclusiveGuard: true,
   antigravityClashNode: null,
+  antigravityClashProfileUid: null,
+  antigravityClashProfileName: null,
+  antigravityClashNodeRaw: null,
+  antigravityClashNodeDialerRaw: null,
   antigravityDedicatedPort: 27898,
   antigravityExePath: '',
 };
@@ -146,6 +150,28 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
       ? raw.antigravityClashNode.trim()
       : null;
 
+  const antigravityClashProfileUid =
+    antigravityClashNode &&
+    typeof raw.antigravityClashProfileUid === 'string' &&
+    raw.antigravityClashProfileUid.trim()
+      ? raw.antigravityClashProfileUid.trim()
+      : null;
+
+  const antigravityClashProfileName =
+    antigravityClashNode &&
+    typeof raw.antigravityClashProfileName === 'string' &&
+    raw.antigravityClashProfileName.trim()
+      ? raw.antigravityClashProfileName.trim()
+      : null;
+
+  const antigravityClashNodeRaw = antigravityClashNode
+    ? sanitizeRawProxyObj(raw.antigravityClashNodeRaw)
+    : null;
+
+  const antigravityClashNodeDialerRaw = antigravityClashNode
+    ? sanitizeRawProxyList(raw.antigravityClashNodeDialerRaw)
+    : null;
+
   const agPortNum = Number(raw.antigravityDedicatedPort);
   let antigravityDedicatedPort =
     Number.isFinite(agPortNum) && agPortNum >= 1024 && agPortNum <= 65535
@@ -204,6 +230,10 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     claudeExePath,
     claudeExclusiveGuard,
     antigravityClashNode,
+    antigravityClashProfileUid,
+    antigravityClashProfileName,
+    antigravityClashNodeRaw,
+    antigravityClashNodeDialerRaw,
     antigravityDedicatedPort,
     antigravityExePath,
   };
