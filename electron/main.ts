@@ -366,8 +366,10 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     ? `${state.lastProbe.countryName} (${state.lastProbe.countryCode}) · ${state.lastProbe.ip}`
     : state.lastError || '检测中...';
 
+  const profilePrefix =
+    state.config.selectedClashProfileName || state.clashInfo.boundProfileName;
   const nodeText = state.config.selectedClashNode
-    ? `指定节点: ${state.config.selectedClashNode}`
+    ? `指定节点: ${profilePrefix ? `${profilePrefix} / ` : ''}${state.config.selectedClashNode}`
     : state.clashInfo.connected
     ? `Clash全局: ${state.clashInfo.activeNode || state.clashInfo.mode}`
     : '未指定节点';
@@ -550,8 +552,10 @@ function registerIpcHandlers(): void {
     );
   });
 
-  ipcMain.handle('guard:select-clash-node', (_e, nodeName: string | null) =>
-    probeEngine.selectClashNode(nodeName)
+  ipcMain.handle(
+    'guard:select-clash-node',
+    (_e, nodeName: string | null, profileUid?: string | null) =>
+      probeEngine.selectClashNode(nodeName, profileUid)
   );
 
   ipcMain.handle('guard:launch-claude', () => probeEngine.launchClaudeFromGuard());
@@ -593,9 +597,13 @@ function registerIpcHandlers(): void {
 
     if (
       prevCfg.selectedClashNode !== nextCfg.selectedClashNode ||
+      prevCfg.selectedClashProfileUid !== nextCfg.selectedClashProfileUid ||
       prevCfg.dedicatedProxyPort !== nextCfg.dedicatedProxyPort
     ) {
-      return probeEngine.selectClashNode(nextCfg.selectedClashNode);
+      return probeEngine.selectClashNode(
+        nextCfg.selectedClashNode,
+        nextCfg.selectedClashProfileUid
+      );
     }
 
     const proxyCfgChanged =

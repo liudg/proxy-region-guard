@@ -169,7 +169,14 @@ export class ProbeEngine extends EventEmitter {
     this.lastSysProxySnapshot = `${sys.enabled}|${sys.proxyUrl || ''}`;
     this.lastNetFingerprint = getNetworkInterfaceFingerprint();
 
-    this.clashMonitor.start(cfg.selectedClashNode, cfg.dedicatedProxyPort);
+    this.clashMonitor.start(
+      cfg.selectedClashNode,
+      cfg.dedicatedProxyPort,
+      cfg.selectedClashProfileUid,
+      cfg.selectedClashProfileName,
+      cfg.selectedClashNodeRaw || null,
+      cfg.selectedClashNodeDialerRaw || null
+    );
     this.startLocalEnvironmentWatcher();
     this.startClaudeExclusiveWatcher();
     this.restartHeartbeatTimer();
@@ -247,16 +254,27 @@ export class ProbeEngine extends EventEmitter {
   }
 
   /**
-   * 切换下拉框中指定的 Clash 节点：
-   * 1. 在 Mihomo 中将独立专属端口绑定到该节点（及进程规则锁死）
+   * 切换下拉框中指定的 Clash 节点（支持跨订阅组选择任意具体节点）：
+   * 1. 在 Mihomo 中将该节点的完整配置及独立专属端口动态注入（及进程规则锁死）
    * 2. 立即通过该专属通道探测真实出口 IP 与国家，并与系统时区/区域对比
    */
-  public async selectClashNode(nodeName: string | null): Promise<AppStateSnapshot> {
+  public async selectClashNode(
+    nodeName: string | null,
+    profileUid?: string | null
+  ): Promise<AppStateSnapshot> {
     const cleanNode = nodeName && nodeName.trim() ? nodeName.trim() : null;
-    const prevNode = this.configStore.get().selectedClashNode;
-    const cfg = this.configStore.update({ selectedClashNode: cleanNode });
+    const prevCfg = this.configStore.get();
+    const effectiveProfileUid =
+      profileUid !== undefined
+        ? profileUid && profileUid.trim()
+          ? profileUid.trim()
+          : null
+        : prevCfg.selectedClashProfileUid;
 
-    if (prevNode !== cleanNode) {
+    if (
+      prevCfg.selectedClashNode !== cleanNode ||
+      prevCfg.selectedClashProfileUid !== effectiveProfileUid
+    ) {
       this.lastProbe = null;
       this.lastError = null;
     }
@@ -265,18 +283,33 @@ export class ProbeEngine extends EventEmitter {
       this.addLog('info', `正在将专属代理通道切换至 Clash 节点：[${cleanNode}]...`);
       const bindRes = await this.clashMonitor.configureDedicatedNode(
         cleanNode,
-        cfg.dedicatedProxyPort
+        prevCfg.dedicatedProxyPort,
+        effectiveProfileUid,
+        true
       );
+
+      const cfg = this.configStore.update({
+        selectedClashNode: cleanNode,
+        selectedClashProfileUid: bindRes.profileUid ?? effectiveProfileUid,
+        selectedClashProfileName: bindRes.profileName ?? prevCfg.selectedClashProfileName,
+        selectedClashNodeRaw: bindRes.nodeRaw ?? prevCfg.selectedClashNodeRaw,
+        selectedClashNodeDialerRaw: bindRes.dialerRaw ?? prevCfg.selectedClashNodeDialerRaw,
+      });
+
+      const fullLabel = cfg.selectedClashProfileName
+        ? `${cfg.selectedClashProfileName} / ${cleanNode}`
+        : cleanNode;
+
       if (!bindRes.ok) {
-        this.addLog('warn', bindRes.error || `绑定节点 [${cleanNode}] 失败`);
+        this.addLog('warn', bindRes.error || `绑定节点 [${fullLabel}] 失败`);
       } else {
         this.addLog(
           'success',
-          `已锁定 Clash 专属节点 [${cleanNode}] → 本地专属端口 127.0.0.1:${cfg.dedicatedProxyPort}`
+          `已锁定 Clash 跨订阅专属节点 [${fullLabel}] → 本地专属端口 127.0.0.1:${cfg.dedicatedProxyPort}`
         );
       }
 
-      const snap = await this.checkNow(`切换指定 Clash 节点: ${cleanNode}`);
+      const snap = await this.checkNow(`切换指定 Clash 节点: ${fullLabel}`);
 
       // 仅当用户尚未设置默认保护地区时，首次选定节点后自动初始化默认保护地区；
       // 若已锁定默认保护地区，绝不随节点切换自动篡改，从而保留对所选节点真实出口的防呆校验能力
@@ -295,7 +328,14 @@ export class ProbeEngine extends EventEmitter {
       }
       return snap;
     } else {
-      await this.clashMonitor.configureDedicatedNode(null, cfg.dedicatedProxyPort);
+      const cfg = this.configStore.update({
+        selectedClashNode: null,
+        selectedClashProfileUid: null,
+        selectedClashProfileName: null,
+        selectedClashNodeRaw: null,
+        selectedClashNodeDialerRaw: null,
+      });
+      await this.clashMonitor.configureDedicatedNode(null, cfg.dedicatedProxyPort, null, true);
       this.addLog('info', '已取消指定 Clash 节点，恢复自动识别系统全局出口');
       return this.checkNow('取消指定 Clash 节点');
     }
@@ -306,7 +346,7 @@ export class ProbeEngine extends EventEmitter {
    * 启动前实时强校验：[指定 Clash 节点真实出口地区] == [Windows 系统区域] == [Windows 系统时区]
    */
   public async launchClaudeFromGuard(): Promise<ClaudeLaunchResult> {
-    const cfg = this.configStore.get();
+    let cfg = this.configStore.get();
 
     // 1. 确认 Claude Desktop 安装路径
     const install = await detectClaudeInstallation(cfg.claudeExePath);
@@ -317,8 +357,18 @@ export class ProbeEngine extends EventEmitter {
     if (cfg.selectedClashNode) {
       const bindRes = await this.clashMonitor.configureDedicatedNode(
         cfg.selectedClashNode,
-        cfg.dedicatedProxyPort
+        cfg.dedicatedProxyPort,
+        cfg.selectedClashProfileUid,
+        false
       );
+      if (bindRes.nodeRaw && !cfg.selectedClashNodeRaw) {
+        cfg = this.configStore.update({
+          selectedClashProfileUid: bindRes.profileUid ?? cfg.selectedClashProfileUid,
+          selectedClashProfileName: bindRes.profileName ?? cfg.selectedClashProfileName,
+          selectedClashNodeRaw: bindRes.nodeRaw,
+          selectedClashNodeDialerRaw: bindRes.dialerRaw ?? null,
+        });
+      }
       if (!bindRes.ok || !bindRes.listening) {
         const msg = `启动被拦截：无法建立节点 [${cfg.selectedClashNode}] 的专属代理端口 (${
           bindRes.error || '端口未监听'
@@ -395,7 +445,10 @@ export class ProbeEngine extends EventEmitter {
       this.claudeSeenRunningSinceAuth = true;
     }
 
-    const okMsg = `三重校验通过！已通过专属节点 [${cfg.selectedClashNode}] (127.0.0.1:${cfg.dedicatedProxyPort} · ${proxyCountryName}) 安全启动 Claude`;
+    const fullNodeLabel = cfg.selectedClashProfileName
+      ? `${cfg.selectedClashProfileName} / ${cfg.selectedClashNode}`
+      : cfg.selectedClashNode;
+    const okMsg = `三重校验通过！已通过专属节点 [${fullNodeLabel}] (127.0.0.1:${cfg.dedicatedProxyPort} · ${proxyCountryName}) 安全启动 Claude`;
     this.addLog('success', okMsg);
     this.evaluateStatusOnly();
     return {
@@ -448,6 +501,7 @@ export class ProbeEngine extends EventEmitter {
    * 1. 严防任何未通过本卫士【Claude 专栏】启动的外部 Claude 进程（唯一启动入口硬性保障）
    * 2. 当 Claude 退出后自动回收 `claudeAuthorizedSession`，确保下次仍须从专栏启动
    * 3. 当 Claude 运行期间出现「指定代理 vs 系统时区/区域」不一致或断连时，毫秒级强杀
+   *    （若因 Clash 切换订阅组导致专属端口瞬时重载，自动触发跨订阅节点重绑自愈，绝不误杀 Claude）
    */
   private startClaudeExclusiveWatcher(): void {
     this.claudeWatchTimer = setInterval(async () => {
@@ -470,7 +524,10 @@ export class ProbeEngine extends EventEmitter {
           // 用户已关闭 Claude，立即回收唯一入口会话授权锁，并连带清理残留的 cowork-svc.exe 等后台进程
           this.unsetClaudeAuthLock();
           await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
-          this.addLog('info', '检测到 Claude 已退出，已自动清理关联后台进程并回收启动授权锁（下次需从专栏启动）');
+          this.addLog(
+            'info',
+            '检测到 Claude 已退出，已自动清理关联后台进程并回收启动授权锁（下次需从专栏启动）'
+          );
           this.emitState();
           return;
         }
@@ -506,9 +563,26 @@ export class ProbeEngine extends EventEmitter {
 
         // 拦截 2：无论是否开启唯一启动入口，只要 Claude 在运行，一旦出现「代理地区 ↔ 系统时区/区域」不一致或断连，立即剥夺授权并强杀！
         if (proc.running && this.status !== 'checking') {
-          const check = this.evaluateClaudeSafety(
+          let check = this.evaluateClaudeSafety(
             this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
           );
+
+          // 若因 Clash 切换订阅组导致专属端口短暂重绑，立即尝试自动重绑并复核，成功则无缝保持 Claude 运行
+          if (!check.safe && check.alertType === 'disconnect' && cfg.selectedClashNode) {
+            const healRes = await this.clashMonitor.configureDedicatedNode(
+              cfg.selectedClashNode,
+              cfg.dedicatedProxyPort,
+              cfg.selectedClashProfileUid,
+              true
+            );
+            if (healRes.listening) {
+              await this.checkNow('Clash 订阅切换后专属通道自愈复核');
+              check = this.evaluateClaudeSafety(
+                this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
+              );
+            }
+          }
+
           if (!check.safe) {
             this.unsetClaudeAuthLock();
 
@@ -531,7 +605,8 @@ export class ProbeEngine extends EventEmitter {
                 expectedCode,
                 expectedName,
                 triggerReason: check.reason,
-                errorDetail: check.alertType === 'disconnect' ? this.lastError || undefined : undefined,
+                errorDetail:
+                  check.alertType === 'disconnect' ? this.lastError || undefined : undefined,
                 killedProcesses: report.killedCount > 0 ? report.killedSummary : undefined,
                 killError: report.errorDetail,
               });
@@ -652,9 +727,9 @@ export class ProbeEngine extends EventEmitter {
     if (!this.claudeDetectedExe) {
       launchBlockReason = '未检测到 Claude Desktop 安装路径，请手动指定 Claude.exe';
     } else if (!cfg.selectedClashNode) {
-      launchBlockReason = '请先在下方下拉框中选择要绑定的 Clash Verge 代理节点';
+      launchBlockReason = '请先在下方选择要绑定的 Clash Verge Rev 代理节点';
     } else if (!clash.connected) {
-      launchBlockReason = '未连接到 Clash Verge 控制接口，请确认 Clash Verge 已启动';
+      launchBlockReason = '未连接到 Clash Verge Rev 控制接口，请确认 Clash Verge 已启动';
     } else if (!clash.dedicatedPortListening) {
       launchBlockReason = `节点 [${cfg.selectedClashNode}] 专属端口 (127.0.0.1:${cfg.dedicatedProxyPort}) 尚未就绪`;
     } else if (this.isChecking && !this.lastProbe && !this.lastError) {
@@ -826,7 +901,6 @@ export class ProbeEngine extends EventEmitter {
         this.emitState();
         return this.getSnapshot();
       } else if (!localeMatchedWithProbe) {
-        // 方案 B 核心校验：指定的代理出口地区与当前 Windows 时区/区域对比，不一致即判定为异常 (mismatch)
         this.status = 'mismatch';
         void this.handleLocaleMismatchTransition(reason || '系统时区或区域变更');
         this.emitState();
@@ -862,17 +936,18 @@ export class ProbeEngine extends EventEmitter {
     this.emitState();
 
     try {
-      const channel = await this.resolveProxyChannel();
+      let channel = await this.resolveProxyChannel();
       const endpoints = this.buildEndpointsList();
 
-      let probeSuccess: ProbeResult | null = null;
-      let lastErrMsg = channel.errorHint || '所有回显探测源均不可达';
-
-      if (!channel.errorHint) {
+      const tryProbeOnce = async (
+        proxyUrl: string | null,
+        viaDesc: string
+      ): Promise<{ result: ProbeResult | null; errMsg: string }> => {
+        let errOut = '所有回显探测源均不可达';
         for (const ep of endpoints) {
           try {
             const startedAt = Date.now();
-            const rawBody = await requestTextViaProxy(ep.url, channel.proxyUrl, 6000);
+            const rawBody = await requestTextViaProxy(ep.url, proxyUrl, 6000);
             const latencyMs = Date.now() - startedAt;
 
             const parsed = parseTraceResponse(rawBody, ep.format);
@@ -881,23 +956,59 @@ export class ProbeEngine extends EventEmitter {
             }
 
             const geo = this.geoIp.lookup(parsed.ip, parsed.loc);
-            probeSuccess = {
-              ip: parsed.ip,
-              countryCode: geo.countryCode,
-              countryName: geo.countryName,
-              edgeLoc: parsed.loc,
-              viaChannel: channel.description,
-              latencyMs,
-              checkedAt: Date.now(),
+            return {
+              result: {
+                ip: parsed.ip,
+                countryCode: geo.countryCode,
+                countryName: geo.countryName,
+                edgeLoc: parsed.loc,
+                viaChannel: viaDesc,
+                latencyMs,
+                checkedAt: Date.now(),
+              },
+              errMsg: '',
             };
-            break;
           } catch (err) {
-            lastErrMsg = err instanceof Error ? err.message : String(err);
+            errOut = err instanceof Error ? err.message : String(err);
           }
+        }
+        return { result: null, errMsg: errOut };
+      };
+
+      let probeSuccess: ProbeResult | null = null;
+      let lastErrMsg = channel.errorHint || '所有回显探测源均不可达';
+
+      if (!channel.errorHint) {
+        const firstTry = await tryProbeOnce(channel.proxyUrl, channel.description);
+        probeSuccess = firstTry.result;
+        if (!probeSuccess) {
+          lastErrMsg = firstTry.errMsg;
         }
       }
 
       const cfg = this.configStore.get();
+
+      // 若指定了 Clash 专属节点，且探测恰好撞上 Clash Verge 切换订阅组导致瞬时闪断，
+      // 自动执行一次跨订阅节点强制重绑并重试探测，确保持续守护不误判为断连
+      if (!probeSuccess && cfg.selectedClashNode) {
+        await sleep(320);
+        const rebindRes = await this.clashMonitor.configureDedicatedNode(
+          cfg.selectedClashNode,
+          cfg.dedicatedProxyPort,
+          cfg.selectedClashProfileUid,
+          true
+        );
+        if (rebindRes.ok && rebindRes.listening) {
+          channel = await this.resolveProxyChannel();
+          if (!channel.errorHint) {
+            const retryRes = await tryProbeOnce(channel.proxyUrl, channel.description);
+            probeSuccess = retryRes.result;
+            if (!probeSuccess) {
+              lastErrMsg = retryRes.errMsg;
+            }
+          }
+        }
+      }
 
       if (probeSuccess) {
         const prevIp = this.lastProbe?.ip;
@@ -1465,6 +1576,12 @@ export class ProbeEngine extends EventEmitter {
 
     const clash = this.clashMonitor.getRuntimeInfo();
     const isDisconnect = opts.alertType === 'disconnect';
+    const selectedFullLabel = cfg.selectedClashNode
+      ? cfg.selectedClashProfileName
+        ? `${cfg.selectedClashProfileName} / ${cfg.selectedClashNode}`
+        : cfg.selectedClashNode
+      : null;
+
     const payload: AlertPayload = {
       alertType: opts.alertType,
       expectedCode: opts.expectedCode,
@@ -1474,7 +1591,7 @@ export class ProbeEngine extends EventEmitter {
       actualIp: isDisconnect ? null : this.lastProbe?.ip || null,
       edgeLoc: this.lastProbe?.edgeLoc,
       viaChannel: this.lastProbe?.viaChannel,
-      activeNode: cfg.selectedClashNode || (clash.connected ? clash.activeNode : null),
+      activeNode: selectedFullLabel || (clash.connected ? clash.activeNode : null),
       triggerReason: opts.triggerReason,
       errorDetail: opts.errorDetail,
       killedProcesses: opts.killedProcesses,
@@ -1532,30 +1649,48 @@ export class ProbeEngine extends EventEmitter {
     description: string;
     errorHint?: string;
   }> {
-    const cfg = this.configStore.get();
+    let cfg = this.configStore.get();
 
     if (cfg.selectedClashNode) {
       let clash = this.clashMonitor.getRuntimeInfo();
       if (!clash.connected || !clash.dedicatedPortListening) {
         const bindRes = await this.clashMonitor.configureDedicatedNode(
           cfg.selectedClashNode,
-          cfg.dedicatedProxyPort
+          cfg.dedicatedProxyPort,
+          cfg.selectedClashProfileUid,
+          false
         );
+        if (bindRes.nodeRaw && !cfg.selectedClashNodeRaw) {
+          cfg = this.configStore.update({
+            selectedClashProfileUid: bindRes.profileUid ?? cfg.selectedClashProfileUid,
+            selectedClashProfileName: bindRes.profileName ?? cfg.selectedClashProfileName,
+            selectedClashNodeRaw: bindRes.nodeRaw,
+            selectedClashNodeDialerRaw: bindRes.dialerRaw ?? null,
+          });
+        }
         clash = this.clashMonitor.getRuntimeInfo();
+        const label = cfg.selectedClashProfileName
+          ? `${cfg.selectedClashProfileName} / ${cfg.selectedClashNode}`
+          : cfg.selectedClashNode;
         if (!bindRes.ok || !bindRes.listening) {
           return {
             proxyUrl: `http://127.0.0.1:${cfg.dedicatedProxyPort}`,
-            description: `指定节点 [${cfg.selectedClashNode}] (127.0.0.1:${cfg.dedicatedProxyPort})`,
+            description: `指定节点 [${label}] (127.0.0.1:${cfg.dedicatedProxyPort})`,
             errorHint:
               bindRes.error ||
-              `无法绑定指定节点 [${cfg.selectedClashNode}] 的专属代理端口 (127.0.0.1:${cfg.dedicatedProxyPort})`,
+              `无法绑定指定节点 [${label}] 的专属代理端口 (127.0.0.1:${cfg.dedicatedProxyPort})`,
           };
         }
       }
 
+      const label =
+        cfg.selectedClashProfileName || clash.boundProfileName
+          ? `${cfg.selectedClashProfileName || clash.boundProfileName} / ${cfg.selectedClashNode}`
+          : cfg.selectedClashNode;
+
       return {
         proxyUrl: `http://127.0.0.1:${cfg.dedicatedProxyPort}`,
-        description: `指定节点 [${cfg.selectedClashNode}] (127.0.0.1:${cfg.dedicatedProxyPort})`,
+        description: `指定节点 [${label}] (127.0.0.1:${cfg.dedicatedProxyPort})`,
       };
     }
 
