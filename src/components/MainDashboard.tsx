@@ -22,6 +22,7 @@ import {
   RefreshCw,
   Rocket,
   RotateCcw,
+  Search,
   Settings,
   Shield,
   ShieldAlert,
@@ -47,12 +48,39 @@ import { CountryFlag } from './CountryFlag';
 type ActiveTab = 'launcher' | 'monitor' | 'guard' | 'settings' | 'logs';
 type LauncherSubTab = 'antigravity' | 'claude';
 
+const NODE_KEY_SEP = ':::';
+
+function encodeNodeSelectionKey(profileUid: string | null | undefined, nodeName: string): string {
+  return `${profileUid || ''}:::`.concat(nodeName);
+}
+
+function decodeNodeSelectionKey(rawValue: string): {
+  profileUid: string | null;
+  nodeName: string | null;
+} {
+  const trimmed = rawValue.trim();
+  if (!trimmed) {
+    return { profileUid: null, nodeName: null };
+  }
+  const idx = trimmed.indexOf(NODE_KEY_SEP);
+  if (idx < 0) {
+    return { profileUid: null, nodeName: trimmed };
+  }
+  const profileUid = trimmed.slice(0, idx).trim() || null;
+  const nodeName = trimmed.slice(idx + NODE_KEY_SEP.length).trim() || null;
+  return { profileUid, nodeName };
+}
+
 export const MainDashboard: React.FC = () => {
   const [state, setState] = useState<AppStateSnapshot | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>('launcher');
   const [launcherSubTab, setLauncherSubTab] = useState<LauncherSubTab>('antigravity');
   const [copiedIp, setCopiedIp] = useState(false);
   const [copiedAgIp, setCopiedAgIp] = useState(false);
+
+  // 订阅组筛选与节点关键字搜索
+  const [selectedProfileFilter, setSelectedProfileFilter] = useState<string>('__all__');
+  const [nodeSearchQuery, setNodeSearchQuery] = useState<string>('');
 
   // 手动代理表单本地编辑态
   const [pendingManualMode, setPendingManualMode] = useState(false);
@@ -152,11 +180,11 @@ export const MainDashboard: React.FC = () => {
     setTimeout(() => setCopiedAgIp(false), 1600);
   };
 
-  const handleSelectClashNode = async (nodeName: string) => {
-    const val = nodeName.trim() || null;
+  const handleSelectClashNodeValue = async (encodedValue: string) => {
+    const { profileUid, nodeName } = decodeNodeSelectionKey(encodedValue);
     setIsSwitchingNode(true);
     try {
-      const next = await window.guardAPI.selectClashNode(val);
+      const next = await window.guardAPI.selectClashNode(nodeName, profileUid);
       setState(next);
     } finally {
       setIsSwitchingNode(false);
@@ -448,10 +476,57 @@ export const MainDashboard: React.FC = () => {
   const concreteNodes = clashInfo.availableNodes.filter((n) => !n.isGroup);
   const groupNodes = clashInfo.availableNodes.filter((n) => n.isGroup);
 
-  const isSelectedNodeMissing = Boolean(
+  // 解析当前选中节点在下拉框中的编码值与归属订阅组
+  const profileGroups = clashInfo.profileGroups || [];
+  const matchedNodeInGroups = config.selectedClashNode
+    ? clashInfo.availableNodes.find(
+        (n) =>
+          n.name === config.selectedClashNode &&
+          (!config.selectedClashProfileUid || n.profileUid === config.selectedClashProfileUid)
+      ) || clashInfo.availableNodes.find((n) => n.name === config.selectedClashNode)
+    : undefined;
+
+  const effectiveSelectedProfileUid =
+    config.selectedClashProfileUid ||
+    matchedNodeInGroups?.profileUid ||
+    clashInfo.boundProfileUid ||
+    null;
+
+  const effectiveSelectedProfileName =
+    config.selectedClashProfileName ||
+    matchedNodeInGroups?.profileName ||
+    clashInfo.boundProfileName ||
+    null;
+
+  const currentSelectEncodedValue = config.selectedClashNode
+    ? encodeNodeSelectionKey(effectiveSelectedProfileUid, config.selectedClashNode)
+    : '';
+
+  const isSelectedNodeMissingFromAll = Boolean(
+    config.selectedClashNode && !matchedNodeInGroups
+  );
+
+  const searchLower = nodeSearchQuery.trim().toLowerCase();
+  const visibleProfileGroups = profileGroups
+    .filter((g) => selectedProfileFilter === '__all__' || g.uid === selectedProfileFilter)
+    .map((g) => ({
+      ...g,
+      filteredNodes: g.nodes.filter((n) => {
+        if (!searchLower) return true;
+        return (
+          n.name.toLowerCase().includes(searchLower) ||
+          n.type.toLowerCase().includes(searchLower) ||
+          g.name.toLowerCase().includes(searchLower)
+        );
+      }),
+    }))
+    .filter((g) => g.filteredNodes.length > 0);
+
+  const isCrossProfileBound = Boolean(
     config.selectedClashNode &&
-      clashInfo.connected &&
-      !clashInfo.availableNodes.some((n) => n.name === config.selectedClashNode)
+      effectiveSelectedProfileUid &&
+      clashInfo.activeProfileUid &&
+      effectiveSelectedProfileUid !== clashInfo.activeProfileUid
   );
 
   const isAgSelectedNodeMissing = Boolean(
@@ -483,50 +558,118 @@ export const MainDashboard: React.FC = () => {
 
   const renderClashNodeSelector = () => (
     <div className="clash-node-selector-wrap">
+      {/* 第一行：订阅组自由切换筛选 + 关键字即时搜索 */}
+      {profileGroups.length > 0 && (
+        <div className="node-filter-bar">
+          <select
+            className="profile-filter-select"
+            value={
+              selectedProfileFilter === '__all__' ||
+              profileGroups.some((g) => g.uid === selectedProfileFilter)
+                ? selectedProfileFilter
+                : '__all__'
+            }
+            onChange={(e) => setSelectedProfileFilter(e.target.value)}
+            title="按 Clash Verge 订阅组筛选节点（支持自由选择未激活的订阅组）"
+          >
+            <option value="__all__">
+              📚 全部订阅组 ({profileGroups.length} 个订阅 · {clashInfo.availableNodes.length} 个节点)
+            </option>
+            {profileGroups.map((g) => (
+              <option key={g.uid} value={g.uid}>
+                {g.isActive ? '🟢 [当前激活] ' : '📦 '}
+                {g.name} ({g.nodeCount} 个节点)
+              </option>
+            ))}
+          </select>
+
+          <div className="node-search-box">
+            <Search size={13} className="node-search-icon" />
+            <input
+              type="text"
+              className="node-search-input"
+              value={nodeSearchQuery}
+              onChange={(e) => setNodeSearchQuery(e.target.value)}
+              placeholder="搜索节点 (如: 美国 / US)..."
+            />
+            {nodeSearchQuery && (
+              <button
+                className="node-search-clear"
+                onClick={() => setNodeSearchQuery('')}
+                title="清空搜索"
+              >
+                <X size={12} />
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      {/* 第二行：跨订阅具体落地节点选择下拉框 */}
       <div className="node-selector-row">
         <select
           className="clash-node-select"
-          value={config.selectedClashNode || ''}
-          disabled={isSwitchingNode || (!clashInfo.connected && !config.selectedClashNode)}
-          onChange={(e) => void handleSelectClashNode(e.target.value)}
+          value={currentSelectEncodedValue}
+          disabled={
+            isSwitchingNode ||
+            (clashInfo.availableNodes.length === 0 && !config.selectedClashNode)
+          }
+          onChange={(e) => void handleSelectClashNodeValue(e.target.value)}
         >
           <option value="">
-            {clashInfo.connected
-              ? '请选择要为 Claude 强制绑定的 Clash 节点...'
-              : '未连接 Clash Verge 控制接口...'}
+            {clashInfo.availableNodes.length > 0
+              ? '请选择要锁定的具体落地节点（支持任意订阅组）...'
+              : clashInfo.connected
+              ? '未扫描到可用具体节点...'
+              : '未连接 Clash Verge Rev 控制接口...'}
           </option>
-          {isSelectedNodeMissing && config.selectedClashNode && (
-            <option value={config.selectedClashNode}>
-              ⚠️ {config.selectedClashNode} (当前配置中不存在)
+
+          {isSelectedNodeMissingFromAll && config.selectedClashNode && (
+            <option value={currentSelectEncodedValue}>
+              🔒 {effectiveSelectedProfileName ? `[${effectiveSelectedProfileName}] ` : ''}
+              {config.selectedClashNode} (已缓存节点定义)
             </option>
           )}
-          {concreteNodes.length > 0 && (
-            <optgroup label={`🚀 具体落地节点 (${concreteNodes.length} 个)`}>
-              {concreteNodes.map((n) => (
-                <option key={n.name} value={n.name}>
-                  {n.name} [{n.type}
-                  {n.delay ? ` · ${n.delay}ms` : ''}]
-                </option>
-              ))}
+
+          { !isSelectedNodeMissingFromAll &&
+            config.selectedClashNode &&
+            !visibleProfileGroups.some((g) =>
+              g.filteredNodes.some(
+                (n) =>
+                  encodeNodeSelectionKey(n.profileUid, n.name) === currentSelectEncodedValue
+              )
+            ) && (
+              <option value={currentSelectEncodedValue}>
+                🎯 当前已选：{effectiveSelectedProfileName ? `[${effectiveSelectedProfileName}] ` : ''}
+                {config.selectedClashNode}
+              </option>
+            )}
+
+          {visibleProfileGroups.map((group) => (
+            <optgroup
+              key={group.uid}
+              label={`${
+                group.isActive ? '🟢 [Clash当前激活] ' : '📦 [独立订阅组] '
+              }${group.name} (${group.filteredNodes.length} 个节点)`}
+            >
+              {group.filteredNodes.map((n) => {
+                const encoded = encodeNodeSelectionKey(group.uid, n.name);
+                return (
+                  <option key={encoded} value={encoded}>
+                    {n.name} [{n.type.toUpperCase()}
+                    {n.delay ? ` · ${n.delay}ms` : ''}]
+                  </option>
+                );
+              })}
             </optgroup>
-          )}
-          {groupNodes.length > 0 && (
-            <optgroup label={`📁 策略组 (${groupNodes.length} 个)`}>
-              {groupNodes.map((g) => (
-                <option key={g.name} value={g.name}>
-                  {g.name} ({g.type}
-                  {g.now ? ` → ${g.now}` : ''})
-                </option>
-              ))}
-            </optgroup>
-          )}
+          ))}
         </select>
 
         {config.selectedClashNode && (
           <button
             className="btn-clear-node"
             disabled={isSwitchingNode}
-            onClick={() => void handleSelectClashNode('')}
+            onClick={() => void handleSelectClashNodeValue('')}
             title="取消固定节点绑定，恢复跟随系统代理"
           >
             <X size={14} />
@@ -534,23 +677,46 @@ export const MainDashboard: React.FC = () => {
         )}
       </div>
 
+      {/* 第三行：专属端口监听状态 & 跨订阅隔离提示 */}
       {config.selectedClashNode && (
-        <div className="dedicated-port-status">
-          <span
-            className={`port-dot ${
-              clashInfo.dedicatedPortListening ? 'listening' : 'not-listening'
-            }`}
-          />
-          <span>
-            专属本地端口：<code>127.0.0.1:{config.dedicatedProxyPort}</code>
-          </span>
-          <span className="port-bind-tag">
-            {isSwitchingNode
-              ? '正在绑定节点...'
-              : clashInfo.dedicatedPortListening
-              ? `已锁定直通 [${config.selectedClashNode}]`
-              : '端口未就绪'}
-          </span>
+        <div className="dedicated-port-status-group">
+          <div className="dedicated-port-status">
+            <span
+              className={`port-dot ${
+                clashInfo.dedicatedPortListening ? 'listening' : 'not-listening'
+              }`}
+            />
+            <span>
+              专属端口：<code>127.0.0.1:{config.dedicatedProxyPort}</code>
+            </span>
+            <span
+              className="port-bind-tag"
+              title={
+                effectiveSelectedProfileName
+                  ? `${effectiveSelectedProfileName} / ${config.selectedClashNode}`
+                  : config.selectedClashNode
+              }
+            >
+              {isSwitchingNode
+                ? '正在注入并绑定节点...'
+                : clashInfo.dedicatedPortListening
+                ? `已锁定 [${
+                    effectiveSelectedProfileName ? `${effectiveSelectedProfileName} / ` : ''
+                  }${config.selectedClashNode}]`
+                : '端口未就绪'}
+            </span>
+          </div>
+
+          <div className={`cross-profile-isolation-tip ${isCrossProfileBound ? 'cross-active' : ''}`}>
+            <ShieldCheck size={13} />
+            <span>
+              {isCrossProfileBound
+                ? `跨订阅独立直通中：Clash 当前激活 [${
+                    clashInfo.activeProfileName || '其他订阅'
+                  }]，Claude 独立固定走 [${effectiveSelectedProfileName}]，切换订阅或节点互不影响`
+                : '节点底层配置已独立注入内核：后续在 Clash 切换任意订阅组或节点均不会影响 Claude'}
+            </span>
+          </div>
         </div>
       )}
     </div>
@@ -577,25 +743,45 @@ export const MainDashboard: React.FC = () => {
               ⚠️ {config.antigravityClashNode} (当前配置中不存在)
             </option>
           )}
-          {concreteNodes.length > 0 && (
-            <optgroup label={`🚀 具体落地节点 (${concreteNodes.length} 个)`}>
-              {concreteNodes.map((n) => (
-                <option key={n.name} value={n.name}>
-                  {n.name} [{n.type}
-                  {n.delay ? ` · ${n.delay}ms` : ''}]
-                </option>
-              ))}
-            </optgroup>
-          )}
-          {groupNodes.length > 0 && (
-            <optgroup label={`📁 策略组 (${groupNodes.length} 个)`}>
-              {groupNodes.map((g) => (
-                <option key={g.name} value={g.name}>
-                  {g.name} ({g.type}
-                  {g.now ? ` → ${g.now}` : ''})
-                </option>
-              ))}
-            </optgroup>
+          {profileGroups.length > 0 ? (
+            profileGroups.map((group) => (
+              <optgroup
+                key={group.uid}
+                label={`${
+                  group.isActive ? '🟢 [Clash当前激活] ' : '📦 [独立订阅组] '
+                }${group.name} (${group.nodes.length} 个节点)`}
+              >
+                {group.nodes.map((n) => (
+                  <option key={`${group.uid}::${n.name}`} value={n.name}>
+                    {n.name} [{n.type.toUpperCase()}
+                    {n.delay ? ` · ${n.delay}ms` : ''}]
+                  </option>
+                ))}
+              </optgroup>
+            ))
+          ) : (
+            <>
+              {concreteNodes.length > 0 && (
+                <optgroup label={`🚀 具体落地节点 (${concreteNodes.length} 个)`}>
+                  {concreteNodes.map((n, idx) => (
+                    <option key={`${n.profileUid || idx}::${n.name}`} value={n.name}>
+                      {n.name} [{n.type}
+                      {n.delay ? ` · ${n.delay}ms` : ''}]
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+              {groupNodes.length > 0 && (
+                <optgroup label={`📁 策略组 (${groupNodes.length} 个)`}>
+                  {groupNodes.map((g, idx) => (
+                    <option key={`${g.profileUid || idx}::${g.name}`} value={g.name}>
+                      {g.name} ({g.type}
+                      {g.now ? ` → ${g.now}` : ''})
+                    </option>
+                  ))}
+                </optgroup>
+              )}
+            </>
           )}
         </select>
 
@@ -1369,7 +1555,7 @@ export const MainDashboard: React.FC = () => {
                   )}
                 </section>
 
-                {/* 2. Clash Verge 专属节点选择卡片 */}
+                {/* 2. Clash Verge Rev 全订阅组专属节点选择卡片 */}
                 <section className="panel-card">
                   <div className="panel-card-header">
                     <div className="panel-title">
@@ -1377,7 +1563,7 @@ export const MainDashboard: React.FC = () => {
                         size={15}
                         className={clashInfo.connected ? 'pulse-green' : ''}
                       />
-                      <span>指定 Clash Verge 专属代理节点</span>
+                      <span>指定 Clash 专属代理节点（支持跨订阅组）</span>
                     </div>
                     <span
                       className={`mini-badge ${
@@ -1385,9 +1571,11 @@ export const MainDashboard: React.FC = () => {
                       }`}
                     >
                       {clashInfo.connected
-                        ? `${clashInfo.source} · ${clashInfo.mode.toUpperCase()}${
-                            clashInfo.mixedPort ? ` (${clashInfo.mixedPort})` : ''
-                          }`
+                        ? `${
+                            clashInfo.activeProfileName
+                              ? `当前订阅: ${clashInfo.activeProfileName}`
+                              : clashInfo.source
+                          } · ${clashInfo.mode.toUpperCase()}`
                         : '未连接 Clash Verge'}
                     </span>
                   </div>

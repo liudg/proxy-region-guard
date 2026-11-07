@@ -32,15 +32,19 @@ export interface AppConfig {
   protectedProcessPatterns: string[];  // 手动输入的进程匹配规则列表（支持通配符如 claude*.exe 与正则）
 
   // Clash 指定代理节点与 Claude 专栏配置
-  selectedClashNode: string | null;    // 下拉选择的指定 Clash 节点名称
-  dedicatedProxyPort: number;          // 为所选节点分配的本地独立专属代理端口（默认 27897）
-  claudeExePath: string;               // 自定义 Claude Desktop 启动路径（留空则自动探测）
-  claudeExclusiveGuard: boolean;       // 唯一入口守护：禁止任何外部途径启动 Claude，不一致立杀
+  selectedClashNode: string | null;        // 选定的指定 Clash 节点名称
+  selectedClashProfileUid: string | null;  // 选定节点所属的 Clash 订阅组 UID（支持跨订阅固定）
+  selectedClashProfileName: string | null; // 选定节点所属的 Clash 订阅组名称
+  selectedClashNodeRaw?: Record<string, unknown> | null;          // 缓存的节点底层完整配置（跨订阅与重启持久化）
+  selectedClashNodeDialerRaw?: Array<Record<string, unknown>> | null; // 缓存的链式前置节点定义
+  dedicatedProxyPort: number;              // 为所选节点分配的本地独立专属代理端口（默认 27897）
+  claudeExePath: string;                   // 自定义 Claude Desktop 启动路径（留空则自动探测）
+  claudeExclusiveGuard: boolean;           // 唯一入口守护：禁止任何外部途径启动 Claude，不一致立杀
 
   // Antigravity 启动器专栏配置（纯代理绑定，无监控/预警/强杀）
-  antigravityClashNode: string | null; // Antigravity 独立指定的 Clash 节点名称
-  antigravityDedicatedPort: number;    // Antigravity 独立专属本地代理端口（默认 27898）
-  antigravityExePath: string;          // 自定义 Antigravity.exe 启动路径（留空则自动探测）
+  antigravityClashNode: string | null;     // Antigravity 独立指定的 Clash 节点名称
+  antigravityDedicatedPort: number;        // Antigravity 独立专属本地代理端口（默认 27898）
+  antigravityExePath: string;              // 自定义 Antigravity.exe 启动路径（留空则自动探测）
 }
 
 export interface WindowsLocaleState {
@@ -54,9 +58,23 @@ export interface ClashProxyNodeOption {
   name: string;
   type: string;
   isGroup: boolean;
+  server?: string;
+  port?: number;
+  profileUid?: string;
+  profileName?: string;
   now?: string;
   delay?: number;
   alive?: boolean;
+}
+
+export interface ClashProfileGroupOption {
+  uid: string;
+  name: string;
+  type: string;          // remote / local / merge / runtime
+  isActive: boolean;     // 是否为当前 Clash Verge 激活的订阅组
+  nodeCount: number;
+  updatedAt?: number;
+  nodes: ClashProxyNodeOption[];
 }
 
 export interface ClashRuntimeInfo {
@@ -65,14 +83,19 @@ export interface ClashRuntimeInfo {
   mode: string;           // rule / global / direct
   mixedPort: number | null;
   activeNode: string | null;
+  activeProfileUid: string | null;
+  activeProfileName: string | null;
   nodeChain: string[];    // 完整节点选择链，如 ["节点选择", "自动选择", "🇺🇸 美国 01"]
-  availableNodes: ClashProxyNodeOption[]; // 从 Clash 读取的可选节点与策略组列表
-  boundNode: string | null;               // 当前 Claude 独立专属端口实际绑定的节点名
-  dedicatedPort: number | null;           // 当前 Claude 独立专属端口（如 27897）
-  dedicatedPortListening: boolean;        // Claude 独立专属端口是否已就绪监听
-  antigravityBoundNode: string | null;    // 当前 Antigravity 独立专属端口实际绑定的节点名
-  antigravityDedicatedPort: number | null;// 当前 Antigravity 独立专属端口（如 27898）
-  antigravityPortListening: boolean;      // Antigravity 独立专属端口是否已就绪监听
+  availableNodes: ClashProxyNodeOption[];   // 汇总的所有可选具体节点列表
+  profileGroups: ClashProfileGroupOption[]; // 按 Clash 订阅组分类的节点列表（含所有未激活订阅）
+  boundNode: string | null;                 // 当前 Claude 独立专属端口实际绑定的节点名
+  boundProfileUid: string | null;           // 当前绑定节点所属的订阅组 UID
+  boundProfileName: string | null;          // 当前绑定节点所属的订阅组名称
+  dedicatedPort: number | null;             // 当前 Claude 独立专属端口（如 27897）
+  dedicatedPortListening: boolean;          // Claude 独立专属端口是否已就绪监听
+  antigravityBoundNode: string | null;      // 当前 Antigravity 独立专属端口实际绑定的节点名
+  antigravityDedicatedPort: number | null;  // 当前 Antigravity 独立专属端口（如 27898）
+  antigravityPortListening: boolean;        // Antigravity 独立专属端口是否已就绪监听
 }
 
 export interface ProbeResult {
@@ -187,7 +210,10 @@ export interface GuardBridgeAPI {
   syncSystemLocaleToDefault: () => Promise<LocaleSyncResult>;
   restoreDefaultChinaLocale: () => Promise<LocaleSyncResult>;
   // Clash 指定节点 & Claude 专栏控制
-  selectClashNode: (nodeName: string | null) => Promise<AppStateSnapshot>;
+  selectClashNode: (
+    nodeName: string | null,
+    profileUid?: string | null
+  ) => Promise<AppStateSnapshot>;
   launchClaude: () => Promise<ClaudeLaunchResult>;
   terminateClaudeNow: () => Promise<ClaudeLaunchResult>;
   browseClaudeExe: () => Promise<AppStateSnapshot>;

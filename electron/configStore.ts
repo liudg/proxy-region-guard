@@ -25,6 +25,10 @@ export const DEFAULT_CONFIG: AppConfig = {
   killOnLocaleMismatch: true,
   protectedProcessPatterns: [],
   selectedClashNode: null,
+  selectedClashProfileUid: null,
+  selectedClashProfileName: null,
+  selectedClashNodeRaw: null,
+  selectedClashNodeDialerRaw: null,
   dedicatedProxyPort: 27897,
   claudeExePath: '',
   claudeExclusiveGuard: true,
@@ -48,6 +52,25 @@ function sanitizePatternList(raw: unknown): string[] {
     }
   }
   return out;
+}
+
+function sanitizeRawProxyObj(raw: unknown): Record<string, unknown> | null {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  if (typeof obj['name'] !== 'string' || typeof obj['type'] !== 'string') return null;
+  return structuredClone(obj);
+}
+
+function sanitizeRawProxyList(raw: unknown): Array<Record<string, unknown>> | null {
+  if (!Array.isArray(raw)) return null;
+  const out: Array<Record<string, unknown>> = [];
+  for (const item of raw) {
+    const clean = sanitizeRawProxyObj(item);
+    if (clean) {
+      out.push(clean);
+    }
+  }
+  return out.length > 0 ? out : null;
 }
 
 function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
@@ -81,6 +104,28 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     typeof raw.selectedClashNode === 'string' && raw.selectedClashNode.trim()
       ? raw.selectedClashNode.trim()
       : null;
+
+  const selectedClashProfileUid =
+    selectedClashNode &&
+    typeof raw.selectedClashProfileUid === 'string' &&
+    raw.selectedClashProfileUid.trim()
+      ? raw.selectedClashProfileUid.trim()
+      : null;
+
+  const selectedClashProfileName =
+    selectedClashNode &&
+    typeof raw.selectedClashProfileName === 'string' &&
+    raw.selectedClashProfileName.trim()
+      ? raw.selectedClashProfileName.trim()
+      : null;
+
+  const selectedClashNodeRaw = selectedClashNode
+    ? sanitizeRawProxyObj(raw.selectedClashNodeRaw)
+    : null;
+
+  const selectedClashNodeDialerRaw = selectedClashNode
+    ? sanitizeRawProxyList(raw.selectedClashNodeDialerRaw)
+    : null;
 
   const dedPortNum = Number(raw.dedicatedProxyPort);
   const dedicatedProxyPort =
@@ -151,6 +196,10 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
         : DEFAULT_CONFIG.killOnLocaleMismatch,
     protectedProcessPatterns: sanitizePatternList(raw.protectedProcessPatterns),
     selectedClashNode,
+    selectedClashProfileUid,
+    selectedClashProfileName,
+    selectedClashNodeRaw,
+    selectedClashNodeDialerRaw,
     dedicatedProxyPort,
     claudeExePath,
     claudeExclusiveGuard,
