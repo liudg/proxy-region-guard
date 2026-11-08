@@ -22,6 +22,7 @@ export interface AppConfig {
   alertPopupEnabled: boolean;
   alertSoundEnabled: boolean;
   alertOnDisconnect: boolean;
+  monitorAlertEnabled: boolean; // 实时监控（Clash选中通道）异常弹窗告警开关
   closeToTray: boolean;
   autoLaunch: boolean;
 
@@ -127,6 +128,9 @@ export interface ClaudeRuntimeState {
   proxyCountryName: string | null;
   winRegionMatched: boolean;
   winTimeZoneMatched: boolean;
+  isProbingNode: boolean;         // 是否正在独立探测所选节点的出口信息
+  nodeProbe: ProbeResult | null;  // 所选节点的独立出口 IP 与国家（与实时监控解耦）
+  nodeProbeError: string | null;  // 节点独立探测失败提示
 }
 
 export interface AntigravityRuntimeState {
@@ -213,13 +217,14 @@ export interface GuardBridgeAPI {
   setDefaultRegion: (code: string | null) => Promise<AppStateSnapshot>;
   updateConfig: (partial: Partial<AppConfig>) => Promise<AppStateSnapshot>;
   clearLogs: () => Promise<AppStateSnapshot>;
-  syncSystemLocaleToDefault: () => Promise<LocaleSyncResult>;
+  syncSystemLocaleToDefault: (targetSource?: 'monitor' | 'claude') => Promise<LocaleSyncResult>;
   restoreDefaultChinaLocale: () => Promise<LocaleSyncResult>;
   // Clash 指定节点 & Claude 专栏控制
   selectClashNode: (
     nodeName: string | null,
     profileUid?: string | null
   ) => Promise<AppStateSnapshot>;
+  probeClaudeNode: (reason?: string) => Promise<AppStateSnapshot>;
   launchClaude: () => Promise<ClaudeLaunchResult>;
   terminateClaudeNow: () => Promise<ClaudeLaunchResult>;
   browseClaudeExe: () => Promise<AppStateSnapshot>;

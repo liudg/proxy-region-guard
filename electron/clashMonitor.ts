@@ -741,56 +741,47 @@ export class ClashMonitor extends EventEmitter {
           antigravityPortListening: antigravityListening,
         };
 
+        if (claudeBoundChanged || prevClaudeListening !== claudeListening) {
+          this.emit('claude-clash-ready');
+        }
         if (agBoundChanged || prevAgListening !== antigravityListening) {
           this.emit('antigravity-clash-ready');
         }
 
-        const displayBoundLabel = this.formatBoundDisplayLabel(claudeSlot);
-
         if (!prevConnected) {
-          if (claudeBoundChanged) {
-            this.emit(
-              'clash-change',
-              claudeListening
-                ? `Clash 已连接并锁定专属节点: ${displayBoundLabel} (127.0.0.1:${claudeSlot.desiredPort})`
-                : `Clash 已连接，但指定节点通道未就绪: ${displayBoundLabel}`
-            );
-          } else {
-            this.emit('clash-status-updated');
-          }
-        } else if (claudeBoundChanged || prevClaudeListening !== claudeListening) {
-          this.emit(
-            'clash-change',
-            claudeListening
-              ? `已绑定专属节点通道: ${displayBoundLabel} (127.0.0.1:${claudeSlot.desiredPort})`
-              : `指定节点通道异常: ${displayBoundLabel}`
-          );
-        } else if (!claudeSlot.desiredNodeName && prevMode !== mode) {
+          this.emit('clash-change', 'Clash 控制接口已连接');
+        } else if (prevMode !== mode) {
           this.emit('clash-change', `Clash 代理模式变更: ${prevMode} → ${mode}`);
-        } else if (
-          !claudeSlot.desiredNodeName &&
-          (prevNode !== resolved.leafNode || prevChainKey !== nextChainKey)
-        ) {
+        } else if (prevNode !== resolved.leafNode || prevChainKey !== nextChainKey) {
           this.emit(
             'clash-change',
             `Clash 节点变更: ${prevNode || '无'} → ${resolved.leafNode || '直连'}`
           );
+        } else if (prevActiveProfileUid && prevActiveProfileUid !== profilesScan.activeProfileUid) {
+          this.emit(
+            'clash-change',
+            `Clash 订阅切换: ${profilesScan.activeProfileName || '当前订阅'}`
+          );
         } else if (prevGroupsSig && prevGroupsSig !== nextGroupsSig) {
+          const selectedClaudeItem = claudeSlot.desiredNodeName
+            ? proxiesMap[claudeSlot.desiredNodeName]
+            : null;
+          if (selectedClaudeItem && GROUP_TYPES.has(selectedClaudeItem.type)) {
+            this.emit('claude-clash-ready');
+          }
           const selectedAgItem = agSlot.desiredNodeName
             ? proxiesMap[agSlot.desiredNodeName]
             : null;
           if (selectedAgItem && GROUP_TYPES.has(selectedAgItem.type)) {
             this.emit('antigravity-clash-ready');
           }
-          if (!claudeSlot.desiredNodeName) {
-            this.emit('clash-change', 'Clash 策略组节点切换');
-          } else {
-            this.emit('clash-status-updated');
-          }
+          this.emit('clash-change', 'Clash 策略组节点切换');
         } else if (
           prevAvailCount !== profilesScan.availableNodes.length ||
           prevProfilesSig !== nextProfilesSig ||
           prevActiveProfileUid !== profilesScan.activeProfileUid ||
+          claudeBoundChanged ||
+          prevClaudeListening !== claudeListening ||
           agBoundChanged ||
           prevAgListening !== antigravityListening
         ) {
@@ -823,12 +814,6 @@ export class ClashMonitor extends EventEmitter {
           : DISCONNECTED_POLL_MS;
       this.scheduleNextTick(nextDelay);
     }
-  }
-
-  private formatBoundDisplayLabel(slot: DedicatedChannelSlot): string {
-    const pName = slot.boundProfileName || slot.desiredProfileName;
-    const nName = slot.desiredNodeName || '';
-    return pName ? `${pName} / ${nName}` : nName;
   }
 
   private refreshOfflineProfilesState(activeProxiesMap: Record<string, ClashProxyItem>): void {

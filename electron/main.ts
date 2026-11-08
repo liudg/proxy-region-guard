@@ -432,13 +432,22 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     ? `${state.lastProbe.countryName} (${state.lastProbe.countryCode}) · ${state.lastProbe.ip}`
     : state.lastError || '检测中...';
 
+  const clashChannelText = state.clashInfo.connected
+    ? `Clash选中: ${
+        state.clashInfo.activeProfileName
+          ? `${state.clashInfo.activeProfileName} / `
+          : ''
+      }${state.clashInfo.activeNode || state.clashInfo.mode}`
+    : 'Clash: 未连接';
+
   const profilePrefix =
     state.config.selectedClashProfileName || state.clashInfo.boundProfileName;
+  const claudeProbeSuffix = state.claudeState.nodeProbe
+    ? ` (${state.claudeState.nodeProbe.countryCode} · ${state.claudeState.nodeProbe.ip})`
+    : '';
   const nodeText = state.config.selectedClashNode
-    ? `Claude节点: ${profilePrefix ? `${profilePrefix} / ` : ''}${state.config.selectedClashNode}`
-    : state.clashInfo.connected
-    ? `Clash全局: ${state.clashInfo.activeNode || state.clashInfo.mode}`
-    : '未指定节点';
+    ? `Claude节点: ${profilePrefix ? `${profilePrefix} / ` : ''}${state.config.selectedClashNode}${claudeProbeSuffix}`
+    : '';
 
   const agProfilePrefix =
     state.config.antigravityClashProfileName || state.clashInfo.antigravityBoundProfileName;
@@ -470,9 +479,10 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
 
   const tooltip = [
     `代理地区卫士 · ${statusLabelMap[state.status]}`,
+    clashChannelText,
+    `当前出口: ${curText}`,
     nodeText,
     agNodeText,
-    `当前出口: ${curText}`,
     `系统区域: ${state.winLocale.regionName} (${state.winLocale.regionCode})`,
     agText,
     claudeText,
@@ -491,6 +501,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
 
   const menuSig = [
     state.status,
+    clashChannelText,
     curText,
     nodeText,
     agNodeText,
@@ -518,9 +529,17 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       enabled: false,
     },
     {
-      label: nodeText,
+      label: clashChannelText,
       enabled: false,
     },
+    ...(nodeText
+      ? [
+          {
+            label: nodeText,
+            enabled: false,
+          },
+        ]
+      : []),
     ...(agNodeText
       ? [
           {
@@ -677,6 +696,10 @@ function registerIpcHandlers(): void {
       probeEngine.selectClashNode(nodeName, profileUid)
   );
 
+  ipcMain.handle('guard:probe-claude-node', (_e, reason?: string) =>
+    probeEngine.probeClaudeNodeNow(reason || 'Claude 专栏手动重测')
+  );
+
   ipcMain.handle('guard:launch-claude', () => probeEngine.launchClaudeFromGuard());
 
   ipcMain.handle('guard:terminate-claude', () => probeEngine.terminateClaudeManually());
@@ -789,7 +812,11 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('guard:clear-logs', () => probeEngine.clearLogs());
 
-  ipcMain.handle('guard:sync-locale', () => probeEngine.syncSystemLocaleToDefault());
+  ipcMain.handle(
+    'guard:sync-locale',
+    (_e, targetSource?: 'monitor' | 'claude') =>
+      probeEngine.syncSystemLocaleToDefault(targetSource)
+  );
 
   ipcMain.handle('guard:restore-locale', () => probeEngine.restoreDefaultChinaLocale());
 

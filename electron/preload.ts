@@ -13,11 +13,13 @@ const api: GuardBridgeAPI = {
   setDefaultRegion: (code: string | null) => ipcRenderer.invoke('guard:set-default-region', code),
   updateConfig: (partial: Partial<AppConfig>) => ipcRenderer.invoke('guard:update-config', partial),
   clearLogs: () => ipcRenderer.invoke('guard:clear-logs'),
-  syncSystemLocaleToDefault: () => ipcRenderer.invoke('guard:sync-locale'),
+  syncSystemLocaleToDefault: (targetSource?: 'monitor' | 'claude') =>
+    ipcRenderer.invoke('guard:sync-locale', targetSource),
   restoreDefaultChinaLocale: () => ipcRenderer.invoke('guard:restore-locale'),
 
   selectClashNode: (nodeName: string | null, profileUid?: string | null) =>
     ipcRenderer.invoke('guard:select-clash-node', nodeName, profileUid),
+  probeClaudeNode: (reason?: string) => ipcRenderer.invoke('guard:probe-claude-node', reason),
   launchClaude: () => ipcRenderer.invoke('guard:launch-claude'),
   terminateClaudeNow: () => ipcRenderer.invoke('guard:terminate-claude'),
   browseClaudeExe: () => ipcRenderer.invoke('guard:browse-claude-exe'),

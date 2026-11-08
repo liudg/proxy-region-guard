@@ -214,7 +214,7 @@ export const MainDashboard: React.FC = () => {
 
   const handleSyncLocaleFromClaude = async () => {
     setClaudeFeedback(null);
-    const res = await window.guardAPI.syncSystemLocaleToDefault();
+    const res = await window.guardAPI.syncSystemLocaleToDefault('claude');
     setState(res.state);
     showTimedClaudeFeedback(res.ok, res.message);
   };
@@ -345,7 +345,7 @@ export const MainDashboard: React.FC = () => {
 
   const handleSyncLocale = async () => {
     setLocaleFeedback(null);
-    const res = await window.guardAPI.syncSystemLocaleToDefault();
+    const res = await window.guardAPI.syncSystemLocaleToDefault('monitor');
     setState(res.state);
     showTimedLocaleFeedback(res.ok, res.message);
   };
@@ -591,7 +591,9 @@ export const MainDashboard: React.FC = () => {
                       ? 'running'
                       : claudeState.canLaunch
                       ? 'ready'
-                      : isChecking && !lastProbe && !lastError
+                      : claudeState.isProbingNode &&
+                        !claudeState.nodeProbe &&
+                        !claudeState.nodeProbeError
                       ? 'checking'
                       : 'locked'
                   }`}
@@ -963,7 +965,9 @@ export const MainDashboard: React.FC = () => {
                   className={`hero-card claude-hero-card ${
                     claudeState.running || claudeState.canLaunch
                       ? 'status-ok'
-                      : isChecking && !lastProbe && !lastError
+                      : claudeState.isProbingNode &&
+                        !claudeState.nodeProbe &&
+                        !claudeState.nodeProbeError
                       ? 'status-checking'
                       : 'status-mismatch'
                   }`}
@@ -973,7 +977,9 @@ export const MainDashboard: React.FC = () => {
                       className={`status-pill ${
                         claudeState.running || claudeState.canLaunch
                           ? 'status-ok'
-                          : isChecking && !lastProbe && !lastError
+                          : claudeState.isProbingNode &&
+                            !claudeState.nodeProbe &&
+                            !claudeState.nodeProbeError
                           ? 'status-checking'
                           : 'status-mismatch'
                       }`}
@@ -990,7 +996,9 @@ export const MainDashboard: React.FC = () => {
                           <CheckCircle2 size={17} />
                           <span>三重校验一致 · 允许启动 Claude</span>
                         </>
-                      ) : isChecking && !lastProbe && !lastError ? (
+                      ) : claudeState.isProbingNode &&
+                        !claudeState.nodeProbe &&
+                        !claudeState.nodeProbeError ? (
                         <>
                           <RefreshCw className="spin" size={17} />
                           <span>正在验证所选节点出口与环境...</span>
@@ -1005,11 +1013,18 @@ export const MainDashboard: React.FC = () => {
 
                     <button
                       className="btn-refresh"
-                      disabled={isChecking || isSwitchingNode}
-                      onClick={() => void window.guardAPI.checkNow('Claude 专栏手动重测')}
+                      disabled={claudeState.isProbingNode || isSwitchingNode}
+                      onClick={() =>
+                        void window.guardAPI
+                          .probeClaudeNode('Claude 专栏手动重测')
+                          .then(setState)
+                      }
                     >
-                      <RefreshCw className={isChecking ? 'spin' : ''} size={14} />
-                      <span>{isChecking ? '校验中...' : '重新校验'}</span>
+                      <RefreshCw
+                        className={claudeState.isProbingNode ? 'spin' : ''}
+                        size={14}
+                      />
+                      <span>{claudeState.isProbingNode ? '校验中...' : '重新校验'}</span>
                     </button>
                   </div>
 
@@ -1031,7 +1046,7 @@ export const MainDashboard: React.FC = () => {
                         )}
                       </div>
                       <div className="check-step-body">
-                        {claudeState.proxyCountryCode && lastProbe ? (
+                        {claudeState.proxyCountryCode && claudeState.nodeProbe ? (
                           <>
                             <div className="step-main-line">
                               <CountryFlag code={claudeState.proxyCountryCode} size="sm" />
@@ -1039,16 +1054,27 @@ export const MainDashboard: React.FC = () => {
                                 {claudeState.proxyCountryName} ({claudeState.proxyCountryCode})
                               </strong>
                             </div>
-                            <small className="ellipsis" title={lastProbe.ip}>
-                              IP: {lastProbe.ip}
+                            <small
+                              className="ellipsis"
+                              title={`${claudeState.nodeProbe.ip} (${claudeState.nodeProbe.latencyMs} ms)`}
+                            >
+                              IP: {claudeState.nodeProbe.ip} · {claudeState.nodeProbe.latencyMs} ms
                             </small>
                           </>
                         ) : (
                           <>
                             <strong className="text-warn">
-                              {config.selectedClashNode ? '节点未连通' : '未选定节点'}
+                              {!config.selectedClashNode
+                                ? '未选定节点'
+                                : claudeState.isProbingNode
+                                ? '正在探测节点...'
+                                : '节点未连通'}
                             </strong>
-                            <small>请在下方下拉框选择节点</small>
+                            <small>
+                              {config.selectedClashNode
+                                ? claudeState.nodeProbeError || '请检查节点连通性'
+                                : '请在下方下拉框选择节点'}
+                            </small>
                           </>
                         )}
                       </div>
@@ -1119,23 +1145,6 @@ export const MainDashboard: React.FC = () => {
                         <span>{claudeState.launchBlockReason}</span>
                       </div>
                       {claudeState.proxyCountryCode &&
-                        config.defaultCountryCode &&
-                        config.defaultCountryCode !== claudeState.proxyCountryCode && (
-                          <button
-                            className="btn-banner-quick-sync"
-                            onClick={() =>
-                              void window.guardAPI.setDefaultCurrent().then(setState)
-                            }
-                          >
-                            <Sparkles size={13} />
-                            <span>
-                              将默认保护地区更改为 [{claudeState.proxyCountryName}]
-                            </span>
-                          </button>
-                        )}
-                      {claudeState.proxyCountryCode &&
-                        (!config.defaultCountryCode ||
-                          config.defaultCountryCode === claudeState.proxyCountryCode) &&
                         (!claudeState.winRegionMatched ||
                           !claudeState.winTimeZoneMatched) && (
                           <button
@@ -1196,6 +1205,15 @@ export const MainDashboard: React.FC = () => {
                       </button>
                     )}
                   </div>
+
+                  {claudeState.nodeProbe && (
+                    <div className="hero-footer-meta">
+                      <span className="ellipsis" title={claudeState.nodeProbe.viaChannel}>
+                        独立监控通道：{claudeState.nodeProbe.viaChannel}
+                      </span>
+                      <span>更新于 {formatTime(claudeState.nodeProbe.checkedAt)}</span>
+                    </div>
+                  )}
 
                   {claudeFeedback && (
                     <div
@@ -1587,6 +1605,23 @@ export const MainDashboard: React.FC = () => {
                     ))}
                   </select>
                 </div>
+
+                <div className="setting-row no-border-bottom">
+                  <div>
+                    <strong>实时监控异常弹窗告警</strong>
+                    <p>开启后，Clash 选中通道与保护地区/系统时区不符或断连时弹出置顶提醒</p>
+                  </div>
+                  <input
+                    type="checkbox"
+                    className="toggle-switch"
+                    checked={config.monitorAlertEnabled}
+                    onChange={(e) =>
+                      void window.guardAPI
+                        .updateConfig({ monitorAlertEnabled: e.target.checked })
+                        .then(setState)
+                    }
+                  />
+                </div>
               </div>
             </section>
           </div>
@@ -1758,7 +1793,7 @@ export const MainDashboard: React.FC = () => {
               <div className="panel-card-header">
                 <div className="panel-title">
                   <Settings size={15} />
-                  <span>全局回退检测通道（未指定 Clash 节点时生效）</span>
+                  <span>实时监控检测通道模式</span>
                 </div>
               </div>
 
@@ -1771,8 +1806,8 @@ export const MainDashboard: React.FC = () => {
                     onChange={() => void handleSwitchNonManualMode('auto')}
                   />
                   <div>
-                    <strong>自动识别全局出口（推荐）</strong>
-                    <p>优先走系统代理，未开启系统代理时自动检测默认网卡 / TUN 路由</p>
+                    <strong>自动识别 Clash 选中通道（推荐）</strong>
+                    <p>优先检测 Clash Verge 当前选中的代理通道（混合端口/当前模式），未连接时自动检测系统代理或网卡路由</p>
                   </div>
                 </label>
 
@@ -1883,8 +1918,8 @@ export const MainDashboard: React.FC = () => {
 
               <div className="setting-row">
                 <div>
-                  <strong>置顶警告弹窗</strong>
-                  <p>地区异常或拦截进程时在屏幕右下角弹出置顶提醒</p>
+                  <strong>置顶警告弹窗（总开关）</strong>
+                  <p>Claude 异常拦截或触发告警时在屏幕右下角弹出置顶提醒</p>
                 </div>
                 <input
                   type="checkbox"
@@ -1892,6 +1927,22 @@ export const MainDashboard: React.FC = () => {
                   checked={config.alertPopupEnabled}
                   onChange={(e) =>
                     void window.guardAPI.updateConfig({ alertPopupEnabled: e.target.checked })
+                  }
+                />
+              </div>
+
+              <div className="setting-row">
+                <div>
+                  <strong>实时监控异常弹窗告警</strong>
+                  <p>开启后，Clash 选中通道与保护地区/系统时区不一致或断连时也弹出提醒</p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="toggle-switch"
+                  disabled={!config.alertPopupEnabled}
+                  checked={config.monitorAlertEnabled}
+                  onChange={(e) =>
+                    void window.guardAPI.updateConfig({ monitorAlertEnabled: e.target.checked })
                   }
                 />
               </div>

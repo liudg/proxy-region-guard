@@ -18,6 +18,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   alertPopupEnabled: true,
   alertSoundEnabled: true,
   alertOnDisconnect: true,
+  monitorAlertEnabled: false,
   closeToTray: true,
   autoLaunch: false,
   killProcessesEnabled: true,
@@ -204,6 +205,10 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
       typeof raw.alertOnDisconnect === 'boolean'
         ? raw.alertOnDisconnect
         : DEFAULT_CONFIG.alertOnDisconnect,
+    monitorAlertEnabled:
+      typeof raw.monitorAlertEnabled === 'boolean'
+        ? raw.monitorAlertEnabled
+        : DEFAULT_CONFIG.monitorAlertEnabled,
     closeToTray:
       typeof raw.closeToTray === 'boolean' ? raw.closeToTray : DEFAULT_CONFIG.closeToTray,
     autoLaunch:
