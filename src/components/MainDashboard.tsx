@@ -755,9 +755,6 @@ export const MainDashboard: React.FC = () => {
                             : '未运行'}
                         </span>
                       </div>
-                      <small>
-                        Chromium <code>--proxy-server</code> 参数 + Clash 进程名规则锁定
-                      </small>
                     </div>
 
                     <div
@@ -777,9 +774,6 @@ export const MainDashboard: React.FC = () => {
                             : '未运行'}
                         </span>
                       </div>
-                      <small>
-                        <code>HTTP/HTTPS/ALL/GRPC_PROXY</code> 环境变量继承 + Clash 规则兜底
-                      </small>
                     </div>
                   </div>
 
@@ -788,7 +782,7 @@ export const MainDashboard: React.FC = () => {
                     <div className="ag-info-banner">
                       <Info size={14} />
                       <span>
-                        当前 Antigravity 由外部启动（Clash 进程名规则已生效，但尚未注入启动参数与环境变量）。如需最严格的专属端口直通，可点击下方按钮重启注入。
+                        当前 Antigravity 由外部启动，可点击下方按钮重启以绑定专属代理通道。
                       </span>
                     </div>
                   )}

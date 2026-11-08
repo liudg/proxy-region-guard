@@ -1,6 +1,8 @@
 import { EventEmitter } from 'node:events';
 import * as fs from 'node:fs';
 import * as http from 'node:http';
+import * as http2 from 'node:http2';
+import * as https from 'node:https';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
@@ -49,6 +51,8 @@ interface CachedProfileNodesEntry {
   size: number;
   nodes: ClashProxyNodeOption[];
   rawMap: Map<string, Record<string, unknown>>;
+  hosts: Record<string, string>;
+  nameserverPolicy: Record<string, string[]>;
 }
 
 interface CachedProfilesIndexEntry {
@@ -65,6 +69,8 @@ interface ResolvedProfileData {
   updatedAt?: number;
   nodes: ClashProxyNodeOption[];
   rawMap: Map<string, Record<string, unknown>>;
+  hosts: Record<string, string>;
+  nameserverPolicy: Record<string, string[]>;
 }
 
 const CONNECTED_POLL_MS = 3000;
@@ -222,6 +228,9 @@ export class ClashMonitor extends EventEmitter {
   private rebindGraceUntil = 0;
   private lastAutoBindFailAt = 0;
   private lastAutoBindFailKey = '';
+  private lastConfigReloadAt = 0;
+  private lastConfigReloadSig = '';
+  private customDnsCache = new Map<string, { ip: string; expiresAt: number }>();
 
   private info: ClashRuntimeInfo = {
     connected: false,
@@ -441,6 +450,11 @@ export class ClashMonitor extends EventEmitter {
     const claude = this.slots.claude;
     const ag = this.slots.antigravity;
 
+    if (this.currentEndpoint && (claudeListening || antigravityListening)) {
+      this.info.connected = true;
+      this.info.source = this.currentEndpoint.label;
+    }
+
     this.info.boundNode = claude.desiredNodeName;
     this.info.boundProfileUid = claude.desiredNodeName
       ? claude.boundProfileUid || claude.desiredProfileUid
@@ -630,7 +644,7 @@ export class ClashMonitor extends EventEmitter {
                 Date.now() + RELOAD_GRACE_WINDOW_MS
               );
             }
-            const syncRes = await this.queueSyncDedicatedListeners(true);
+            const syncRes = await this.queueSyncDedicatedListeners(false);
             claudeListening = syncRes.claudeListening;
             antigravityListening = syncRes.antigravityListening;
 
@@ -870,30 +884,11 @@ export class ClashMonitor extends EventEmitter {
       };
     }
 
-    const isSlotAlreadyOk = async (slot: DedicatedChannelSlot): Promise<boolean> => {
-      if (!slot.desiredNodeName) {
-        return !slot.boundNodeName;
-      }
-      if (forceRebind) return false;
-      return (
-        slot.boundNodeName === slot.desiredNodeName &&
-        (!slot.desiredProfileUid || slot.boundProfileUid === slot.desiredProfileUid) &&
-        slot.boundPort === slot.desiredPort &&
-        (await isLocalPortListening(slot.desiredPort))
-      );
-    };
-
-    const [claudeAlreadyOk, agAlreadyOk] = await Promise.all([
-      isSlotAlreadyOk(claudeSlot),
-      isSlotAlreadyOk(agSlot),
-    ]);
-
-    if (claudeAlreadyOk && agAlreadyOk) {
-      const claudeListening = Boolean(claudeSlot.desiredNodeName);
-      const antigravityListening = Boolean(agSlot.desiredNodeName);
-      this.syncSlotInfoFields(claudeListening, antigravityListening);
-      return { claudeListening, antigravityListening };
-    }
+    const desiredSig = `${claudeSlot.desiredProfileUid || ''}:::${
+      claudeSlot.desiredNodeName || ''
+    }:${claudeSlot.desiredPort}|${agSlot.desiredProfileUid || ''}:::${
+      agSlot.desiredNodeName || ''
+    }:${agSlot.desiredPort}`;
 
     try {
       const yamlPath = this.findActiveClashYamlFile();
@@ -910,6 +905,39 @@ export class ClashMonitor extends EventEmitter {
         '/proxies'
       );
       const proxiesMap = proxiesRes?.proxies || {};
+
+      const recentlyReloadedSameSig =
+        this.lastConfigReloadSig === desiredSig && Date.now() - this.lastConfigReloadAt < 1800;
+
+      const isSlotAlreadyOk = async (slot: DedicatedChannelSlot): Promise<boolean> => {
+        if (!slot.desiredNodeName) {
+          return !slot.boundNodeName;
+        }
+        if (forceRebind && !recentlyReloadedSameSig) return false;
+        const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
+        const nodeAliveInKernel = Boolean(
+          proxiesMap[expectedInternal] || proxiesMap[slot.desiredNodeName]
+        );
+        if (!nodeAliveInKernel) return false;
+        return (
+          slot.boundNodeName === slot.desiredNodeName &&
+          (!slot.desiredProfileUid || slot.boundProfileUid === slot.desiredProfileUid) &&
+          slot.boundPort === slot.desiredPort &&
+          (await isLocalPortListening(slot.desiredPort))
+        );
+      };
+
+      const [claudeAlreadyOk, agAlreadyOk] = await Promise.all([
+        isSlotAlreadyOk(claudeSlot),
+        isSlotAlreadyOk(agSlot),
+      ]);
+
+      if (claudeAlreadyOk && agAlreadyOk) {
+        const claudeListening = Boolean(claudeSlot.desiredNodeName);
+        const antigravityListening = Boolean(agSlot.desiredNodeName);
+        this.syncSlotInfoFields(claudeListening, antigravityListening);
+        return { claudeListening, antigravityListening };
+      }
 
       this.scanAllClashVergeProfiles(proxiesMap);
 
@@ -941,6 +969,8 @@ export class ClashMonitor extends EventEmitter {
         ? (doc['listeners'] as Array<Record<string, unknown>>)
         : [];
       const prependedRules: string[] = [];
+      const mergedExtraHosts: Record<string, string> = {};
+      const mergedNameserverPolicies: Record<string, string[]> = {};
 
       const slotOutcome: Record<
         DedicatedChannelId,
@@ -962,14 +992,29 @@ export class ClashMonitor extends EventEmitter {
           slot.desiredDialerRaw = structuredClone(resolved.dialerChain);
         }
 
+        const profHosts = resolved?.hosts || {};
+        const profNsPolicy = resolved?.nameserverPolicy || {};
+        Object.assign(mergedExtraHosts, profHosts);
+        for (const [pat, servers] of Object.entries(profNsPolicy)) {
+          mergedNameserverPolicies[pat] = servers;
+        }
+
         let shouldBind = false;
         let targetProxy = slot.desiredNodeName;
 
         if (slot.desiredNodeRaw) {
           shouldBind = true;
+          const forceDnsRefresh = forceRebind && !recentlyReloadedSameSig;
           const dialerChain = slot.desiredDialerRaw || [];
           for (let i = 0; i < dialerChain.length; i++) {
             const hopClone = structuredClone(dialerChain[i]);
+            await this.resolveProxyNodeServerIfNeeded(
+              hopClone,
+              profHosts,
+              profNsPolicy,
+              mergedExtraHosts,
+              forceDnsRefresh
+            );
             hopClone['name'] = `${slot.dialerPrefix}${i}__`;
             if (i + 1 < dialerChain.length) {
               hopClone['dialer-proxy'] = `${slot.dialerPrefix}${i + 1}__`;
@@ -978,6 +1023,13 @@ export class ClashMonitor extends EventEmitter {
           }
 
           const injectedNode = structuredClone(slot.desiredNodeRaw);
+          await this.resolveProxyNodeServerIfNeeded(
+            injectedNode,
+            profHosts,
+            profNsPolicy,
+            mergedExtraHosts,
+            forceDnsRefresh
+          );
           injectedNode['name'] = slot.internalProxyName;
           if (dialerChain.length > 0) {
             injectedNode['dialer-proxy'] = `${slot.dialerPrefix}0__`;
@@ -1011,6 +1063,35 @@ export class ClashMonitor extends EventEmitter {
       doc['proxies'] = existingProxies;
       doc['listeners'] = existingListeners;
 
+      if (Object.keys(mergedExtraHosts).length > 0) {
+        const curHosts =
+          doc['hosts'] && typeof doc['hosts'] === 'object' && !Array.isArray(doc['hosts'])
+            ? (doc['hosts'] as Record<string, unknown>)
+            : {};
+        doc['hosts'] = { ...mergedExtraHosts, ...curHosts };
+        if (doc['dns'] && typeof doc['dns'] === 'object' && !Array.isArray(doc['dns'])) {
+          (doc['dns'] as Record<string, unknown>)['use-hosts'] = true;
+        }
+      }
+
+      if (Object.keys(mergedNameserverPolicies).length > 0) {
+        const curDns =
+          doc['dns'] && typeof doc['dns'] === 'object' && !Array.isArray(doc['dns'])
+            ? (doc['dns'] as Record<string, unknown>)
+            : {};
+        const curNsPolicy =
+          curDns['nameserver-policy'] &&
+          typeof curDns['nameserver-policy'] === 'object' &&
+          !Array.isArray(curDns['nameserver-policy'])
+            ? (curDns['nameserver-policy'] as Record<string, unknown>)
+            : {};
+        curDns['nameserver-policy'] = {
+          ...mergedNameserverPolicies,
+          ...curNsPolicy,
+        };
+        doc['dns'] = curDns;
+      }
+
       if (prependedRules.length > 0 && doc['find-process-mode'] === 'off') {
         doc['find-process-mode'] = 'strict';
       }
@@ -1043,6 +1124,14 @@ export class ClashMonitor extends EventEmitter {
       updateSlotBoundState(claudeSlot, claudeListening);
       updateSlotBoundState(agSlot, antigravityListening);
       this.syncSlotInfoFields(claudeListening, antigravityListening);
+
+      if (
+        (!claudeSlot.desiredNodeName || claudeListening) &&
+        (!agSlot.desiredNodeName || antigravityListening)
+      ) {
+        this.lastConfigReloadAt = Date.now();
+        this.lastConfigReloadSig = desiredSig;
+      }
 
       if (claudeListening) {
         this.lastAutoBindFailAt = 0;
@@ -1093,6 +1182,8 @@ export class ClashMonitor extends EventEmitter {
     profileName: string | null;
     rawProxy: Record<string, unknown>;
     dialerChain: Array<Record<string, unknown>>;
+    hosts: Record<string, string>;
+    nameserverPolicy: Record<string, string[]>;
   } | null {
     const nodeName = slot.desiredNodeName;
     if (!nodeName) return null;
@@ -1108,6 +1199,8 @@ export class ClashMonitor extends EventEmitter {
           profileName: targetProf.name,
           rawProxy: structuredClone(raw),
           dialerChain: extractDialerChain(raw, targetProf.rawMap),
+          hosts: { ...targetProf.hosts },
+          nameserverPolicy: structuredClone(targetProf.nameserverPolicy),
         };
       }
     }
@@ -1121,6 +1214,8 @@ export class ClashMonitor extends EventEmitter {
           profileName: prof.name,
           rawProxy: structuredClone(raw),
           dialerChain: extractDialerChain(raw, prof.rawMap),
+          hosts: { ...prof.hosts },
+          nameserverPolicy: structuredClone(prof.nameserverPolicy),
         };
       }
     }
@@ -1134,21 +1229,107 @@ export class ClashMonitor extends EventEmitter {
           profileName: prof.name,
           rawProxy: structuredClone(raw),
           dialerChain: extractDialerChain(raw, prof.rawMap),
+          hosts: { ...prof.hosts },
+          nameserverPolicy: structuredClone(prof.nameserverPolicy),
         };
       }
     }
 
     // 4. 兜底使用该通道槽位已持久化的缓存节点定义
     if (slot.desiredNodeRaw) {
+      const fallbackProf = preferredProfileUid
+        ? this.profileRawLookup.get(preferredProfileUid)
+        : undefined;
       return {
         profileUid: slot.desiredProfileUid,
         profileName: slot.desiredProfileName,
         rawProxy: structuredClone(slot.desiredNodeRaw),
         dialerChain: slot.desiredDialerRaw ? structuredClone(slot.desiredDialerRaw) : [],
+        hosts: fallbackProf ? { ...fallbackProf.hosts } : {},
+        nameserverPolicy: fallbackProf ? structuredClone(fallbackProf.nameserverPolicy) : {},
       };
     }
 
     return null;
+  }
+
+  private async resolveProxyNodeServerIfNeeded(
+    proxyObj: Record<string, unknown>,
+    profileHosts: Record<string, string>,
+    profileNsPolicy: Record<string, string[]>,
+    outExtraHosts: Record<string, string>,
+    forceRefresh = false
+  ): Promise<void> {
+    if (!proxyObj['ip-version']) {
+      proxyObj['ip-version'] = 'ipv4-prefer';
+    }
+
+    const rawServer = typeof proxyObj['server'] === 'string' ? proxyObj['server'].trim() : '';
+    if (!rawServer || net.isIP(rawServer) !== 0) {
+      return;
+    }
+
+    const lowerServer = rawServer.toLowerCase();
+    let resolvedIp: string | null = profileHosts[lowerServer] || profileHosts[rawServer] || null;
+
+    if (!resolvedIp) {
+      for (const [pattern, dnsServers] of Object.entries(profileNsPolicy)) {
+        if (doesDomainMatchPolicyPattern(rawServer, pattern)) {
+          resolvedIp = await this.resolveHostViaCustomDnsServers(
+            rawServer,
+            dnsServers,
+            forceRefresh
+          );
+          if (resolvedIp) break;
+        }
+      }
+    }
+
+    if (resolvedIp && net.isIP(resolvedIp) !== 0) {
+      outExtraHosts[rawServer] = resolvedIp;
+      if (!proxyObj['sni'] && !proxyObj['servername']) {
+        proxyObj['sni'] = rawServer;
+        proxyObj['servername'] = rawServer;
+      }
+      proxyObj['server'] = resolvedIp;
+    }
+  }
+
+  private async resolveHostViaCustomDnsServers(
+    host: string,
+    dnsServers: string[],
+    forceRefresh = false
+  ): Promise<string | null> {
+    const dohUrls = dnsServers
+      .map((s) => s.trim())
+      .filter((s) => /^https?:\/\//i.test(s));
+    if (dohUrls.length === 0) return null;
+
+    const cacheKey = `${host.toLowerCase()}|${dohUrls.join(',')}`;
+    const cached = this.customDnsCache.get(cacheKey);
+    if (!forceRefresh && cached && Date.now() < cached.expiresAt) {
+      return cached.ip;
+    }
+
+    try {
+      const winner = await Promise.any(
+        dohUrls.map(async (dohUrl) => {
+          const ans = await querySingleDohServer(dohUrl, host, 2800);
+          if (!ans || !ans.ip) {
+            throw new Error('No DNS A record');
+          }
+          return ans;
+        })
+      );
+      const ttlMs = Math.max(45_000, Math.min((winner.ttl || 60) * 1000, 300_000));
+      this.customDnsCache.set(cacheKey, {
+        ip: winner.ip,
+        expiresAt: Date.now() + ttlMs,
+      });
+      return winner.ip;
+    } catch {
+      return cached ? cached.ip : null;
+    }
   }
 
   private loadAndPrepareCoreYaml(
@@ -1359,6 +1540,10 @@ export class ClashMonitor extends EventEmitter {
 
           const rawMap = new Map<string, Record<string, unknown>>(parsedNodes.rawMap);
           const mergedNodeList: ClashProxyNodeOption[] = [...parsedNodes.nodes];
+          const mergedHosts: Record<string, string> = { ...parsedNodes.hosts };
+          const mergedNsPolicy: Record<string, string[]> = structuredClone(
+            parsedNodes.nameserverPolicy
+          );
 
           // 合并该订阅关联的自定义节点增强配置 (option.proxies / option.merge)
           const optionObj =
@@ -1382,6 +1567,10 @@ export class ClashMonitor extends EventEmitter {
               if (!companionPath) continue;
               const companionParsed = this.readProfileNodesCached(companionPath, vergeDir);
               if (!companionParsed) continue;
+              Object.assign(mergedHosts, companionParsed.hosts);
+              for (const [pat, servers] of Object.entries(companionParsed.nameserverPolicy)) {
+                mergedNsPolicy[pat] = servers;
+              }
               for (const cn of companionParsed.nodes) {
                 if (!rawMap.has(cn.name)) {
                   const rawObj = companionParsed.rawMap.get(cn.name);
@@ -1433,6 +1622,8 @@ export class ClashMonitor extends EventEmitter {
             updatedAt,
             nodes,
             rawMap,
+            hosts: mergedHosts,
+            nameserverPolicy: mergedNsPolicy,
           };
 
           if (isActive && !activeProfileUid) {
@@ -1454,6 +1645,12 @@ export class ClashMonitor extends EventEmitter {
       if (runtimeParsed && runtimeParsed.nodes.length > 0) {
         const activeProf = resolvedProfiles.find((p) => p.isActive);
         if (activeProf) {
+          Object.assign(activeProf.hosts, runtimeParsed.hosts);
+          for (const [pat, servers] of Object.entries(runtimeParsed.nameserverPolicy)) {
+            if (!activeProf.nameserverPolicy[pat]) {
+              activeProf.nameserverPolicy[pat] = servers;
+            }
+          }
           for (const rtNode of runtimeParsed.nodes) {
             if (!activeProf.rawMap.has(rtNode.name)) {
               const rawObj = runtimeParsed.rawMap.get(rtNode.name);
@@ -1490,6 +1687,8 @@ export class ClashMonitor extends EventEmitter {
             isActive: true,
             nodes,
             rawMap: new Map(runtimeParsed.rawMap),
+            hosts: { ...runtimeParsed.hosts },
+            nameserverPolicy: structuredClone(runtimeParsed.nameserverPolicy),
           };
           activeProfileUid = fallbackUid;
           activeProfileName = fallbackName;
@@ -1517,6 +1716,8 @@ export class ClashMonitor extends EventEmitter {
           isActive: true,
           nodes: taggedNodes,
           rawMap: new Map(),
+          hosts: {},
+          nameserverPolicy: {},
         };
         activeProfileUid = fallbackUid;
         activeProfileName = fallbackName;
@@ -1738,11 +1939,55 @@ export class ClashMonitor extends EventEmitter {
         }
       }
 
+      const hosts: Record<string, string> = {};
+      if (doc['hosts'] && typeof doc['hosts'] === 'object' && !Array.isArray(doc['hosts'])) {
+        for (const [k, v] of Object.entries(doc['hosts'] as Record<string, unknown>)) {
+          const dom = k.trim().toLowerCase();
+          if (!dom) continue;
+          if (typeof v === 'string' && v.trim()) {
+            hosts[dom] = v.trim();
+          } else if (Array.isArray(v) && typeof v[0] === 'string' && v[0].trim()) {
+            hosts[dom] = v[0].trim();
+          }
+        }
+      }
+
+      const nameserverPolicy: Record<string, string[]> = {};
+      const dnsObj =
+        doc['dns'] && typeof doc['dns'] === 'object' && !Array.isArray(doc['dns'])
+          ? (doc['dns'] as Record<string, unknown>)
+          : null;
+      const rawNsPolicy =
+        dnsObj &&
+        dnsObj['nameserver-policy'] &&
+        typeof dnsObj['nameserver-policy'] === 'object' &&
+        !Array.isArray(dnsObj['nameserver-policy'])
+          ? (dnsObj['nameserver-policy'] as Record<string, unknown>)
+          : null;
+      if (rawNsPolicy) {
+        for (const [pat, val] of Object.entries(rawNsPolicy)) {
+          const cleanPat = pat.trim();
+          if (!cleanPat) continue;
+          if (typeof val === 'string' && val.trim()) {
+            nameserverPolicy[cleanPat] = [val.trim()];
+          } else if (Array.isArray(val)) {
+            const list = val
+              .filter((x): x is string => typeof x === 'string' && Boolean(x.trim()))
+              .map((x) => x.trim());
+            if (list.length > 0) {
+              nameserverPolicy[cleanPat] = list;
+            }
+          }
+        }
+      }
+
       const entry: CachedProfileNodesEntry = {
         mtimeMs: stat.mtimeMs,
         size: stat.size,
         nodes,
         rawMap,
+        hosts,
+        nameserverPolicy,
       };
       this.profileNodesCache.set(filePath, entry);
       return entry;
@@ -2388,4 +2633,239 @@ function resolveActiveProxyChain(
     leafNode,
     chain,
   };
+}
+
+function doesDomainMatchPolicyPattern(host: string, rawPattern: string): boolean {
+  const h = host.trim().toLowerCase().replace(/\.$/, '');
+  if (!h) return false;
+
+  const subPatterns = rawPattern
+    .split(',')
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+  for (let pat of subPatterns) {
+    if (pat.startsWith('rule-set:') || pat.startsWith('geosite:') || pat.startsWith('regexp:')) {
+      continue;
+    }
+    if (pat.startsWith('full:')) {
+      pat = pat.slice(5).trim();
+      if (h === pat) return true;
+      continue;
+    }
+    if (pat.startsWith('domain:')) {
+      pat = `+.${pat.slice(7).trim()}`;
+    }
+    if (pat.startsWith('+.')) {
+      const base = pat.slice(2).replace(/\.$/, '');
+      if (h === base || h.endsWith(`.${base}`)) return true;
+    } else if (pat.startsWith('*.')) {
+      const base = pat.slice(2).replace(/\.$/, '');
+      if (h.endsWith(`.${base}`) && h !== base) return true;
+    } else if (pat.startsWith('.')) {
+      const base = pat.slice(1).replace(/\.$/, '');
+      if (h.endsWith(`.${base}`) && h !== base) return true;
+    } else {
+      const base = pat.replace(/\.$/, '');
+      if (h === base) return true;
+    }
+  }
+  return false;
+}
+
+function buildDnsWireQuery(domain: string, qtype = 1): Buffer {
+  const parts = domain
+    .trim()
+    .replace(/\.$/, '')
+    .split('.')
+    .filter(Boolean);
+  const labels = parts.map((p) => {
+    const b = Buffer.from(p, 'ascii');
+    return Buffer.concat([Buffer.from([b.length]), b]);
+  });
+  const header = Buffer.from([
+    0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+  ]);
+  const footer = Buffer.from([0x00, (qtype >> 8) & 0xff, qtype & 0xff, 0x00, 0x01]);
+  return Buffer.concat([header, ...labels, footer]);
+}
+
+function skipDnsWireName(buf: Buffer, startOffset: number): number {
+  let offset = startOffset;
+  let jumps = 0;
+  while (offset < buf.length && jumps < 32) {
+    const len = buf[offset];
+    if (len === 0) {
+      return offset + 1;
+    }
+    if ((len & 0xc0) === 0xc0) {
+      return offset + 2 <= buf.length ? offset + 2 : -1;
+    }
+    offset += 1 + len;
+    jumps++;
+  }
+  return -1;
+}
+
+function parseDnsWireARecord(buf: Buffer): { ip: string; ttl: number } | null {
+  if (!buf || buf.length < 12) return null;
+  const rcode = buf[3] & 0x0f;
+  if (rcode !== 0) return null;
+
+  const qdcount = buf.readUInt16BE(4);
+  const ancount = buf.readUInt16BE(6);
+  if (ancount === 0) return null;
+
+  let offset = 12;
+  for (let i = 0; i < qdcount; i++) {
+    offset = skipDnsWireName(buf, offset);
+    if (offset < 0 || offset + 4 > buf.length) return null;
+    offset += 4;
+  }
+
+  for (let i = 0; i < ancount; i++) {
+    offset = skipDnsWireName(buf, offset);
+    if (offset < 0 || offset + 10 > buf.length) return null;
+    const atype = buf.readUInt16BE(offset);
+    const aclass = buf.readUInt16BE(offset + 2);
+    const ttl = buf.readUInt32BE(offset + 4);
+    const rdlength = buf.readUInt16BE(offset + 8);
+    offset += 10;
+    if (offset + rdlength > buf.length) return null;
+    if (atype === 1 && aclass === 1 && rdlength === 4) {
+      const ip = `${buf[offset]}.${buf[offset + 1]}.${buf[offset + 2]}.${buf[offset + 3]}`;
+      if (net.isIP(ip) === 4) {
+        return { ip, ttl };
+      }
+    }
+    offset += rdlength;
+  }
+  return null;
+}
+
+function queryDohOverHttp2(
+  urlObj: URL,
+  b64urlQuery: string,
+  timeoutMs: number
+): Promise<{ ip: string; ttl: number } | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    let client: http2.ClientHttp2Session | null = null;
+    const finish = (val: { ip: string; ttl: number } | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        client?.destroy();
+      } catch {
+        // ignore
+      }
+      resolve(val);
+    };
+
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    try {
+      client = http2.connect(urlObj.origin, { rejectUnauthorized: false });
+      client.on('error', () => finish(null));
+
+      const sep = urlObj.search ? '&' : '?';
+      const reqPath = `${urlObj.pathname}${urlObj.search}${sep}dns=${b64urlQuery}`;
+      const req = client.request({
+        ':method': 'GET',
+        ':path': reqPath,
+        accept: 'application/dns-message',
+      });
+
+      const chunks: Buffer[] = [];
+      req.on('data', (chunk: Buffer | string) => {
+        chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      });
+      req.on('end', () => {
+        const buf = Buffer.concat(chunks);
+        finish(parseDnsWireARecord(buf));
+      });
+      req.on('error', () => finish(null));
+      req.end();
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+function queryDohOverHttps1(
+  urlObj: URL,
+  b64urlQuery: string,
+  timeoutMs: number
+): Promise<{ ip: string; ttl: number } | null> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (val: { ip: string; ttl: number } | null) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(val);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+
+    try {
+      const sep = urlObj.search ? '&' : '?';
+      const reqUrl = new URL(`${urlObj.pathname}${urlObj.search}${sep}dns=${b64urlQuery}`, urlObj.origin);
+      const isHttps = reqUrl.protocol === 'https:';
+      const transport = isHttps ? https : http;
+      const req = transport.request(
+        reqUrl,
+        {
+          method: 'GET',
+          rejectUnauthorized: false,
+          timeout: timeoutMs,
+          headers: {
+            Accept: 'application/dns-message',
+          },
+        },
+        (res) => {
+          const chunks: Buffer[] = [];
+          res.on('data', (chunk: Buffer | string) => {
+            chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+          });
+          res.on('end', () => {
+            finish(parseDnsWireARecord(Buffer.concat(chunks)));
+          });
+          res.on('error', () => finish(null));
+        }
+      );
+      req.on('timeout', () => {
+        req.destroy();
+        finish(null);
+      });
+      req.on('error', () => finish(null));
+      req.end();
+    } catch {
+      finish(null);
+    }
+  });
+}
+
+async function querySingleDohServer(
+  dohRaw: string,
+  domain: string,
+  timeoutMs = 2800
+): Promise<{ ip: string; ttl: number } | null> {
+  try {
+    const cleanUrl = dohRaw.split('#')[0].trim();
+    if (!/^https?:\/\//i.test(cleanUrl)) return null;
+    const urlObj = new URL(cleanUrl);
+    const wire = buildDnsWireQuery(domain, 1);
+    const b64url = wire
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+
+    const h2Res = await queryDohOverHttp2(urlObj, b64url, timeoutMs);
+    if (h2Res) return h2Res;
+    return await queryDohOverHttps1(urlObj, b64url, Math.min(1800, timeoutMs));
+  } catch {
+    return null;
+  }
 }

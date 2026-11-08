@@ -18,7 +18,6 @@ import { ProbeEngine } from './probeEngine';
 import { createStatusTrayIcon, createWindowAppIcon } from './trayIcon';
 import {
   applyAutoLaunchSetting,
-  isLaunchedFromAutoStart,
   reconcileAutoLaunchOnStartup,
 } from './autoLaunch';
 
@@ -876,10 +875,7 @@ if (tryRelaunchAsWindowsAdmin()) {
       registerIpcHandlers();
       isBootstrapped = true;
 
-      const startHiddenInTray = isLaunchedFromAutoStart() && configStore.get().closeToTray;
-      if (!startHiddenInTray) {
-        createMainWindow(true);
-      }
+      createMainWindow(true);
       setupTray();
 
       await probeEngine.start();

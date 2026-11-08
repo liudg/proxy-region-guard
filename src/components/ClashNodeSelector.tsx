@@ -5,7 +5,6 @@ import {
   ChevronUp,
   Layers,
   Search,
-  ShieldCheck,
   X,
 } from 'lucide-react';
 import {
@@ -59,10 +58,23 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
   const [profileFilter, setProfileFilter] = useState<string>('__all__');
   const [searchQuery, setSearchQuery] = useState<string>('');
   const [highlightIndex, setHighlightIndex] = useState<number>(0);
+  const [isDraggingPills, setIsDraggingPills] = useState(false);
 
   const containerRef = useRef<HTMLDivElement | null>(null);
   const searchInputRef = useRef<HTMLInputElement | null>(null);
+  const pillsBarRef = useRef<HTMLDivElement | null>(null);
   const listContainerRef = useRef<HTMLDivElement | null>(null);
+  const pillDragStateRef = useRef<{
+    isDown: boolean;
+    startX: number;
+    startScrollLeft: number;
+    moved: boolean;
+  }>({
+    isDown: false,
+    startX: 0,
+    startScrollLeft: 0,
+    moved: false,
+  });
 
   const profileGroups: ClashProfileGroupOption[] = useMemo(() => {
     if (clashInfo.profileGroups && clashInfo.profileGroups.length > 0) {
@@ -105,13 +117,6 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
     if (grp) return grp.isActive;
     return !clashInfo.activeProfileUid || effectiveProfileUid === clashInfo.activeProfileUid;
   }, [effectiveProfileUid, profileGroups, clashInfo.activeProfileUid]);
-
-  const isCrossProfileBound = Boolean(
-    selectedNode &&
-      effectiveProfileUid &&
-      clashInfo.activeProfileUid &&
-      effectiveProfileUid !== clashInfo.activeProfileUid
-  );
 
   const activeFilterUid =
     profileFilter === '__all__' || profileGroups.some((g) => g.uid === profileFilter)
@@ -162,6 +167,28 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
     }
   }, [isOpen]);
 
+  // 订阅组筛选栏支持鼠标滚轮横向滚动
+  useEffect(() => {
+    if (!isOpen) return;
+    const el = pillsBarRef.current;
+    if (!el) return;
+
+    const handleWheel = (e: WheelEvent) => {
+      if (el.scrollWidth <= el.clientWidth) return;
+      const delta = Math.abs(e.deltaY) >= Math.abs(e.deltaX) ? e.deltaY : e.deltaX;
+      if (delta !== 0) {
+        e.preventDefault();
+        e.stopPropagation();
+        el.scrollLeft += delta;
+      }
+    };
+
+    el.addEventListener('wheel', handleWheel, { passive: false });
+    return () => {
+      el.removeEventListener('wheel', handleWheel);
+    };
+  }, [isOpen, profileGroups.length]);
+
   // 搜索词或订阅筛选变化时重置高亮项到第一项
   useEffect(() => {
     setHighlightIndex(0);
@@ -180,6 +207,53 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
       document.removeEventListener('mousedown', handleMouseDownOutside);
     };
   }, [isOpen]);
+
+  const handlePillsMouseDown = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (e.button !== 0 || !pillsBarRef.current) return;
+    pillDragStateRef.current = {
+      isDown: true,
+      startX: e.clientX,
+      startScrollLeft: pillsBarRef.current.scrollLeft,
+      moved: false,
+    };
+  };
+
+  const handlePillsMouseMove = (e: React.MouseEvent<HTMLDivElement>) => {
+    const st = pillDragStateRef.current;
+    if (!st.isDown || !pillsBarRef.current) return;
+    const dx = e.clientX - st.startX;
+    if (!st.moved && Math.abs(dx) > 4) {
+      st.moved = true;
+      setIsDraggingPills(true);
+    }
+    if (st.moved) {
+      e.preventDefault();
+      pillsBarRef.current.scrollLeft = st.startScrollLeft - dx;
+    }
+  };
+
+  const handlePillsMouseUpOrLeave = () => {
+    if (!pillDragStateRef.current.isDown) return;
+    pillDragStateRef.current.isDown = false;
+    setIsDraggingPills(false);
+  };
+
+  const handlePillsClickCapture = (e: React.MouseEvent<HTMLDivElement>) => {
+    if (pillDragStateRef.current.moved) {
+      e.preventDefault();
+      e.stopPropagation();
+      pillDragStateRef.current.moved = false;
+    }
+  };
+
+  const handleSelectProfilePill = (
+    uid: string,
+    btnEl: HTMLButtonElement
+  ) => {
+    setProfileFilter(uid);
+    btnEl.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' });
+    searchInputRef.current?.focus();
+  };
 
   const handleOpenPanel = () => {
     if (isSwitching || (clashInfo.availableNodes.length === 0 && !selectedNode)) {
@@ -359,20 +433,25 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
           </div>
         )}
 
-        {/* 展开态：订阅组筛选胶囊栏 + 实时过滤节点列表 */}
+        {/* 展开态：订阅组筛选胶囊栏（支持滚轮横向滑动与鼠标拖拽）+ 实时过滤节点列表 */}
         {isOpen && (
           <div className="node-dropdown-panel">
             {profileGroups.length > 1 && (
-              <div className="profile-pills-bar">
+              <div
+                ref={pillsBarRef}
+                className={`profile-pills-bar ${isDraggingPills ? 'dragging' : ''}`}
+                onMouseDown={handlePillsMouseDown}
+                onMouseMove={handlePillsMouseMove}
+                onMouseUp={handlePillsMouseUpOrLeave}
+                onMouseLeave={handlePillsMouseUpOrLeave}
+                onClickCapture={handlePillsClickCapture}
+              >
                 <button
                   type="button"
                   className={`profile-filter-pill ${
                     activeFilterUid === '__all__' ? 'active' : ''
                   }`}
-                  onClick={() => {
-                    setProfileFilter('__all__');
-                    searchInputRef.current?.focus();
-                  }}
+                  onClick={(e) => handleSelectProfilePill('__all__', e.currentTarget)}
                 >
                   <Layers size={12} />
                   <span>全部订阅 ({totalNodeCount})</span>
@@ -384,14 +463,11 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
                     className={`profile-filter-pill ${
                       activeFilterUid === g.uid ? 'active' : ''
                     }`}
-                    onClick={() => {
-                      setProfileFilter(g.uid);
-                      searchInputRef.current?.focus();
-                    }}
+                    onClick={(e) => handleSelectProfilePill(g.uid, e.currentTarget)}
                     title={
                       g.isActive
                         ? `Clash 当前激活订阅: ${g.name}`
-                        : `独立订阅组: ${g.name}（选择后将自动跨订阅注入内核）`
+                        : `独立订阅组: ${g.name}`
                     }
                   >
                     <span className="prof-dot">{g.isActive ? '🟢' : '📦'}</span>
@@ -478,48 +554,31 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
         )}
       </div>
 
-      {/* 专属端口监听状态 & 跨订阅隔离提示 */}
+      {/* 专属端口监听状态 */}
       {selectedNode && (
-        <div className="dedicated-port-status-group">
-          <div className="dedicated-port-status">
-            <span
-              className={`port-dot ${portListening ? 'listening' : 'not-listening'}`}
-            />
-            <span>
-              专属端口：<code>127.0.0.1:{dedicatedPort}</code>
-            </span>
-            <span
-              className="port-bind-tag"
-              title={
-                effectiveProfileName
-                  ? `${effectiveProfileName} / ${selectedNode}`
-                  : selectedNode
-              }
-            >
-              {isSwitching
-                ? '正在注入并绑定节点...'
-                : portListening
-                ? `已锁定 [${
-                    effectiveProfileName ? `${effectiveProfileName} / ` : ''
-                  }${selectedNode}]`
-                : '端口未就绪'}
-            </span>
-          </div>
-
-          <div
-            className={`cross-profile-isolation-tip ${
-              isCrossProfileBound ? 'cross-active' : ''
-            }`}
+        <div className="dedicated-port-status">
+          <span
+            className={`port-dot ${portListening ? 'listening' : 'not-listening'}`}
+          />
+          <span>
+            专属端口：<code>127.0.0.1:{dedicatedPort}</code>
+          </span>
+          <span
+            className="port-bind-tag"
+            title={
+              effectiveProfileName
+                ? `${effectiveProfileName} / ${selectedNode}`
+                : selectedNode
+            }
           >
-            <ShieldCheck size={13} />
-            <span>
-              {isCrossProfileBound
-                ? `跨订阅独立直通中：Clash 当前激活 [${
-                    clashInfo.activeProfileName || '其他订阅'
-                  }]，${appLabel} 独立固定走 [${effectiveProfileName}]，切换订阅或节点互不影响`
-                : `节点底层定义已独立注入内核：后续在 Clash 切换任意订阅组或节点均不会影响 ${appLabel}`}
-            </span>
-          </div>
+            {isSwitching
+              ? '正在绑定节点...'
+              : portListening
+              ? `已锁定 [${
+                  effectiveProfileName ? `${effectiveProfileName} / ` : ''
+                }${selectedNode}]`
+              : '端口未就绪'}
+          </span>
         </div>
       )}
     </div>

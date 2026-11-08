@@ -204,13 +204,13 @@ export async function applyWindowsTimeZoneAndRegion(
 }
 
 interface OnlineTzApiSpec {
-  url: string;
+  buildUrl: (ip?: string) => string;
   extract: (data: Record<string, unknown>) => { country?: string; ianaTz?: string };
 }
 
 const ONLINE_TZ_APIS: OnlineTzApiSpec[] = [
   {
-    url: 'https://ipwho.is/',
+    buildUrl: (ip) => (ip ? `https://ipwho.is/${encodeURIComponent(ip)}` : 'https://ipwho.is/'),
     extract: (d) => {
       if (d['success'] === false) return {};
       const tzObj = d['timezone'] as Record<string, unknown> | undefined;
@@ -221,7 +221,10 @@ const ONLINE_TZ_APIS: OnlineTzApiSpec[] = [
     },
   },
   {
-    url: 'https://freeipapi.com/api/json',
+    buildUrl: (ip) =>
+      ip
+        ? `https://freeipapi.com/api/json/${encodeURIComponent(ip)}`
+        : 'https://freeipapi.com/api/json',
     extract: (d) => {
       const tzs = d['timeZones'];
       const firstTz =
@@ -237,7 +240,8 @@ const ONLINE_TZ_APIS: OnlineTzApiSpec[] = [
     },
   },
   {
-    url: 'https://ipapi.co/json/',
+    buildUrl: (ip) =>
+      ip ? `https://ipapi.co/${encodeURIComponent(ip)}/json/` : 'https://ipapi.co/json/',
     extract: (d) => ({
       country: typeof d['country_code'] === 'string' ? d['country_code'] : undefined,
       ianaTz: typeof d['timezone'] === 'string' ? d['timezone'] : undefined,
@@ -250,13 +254,17 @@ const ONLINE_TZ_APIS: OnlineTzApiSpec[] = [
  */
 export async function queryExactExitIanaTimeZone(
   proxyUrl: string | null,
-  expectedCountryCode: string
+  expectedCountryCode: string,
+  knownExitIp?: string | null
 ): Promise<string | null> {
   const expected = expectedCountryCode.trim().toUpperCase();
+  const cleanIp =
+    knownExitIp && !knownExitIp.includes(':') ? knownExitIp.trim() : undefined;
 
   for (const spec of ONLINE_TZ_APIS) {
     try {
-      const json = await requestJsonViaProxy<Record<string, unknown>>(spec.url, proxyUrl, 3200);
+      const url = spec.buildUrl(cleanIp);
+      const json = await requestJsonViaProxy<Record<string, unknown>>(url, proxyUrl, 3200);
       const { country, ianaTz } = spec.extract(json);
       // 必须明确返回国家代码且与期望国家一致，防止无国家字段或跨国脏数据污染
       if (!country || country.trim().toUpperCase() !== expected) {

@@ -63,6 +63,11 @@ interface TraceEndpoint {
 
 const BUILTIN_TRACE_ENDPOINTS: TraceEndpoint[] = [
   {
+    name: 'Cloudflare IPv4 Trace',
+    url: 'https://ipv4.icanhazip.com/cdn-cgi/trace',
+    format: 'cf-trace',
+  },
+  {
     name: 'Cloudflare Connectivity Trace',
     url: 'https://cp.cloudflare.com/cdn-cgi/trace',
     format: 'cf-trace',
@@ -73,8 +78,13 @@ const BUILTIN_TRACE_ENDPOINTS: TraceEndpoint[] = [
     format: 'cf-trace',
   },
   {
-    name: 'AWS CheckIP',
+    name: 'AWS CheckIP (IPv4)',
     url: 'https://checkip.amazonaws.com',
+    format: 'plain-ip',
+  },
+  {
+    name: 'Cloudflare ICanHazIP (IPv4)',
+    url: 'https://ipv4.icanhazip.com',
     format: 'plain-ip',
   },
   {
@@ -186,6 +196,24 @@ export class ProbeEngine extends EventEmitter {
         this.clashDebounceTimer = setTimeout(() => {
           this.clashDebounceTimer = null;
           void this.checkNow('Clash 控制接口已连接');
+        }, 300);
+      }
+
+      const cfg = this.configStore.get();
+      if (
+        info.connected &&
+        cfg.antigravityClashNode &&
+        info.antigravityPortListening &&
+        !this.antigravityNodeProbe &&
+        !this.antigravityNodeProbeError &&
+        !this.antigravityIsProbing
+      ) {
+        if (this.antigravityDebounceTimer) {
+          clearTimeout(this.antigravityDebounceTimer);
+        }
+        this.antigravityDebounceTimer = setTimeout(() => {
+          this.antigravityDebounceTimer = null;
+          void this.probeAntigravityNodeNow();
         }, 300);
       }
     });
@@ -452,33 +480,60 @@ export class ProbeEngine extends EventEmitter {
       const channelDesc = `Antigravity 专属端口 (127.0.0.1:${cfg.antigravityDedicatedPort})`;
       const endpoints = this.buildEndpointsList();
 
-      let probeSuccess: ProbeResult | null = null;
-      let lastErrMsg = '探测超时';
+      const tryAgProbeOnce = async (): Promise<{
+        result: ProbeResult | null;
+        errMsg: string;
+      }> => {
+        let errOut = '探测超时';
+        for (const ep of endpoints) {
+          try {
+            const startedAt = Date.now();
+            const rawBody = await requestTextViaProxy(ep.url, proxyUrl, 5500);
+            const latencyMs = Date.now() - startedAt;
 
-      for (const ep of endpoints) {
-        try {
-          const startedAt = Date.now();
-          const rawBody = await requestTextViaProxy(ep.url, proxyUrl, 5500);
-          const latencyMs = Date.now() - startedAt;
+            const parsed = parseTraceResponse(rawBody, ep.format);
+            if (!parsed.ip) {
+              throw new Error('响应中未解析到有效公网 IP');
+            }
 
-          const parsed = parseTraceResponse(rawBody, ep.format);
-          if (!parsed.ip) {
-            throw new Error('响应中未解析到有效公网 IP');
+            const geo = this.geoIp.lookup(parsed.ip, parsed.loc);
+            return {
+              result: {
+                ip: parsed.ip,
+                countryCode: geo.countryCode,
+                countryName: geo.countryName,
+                edgeLoc: parsed.loc,
+                viaChannel: channelDesc,
+                latencyMs,
+                checkedAt: Date.now(),
+              },
+              errMsg: '',
+            };
+          } catch (err) {
+            errOut = err instanceof Error ? err.message : String(err);
           }
+        }
+        return { result: null, errMsg: errOut };
+      };
 
-          const geo = this.geoIp.lookup(parsed.ip, parsed.loc);
-          probeSuccess = {
-            ip: parsed.ip,
-            countryCode: geo.countryCode,
-            countryName: geo.countryName,
-            edgeLoc: parsed.loc,
-            viaChannel: channelDesc,
-            latencyMs,
-            checkedAt: Date.now(),
-          };
-          break;
-        } catch (err) {
-          lastErrMsg = err instanceof Error ? err.message : String(err);
+      const firstPass = await tryAgProbeOnce();
+      let probeSuccess = firstPass.result;
+      let lastErrMsg = firstPass.errMsg;
+
+      if (!probeSuccess && cfg.antigravityClashNode) {
+        await sleep(320);
+        const rebindRes = await this.clashMonitor.configureAntigravityNode(
+          cfg.antigravityClashNode,
+          cfg.antigravityDedicatedPort,
+          cfg.antigravityClashProfileUid,
+          true
+        );
+        if (rebindRes.ok && rebindRes.listening) {
+          const secondPass = await tryAgProbeOnce();
+          probeSuccess = secondPass.result;
+          if (!probeSuccess) {
+            lastErrMsg = secondPass.errMsg;
+          }
         }
       }
 
@@ -1648,7 +1703,11 @@ export class ProbeEngine extends EventEmitter {
       if (needsCityTzLookup && this.lastProbe && this.lastProbe.countryCode === targetCode) {
         const ch = await this.resolveProxyChannel();
         if (!ch.errorHint) {
-          exactIanaTz = await queryExactExitIanaTimeZone(ch.proxyUrl, targetCode);
+          exactIanaTz = await queryExactExitIanaTimeZone(
+            ch.proxyUrl,
+            targetCode,
+            this.lastProbe.ip
+          );
         }
       }
 

@@ -29,6 +29,47 @@ export async function requestTextViaProxy(
   acceptHeader = 'text/plain, */*',
   redirectsLeft = 2
 ): Promise<string> {
+  const startedAt = Date.now();
+  try {
+    return await requestTextViaProxyOnce(
+      targetUrl,
+      proxyUrl,
+      timeoutMs,
+      acceptHeader,
+      redirectsLeft
+    );
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    const elapsed = Date.now() - startedAt;
+    const remainingMs = timeoutMs - elapsed;
+    const isTransientProxySocketDisconnect =
+      Boolean(proxyUrl) &&
+      remainingMs >= 1600 &&
+      /before secure TLS connection was established|socket hang up|ECONNRESET|ECONNREFUSED|EPIPE/i.test(
+        msg
+      );
+    if (!isTransientProxySocketDisconnect) {
+      throw err;
+    }
+    await new Promise((r) => setTimeout(r, 240));
+    const retryBudget = Math.max(1500, timeoutMs - (Date.now() - startedAt));
+    return requestTextViaProxyOnce(
+      targetUrl,
+      proxyUrl,
+      retryBudget,
+      acceptHeader,
+      redirectsLeft
+    );
+  }
+}
+
+async function requestTextViaProxyOnce(
+  targetUrl: string,
+  proxyUrl: string | null,
+  timeoutMs: number,
+  acceptHeader = 'text/plain, */*',
+  redirectsLeft = 2
+): Promise<string> {
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(targetUrl);
