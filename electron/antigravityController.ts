@@ -1,17 +1,15 @@
-import { execFile, spawn } from 'node:child_process';
+import { execFile } from 'node:child_process';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { AntigravityRuntimeState } from '../src/shared/types';
 import { fileOrReparseExists } from './claudeController';
-import { decodeWinConsoleBuffer, listRunningProcesses } from './processGuard';
+import {
+  decodeWinConsoleBuffer,
+  listRunningProcesses,
+  spawnDetachedWithProxyCheck,
+} from './processGuard';
 
 export const ANTIGRAVITY_PROCESS_PATTERNS = [
-  'Antigravity.exe',
-  'language_server.exe',
-  'language_server_windows_x64.exe',
-];
-
-export const ANTIGRAVITY_TUN_PROCESS_NAMES = [
   'Antigravity.exe',
   'language_server.exe',
   'language_server_windows_x64.exe',
@@ -24,14 +22,17 @@ const ANTIGRAVITY_LS_PROCESS_NAMES = new Set([
 ]);
 
 let launchedByGuardPort: number | null = null;
+let launchedByGuardAt = 0;
 let cachedUiPidsSignature = '';
 let cachedCheckedPort = 0;
 let cachedCmdlineProxied = false;
 
 export function markAntigravityLaunchedByGuard(port: number | null): void {
   launchedByGuardPort = port;
+  launchedByGuardAt = port !== null ? Date.now() : 0;
   if (port === null) {
     cachedUiPidsSignature = '';
+    cachedCheckedPort = 0;
     cachedCmdlineProxied = false;
   }
 }
@@ -112,7 +113,8 @@ function checkAntigravityCommandLineProxy(dedicatedPort: number): Promise<boolea
 }
 
 export async function inspectRunningAntigravityProcesses(
-  dedicatedPort: number
+  dedicatedPort: number,
+  forceFresh = false
 ): Promise<{
   running: boolean;
   uiProcessCount: number;
@@ -120,7 +122,7 @@ export async function inspectRunningAntigravityProcesses(
   totalProcessCount: number;
   proxiedSession: boolean;
 }> {
-  const procs = await listRunningProcesses();
+  const procs = await listRunningProcesses(forceFresh);
   const uiPids: number[] = [];
   const lsPids: number[] = [];
 
@@ -138,46 +140,43 @@ export async function inspectRunningAntigravityProcesses(
   const totalProcessCount = uiProcessCount + languageServerCount;
   const running = totalProcessCount > 0;
 
-  if (!running) {
+  if (!running || uiProcessCount === 0) {
     launchedByGuardPort = null;
+    launchedByGuardAt = 0;
     cachedUiPidsSignature = '';
+    cachedCheckedPort = 0;
     cachedCmdlineProxied = false;
     return {
-      running: false,
-      uiProcessCount: 0,
-      languageServerCount: 0,
-      totalProcessCount: 0,
-      proxiedSession: false,
-    };
-  }
-
-  if (launchedByGuardPort === dedicatedPort && uiProcessCount > 0) {
-    return {
-      running: true,
+      running,
       uiProcessCount,
       languageServerCount,
       totalProcessCount,
-      proxiedSession: true,
+      proxiedSession: false,
     };
   }
 
   uiPids.sort((a, b) => a - b);
   const sig = uiPids.join(',');
-  if (uiProcessCount > 0 && (sig !== cachedUiPidsSignature || cachedCheckedPort !== dedicatedPort)) {
+  if (sig !== cachedUiPidsSignature || cachedCheckedPort !== dedicatedPort) {
     cachedUiPidsSignature = sig;
     cachedCheckedPort = dedicatedPort;
     cachedCmdlineProxied = await checkAntigravityCommandLineProxy(dedicatedPort);
     if (cachedCmdlineProxied) {
       launchedByGuardPort = dedicatedPort;
+    } else if (Date.now() - launchedByGuardAt > 6000) {
+      launchedByGuardPort = null;
     }
   }
+
+  const inLaunchGrace =
+    launchedByGuardPort === dedicatedPort && Date.now() - launchedByGuardAt <= 6000;
 
   return {
     running: true,
     uiProcessCount,
     languageServerCount,
     totalProcessCount,
-    proxiedSession: cachedCmdlineProxied || launchedByGuardPort === dedicatedPort,
+    proxiedSession: cachedCmdlineProxied || inLaunchGrace,
   };
 }
 
@@ -215,47 +214,5 @@ export async function spawnAntigravityWithDedicatedProxy(
     no_proxy: noProxy,
   };
 
-  return new Promise((resolve) => {
-    try {
-      const child = spawn(exePath, args, {
-        cwd: path.dirname(exePath),
-        detached: true,
-        stdio: 'ignore',
-        windowsHide: false,
-        env,
-      });
-
-      let settled = false;
-      const finish = (res: { ok: boolean; error?: string }) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        resolve(res);
-      };
-
-      child.once('error', (err) => {
-        finish({ ok: false, error: err.message });
-      });
-
-      child.once('exit', (code) => {
-        if (code !== null && code !== 0) {
-          finish({ ok: false, error: `进程异常退出 (代码 ${code})` });
-        }
-      });
-
-      const timer = setTimeout(() => {
-        try {
-          child.unref();
-        } catch {
-          // ignore
-        }
-        finish({ ok: true });
-      }, 450);
-    } catch (err) {
-      resolve({
-        ok: false,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-  });
+  return spawnDetachedWithProxyCheck(exePath, args, env, path.dirname(exePath));
 }

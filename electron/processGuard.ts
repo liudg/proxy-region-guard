@@ -1,4 +1,4 @@
-import { execFile } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import * as path from 'node:path';
 import { setTimeout as sleep } from 'node:timers/promises';
 import {
@@ -274,4 +274,58 @@ export async function terminateProtectedProcesses(patterns: string[]): Promise<P
     accessDenied: anyAccessDenied && stillAlive,
     errorDetail,
   };
+}
+
+/**
+ * 统一分离式启动目标可执行文件并等待 450ms 确认未立即报错退出
+ */
+export function spawnDetachedWithProxyCheck(
+  exePath: string,
+  args: string[],
+  env: NodeJS.ProcessEnv,
+  cwd?: string
+): Promise<{ ok: boolean; error?: string }> {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(exePath, args, {
+        ...(cwd ? { cwd } : {}),
+        detached: true,
+        stdio: 'ignore',
+        windowsHide: false,
+        env,
+      });
+
+      let settled = false;
+      const finish = (res: { ok: boolean; error?: string }) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(res);
+      };
+
+      child.once('error', (err) => {
+        finish({ ok: false, error: err.message });
+      });
+
+      child.once('exit', (code) => {
+        if (code !== null && code !== 0) {
+          finish({ ok: false, error: `进程异常退出 (代码 ${code})` });
+        }
+      });
+
+      const timer = setTimeout(() => {
+        try {
+          child.unref();
+        } catch {
+          // ignore
+        }
+        finish({ ok: true });
+      }, 450);
+    } catch (err) {
+      resolve({
+        ok: false,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  });
 }

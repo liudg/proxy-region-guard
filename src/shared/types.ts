@@ -36,8 +36,6 @@ export interface AppConfig {
   selectedClashNode: string | null;        // 选定的指定 Clash 节点名称
   selectedClashProfileUid: string | null;  // 选定节点所属的 Clash 订阅组 UID（支持跨订阅固定）
   selectedClashProfileName: string | null; // 选定节点所属的 Clash 订阅组名称
-  selectedClashNodeRaw?: Record<string, unknown> | null;          // 缓存的节点底层完整配置（跨订阅与重启持久化）
-  selectedClashNodeDialerRaw?: Array<Record<string, unknown>> | null; // 缓存的链式前置节点定义
   dedicatedProxyPort: number;              // 为所选节点分配的本地独立专属代理端口（默认 27897）
   claudeExePath: string;                   // 自定义 Claude Desktop 启动路径（留空则自动探测）
   claudeExclusiveGuard: boolean;           // 唯一入口守护：禁止任何外部途径启动 Claude，不一致立杀
@@ -46,8 +44,6 @@ export interface AppConfig {
   antigravityClashNode: string | null;        // Antigravity 独立指定的 Clash 节点名称
   antigravityClashProfileUid: string | null;  // Antigravity 选定节点所属的 Clash 订阅组 UID（支持跨订阅固定）
   antigravityClashProfileName: string | null; // Antigravity 选定节点所属的 Clash 订阅组名称
-  antigravityClashNodeRaw?: Record<string, unknown> | null;          // 缓存的 Antigravity 节点底层完整配置
-  antigravityClashNodeDialerRaw?: Array<Record<string, unknown>> | null; // 缓存的 Antigravity 链式前置节点定义
   antigravityDedicatedPort: number;           // Antigravity 独立专属本地代理端口（默认 27898）
   antigravityExePath: string;                 // 自定义 Antigravity.exe 启动路径（留空则自动探测）
 }
@@ -162,6 +158,7 @@ export interface GuardEventLog {
 }
 
 export interface AlertPayload {
+  source?: 'claude' | 'monitor';
   alertType: 'mismatch' | 'disconnect' | 'locale-mismatch' | 'unauthorized-launch' | 'recovered';
   expectedCode: string | null;
   expectedName: string | null;

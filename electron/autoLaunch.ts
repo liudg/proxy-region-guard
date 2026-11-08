@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-export const AUTOSTART_ARG = '--autostart';
+const AUTOSTART_ARG = '--autostart';
 const REGISTRY_VALUE_NAME = 'ProxyRegionGuard';
 const SCHEDULED_TASK_NAME = 'ProxyRegionGuard';
 const RUN_REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
@@ -222,10 +222,6 @@ function hasRegistryRunValue(): boolean {
   } catch {
     return false;
   }
-}
-
-export function isLaunchedFromAutoStart(argv: string[] = process.argv): boolean {
-  return argv.includes(AUTOSTART_ARG);
 }
 
 export function applyAutoLaunchSetting(enable: boolean): boolean {

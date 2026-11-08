@@ -286,6 +286,7 @@ export const AlertPopup: React.FC = () => {
           !isDisconnect &&
           !isLocaleMismatch &&
           !isUnauthorizedLaunch &&
+          payload.source !== 'claude' &&
           isValidIsoCountryCode(payload.actualCode) && (
             <button
               className="btn-alert-secondary"

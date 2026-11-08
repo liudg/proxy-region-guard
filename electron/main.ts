@@ -495,9 +495,18 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
   const probeValid = Boolean(
     state.lastProbe && isValidIsoCountryCode(state.lastProbe.countryCode)
   );
-  const canSyncLocale = Boolean(state.config.defaultCountryCode || probeValid);
+  const claudeValid = Boolean(
+    state.claudeState.proxyCountryCode &&
+      isValidIsoCountryCode(state.claudeState.proxyCountryCode)
+  );
+  const canSyncLocale = Boolean(
+    state.config.defaultCountryCode || probeValid || claudeValid
+  );
   const syncTargetName =
-    state.config.defaultCountryName || (probeValid ? state.lastProbe?.countryName : '') || '';
+    state.config.defaultCountryName ||
+    (probeValid ? state.lastProbe?.countryName : '') ||
+    (claudeValid ? state.claudeState.proxyCountryName : '') ||
+    '';
 
   const menuSig = [
     state.status,
@@ -774,26 +783,32 @@ function registerIpcHandlers(): void {
       probeEngine.restartHeartbeatTimer();
     }
 
-    if (
+    const agChanged =
       prevCfg.antigravityClashNode !== nextCfg.antigravityClashNode ||
       prevCfg.antigravityClashProfileUid !== nextCfg.antigravityClashProfileUid ||
-      prevCfg.antigravityDedicatedPort !== nextCfg.antigravityDedicatedPort
-    ) {
-      return probeEngine.selectAntigravityClashNode(
+      prevCfg.antigravityDedicatedPort !== nextCfg.antigravityDedicatedPort;
+
+    const claudeChanged =
+      prevCfg.selectedClashNode !== nextCfg.selectedClashNode ||
+      prevCfg.selectedClashProfileUid !== nextCfg.selectedClashProfileUid ||
+      prevCfg.dedicatedProxyPort !== nextCfg.dedicatedProxyPort;
+
+    if (agChanged) {
+      await probeEngine.selectAntigravityClashNode(
         nextCfg.antigravityClashNode,
         nextCfg.antigravityClashProfileUid
       );
     }
 
-    if (
-      prevCfg.selectedClashNode !== nextCfg.selectedClashNode ||
-      prevCfg.selectedClashProfileUid !== nextCfg.selectedClashProfileUid ||
-      prevCfg.dedicatedProxyPort !== nextCfg.dedicatedProxyPort
-    ) {
-      return probeEngine.selectClashNode(
+    if (claudeChanged) {
+      await probeEngine.selectClashNode(
         nextCfg.selectedClashNode,
         nextCfg.selectedClashProfileUid
       );
+    }
+
+    if (agChanged || claudeChanged) {
+      return probeEngine.getSnapshot();
     }
 
     const proxyCfgChanged =
@@ -823,15 +838,17 @@ function registerIpcHandlers(): void {
   ipcMain.handle('guard:get-alert-data', () => latestAlertPayload);
 
   ipcMain.handle('guard:accept-current-from-alert', () => {
-    const snap = probeEngine.getSnapshot();
-    if (snap.lastProbe && isValidIsoCountryCode(snap.lastProbe.countryCode)) {
-      configStore.update({
-        defaultCountryCode: snap.lastProbe.countryCode,
-        defaultCountryName: snap.lastProbe.countryName,
-      });
-      probeEngine.evaluateStatusOnly(
-        `已在警告窗确认将 [${snap.lastProbe.countryName}] 设为新默认地区`
-      );
+    if (latestAlertPayload?.source !== 'claude') {
+      const snap = probeEngine.getSnapshot();
+      if (snap.lastProbe && isValidIsoCountryCode(snap.lastProbe.countryCode)) {
+        configStore.update({
+          defaultCountryCode: snap.lastProbe.countryCode,
+          defaultCountryName: snap.lastProbe.countryName,
+        });
+        probeEngine.evaluateStatusOnly(
+          `已在警告窗确认将 [${snap.lastProbe.countryName}] 设为新默认地区`
+        );
+      }
     }
     hideAlertWindow();
   });
@@ -875,11 +892,6 @@ if (tryRelaunchAsWindowsAdmin()) {
       const appRoot = app.getAppPath();
 
       configStore = new ConfigStore();
-      const initialCfg = configStore.get();
-      const effectiveAutoLaunch = reconcileAutoLaunchOnStartup(initialCfg.autoLaunch);
-      if (effectiveAutoLaunch !== initialCfg.autoLaunch) {
-        configStore.update({ autoLaunch: effectiveAutoLaunch });
-      }
 
       geoIpService = new GeoIpService();
       await geoIpService.init(appRoot);
@@ -906,6 +918,17 @@ if (tryRelaunchAsWindowsAdmin()) {
       setupTray();
 
       await probeEngine.start();
+
+      // 延迟执行计划任务/注册表自启状态校验，避免同步子进程阻塞主窗口首屏渲染
+      setTimeout(() => {
+        if (isQuitting) return;
+        const curCfg = configStore.get();
+        const effectiveAutoLaunch = reconcileAutoLaunchOnStartup(curCfg.autoLaunch);
+        if (effectiveAutoLaunch !== curCfg.autoLaunch) {
+          configStore.update({ autoLaunch: effectiveAutoLaunch });
+          broadcastState(probeEngine.getSnapshot());
+        }
+      }, 1500).unref?.();
     });
   }
 }

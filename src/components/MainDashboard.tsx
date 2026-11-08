@@ -258,6 +258,7 @@ export const MainDashboard: React.FC = () => {
         dedicatedProxyPort: portNum,
       });
       setState(next);
+      showTimedClaudeFeedback(true, `Claude 专属代理端口已更新为 127.0.0.1:${portNum}`);
     } finally {
       setIsSwitchingNode(false);
     }
@@ -1096,11 +1097,20 @@ export const MainDashboard: React.FC = () => {
                                 title={claudeState.nodeProbe.regionMismatchDetail}
                               >
                                 ⚠️ 实际识别:{' '}
-                                {claudeState.nodeProbe.googleCountryCode &&
-                                claudeState.nodeProbe.googleCountryCode !==
-                                  claudeState.proxyCountryCode
-                                  ? `Google=${claudeState.nodeProbe.googleCountryName}(${claudeState.nodeProbe.googleCountryCode})`
-                                  : `Claude=${claudeState.nodeProbe.claudeTraceLoc}`}
+                                {[
+                                  claudeState.nodeProbe.googleCountryCode &&
+                                  claudeState.nodeProbe.googleCountryCode !==
+                                    claudeState.proxyCountryCode
+                                    ? `Google=${claudeState.nodeProbe.googleCountryName}(${claudeState.nodeProbe.googleCountryCode})`
+                                    : null,
+                                  claudeState.nodeProbe.claudeTraceLoc &&
+                                  claudeState.nodeProbe.claudeTraceLoc !==
+                                    claudeState.proxyCountryCode
+                                    ? `Claude=${claudeState.nodeProbe.claudeTraceLoc}`
+                                    : null,
+                                ]
+                                  .filter(Boolean)
+                                  .join(' · ')}
                               </small>
                             ) : (
                               <small

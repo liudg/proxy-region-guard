@@ -28,16 +28,12 @@ export const DEFAULT_CONFIG: AppConfig = {
   selectedClashNode: null,
   selectedClashProfileUid: null,
   selectedClashProfileName: null,
-  selectedClashNodeRaw: null,
-  selectedClashNodeDialerRaw: null,
   dedicatedProxyPort: 27897,
   claudeExePath: '',
   claudeExclusiveGuard: true,
   antigravityClashNode: null,
   antigravityClashProfileUid: null,
   antigravityClashProfileName: null,
-  antigravityClashNodeRaw: null,
-  antigravityClashNodeDialerRaw: null,
   antigravityDedicatedPort: 27898,
   antigravityExePath: '',
 };
@@ -57,25 +53,6 @@ function sanitizePatternList(raw: unknown): string[] {
     }
   }
   return out;
-}
-
-function sanitizeRawProxyObj(raw: unknown): Record<string, unknown> | null {
-  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const obj = raw as Record<string, unknown>;
-  if (typeof obj['name'] !== 'string' || typeof obj['type'] !== 'string') return null;
-  return structuredClone(obj);
-}
-
-function sanitizeRawProxyList(raw: unknown): Array<Record<string, unknown>> | null {
-  if (!Array.isArray(raw)) return null;
-  const out: Array<Record<string, unknown>> = [];
-  for (const item of raw) {
-    const clean = sanitizeRawProxyObj(item);
-    if (clean) {
-      out.push(clean);
-    }
-  }
-  return out.length > 0 ? out : null;
 }
 
 function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
@@ -124,14 +101,6 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
       ? raw.selectedClashProfileName.trim()
       : null;
 
-  const selectedClashNodeRaw = selectedClashNode
-    ? sanitizeRawProxyObj(raw.selectedClashNodeRaw)
-    : null;
-
-  const selectedClashNodeDialerRaw = selectedClashNode
-    ? sanitizeRawProxyList(raw.selectedClashNodeDialerRaw)
-    : null;
-
   const dedPortNum = Number(raw.dedicatedProxyPort);
   const dedicatedProxyPort =
     Number.isFinite(dedPortNum) && dedPortNum >= 1024 && dedPortNum <= 65535
@@ -164,14 +133,6 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     raw.antigravityClashProfileName.trim()
       ? raw.antigravityClashProfileName.trim()
       : null;
-
-  const antigravityClashNodeRaw = antigravityClashNode
-    ? sanitizeRawProxyObj(raw.antigravityClashNodeRaw)
-    : null;
-
-  const antigravityClashNodeDialerRaw = antigravityClashNode
-    ? sanitizeRawProxyList(raw.antigravityClashNodeDialerRaw)
-    : null;
 
   const agPortNum = Number(raw.antigravityDedicatedPort);
   let antigravityDedicatedPort =
@@ -229,16 +190,12 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     selectedClashNode,
     selectedClashProfileUid,
     selectedClashProfileName,
-    selectedClashNodeRaw,
-    selectedClashNodeDialerRaw,
     dedicatedProxyPort,
     claudeExePath,
     claudeExclusiveGuard,
     antigravityClashNode,
     antigravityClashProfileUid,
     antigravityClashProfileName,
-    antigravityClashNodeRaw,
-    antigravityClashNodeDialerRaw,
     antigravityDedicatedPort,
     antigravityExePath,
   };

@@ -77,43 +77,38 @@ async function main() {
   const srcExe = path.join(appOutDir, 'electron.exe');
   const destExe = path.join(appOutDir, '代理地区卫士.exe');
 
-  let inPlaceUpdate = false;
   if (fs.existsSync(destExe)) {
     try {
       const fd = fs.openSync(destExe, 'r+');
       fs.closeSync(fd);
     } catch {
-      inPlaceUpdate = true;
+      throw new Error(
+        '检测到「代理地区卫士.exe」正在以管理员权限运行且无法从当前非管理员终端自动关闭。请先手动退出运行中的「代理地区卫士」，或以管理员身份运行 npm run dist。'
+      );
     }
   }
 
-  if (!inPlaceUpdate && fs.existsSync(appOutDir)) {
-    try {
-      fs.rmSync(appOutDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 150 });
-    } catch {
-      inPlaceUpdate = true;
-    }
+  if (fs.existsSync(appOutDir)) {
+    fs.rmSync(appOutDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 150 });
   }
   fs.mkdirSync(appOutDir, { recursive: true });
 
-  if (!inPlaceUpdate) {
-    const electronDistDir = path.join(rootDir, 'node_modules', 'electron', 'dist');
-    copyDirFiltered(electronDistDir, appOutDir);
+  const electronDistDir = path.join(rootDir, 'node_modules', 'electron', 'dist');
+  copyDirFiltered(electronDistDir, appOutDir);
 
-    // 移除默认占位应用包
-    const defaultAsar = path.join(appOutDir, 'resources', 'default_app.asar');
-    if (fs.existsSync(defaultAsar)) {
-      fs.rmSync(defaultAsar, { force: true });
-    }
+  // 移除默认占位应用包
+  const defaultAsar = path.join(appOutDir, 'resources', 'default_app.asar');
+  if (fs.existsSync(defaultAsar)) {
+    fs.rmSync(defaultAsar, { force: true });
+  }
 
-    // 精简多语言包，仅保留简体中文与美式英语，减小约 35MB 体积
-    const localesDir = path.join(appOutDir, 'locales');
-    if (fs.existsSync(localesDir)) {
-      const keepLocales = new Set(['zh-CN.pak', 'en-US.pak']);
-      for (const f of fs.readdirSync(localesDir)) {
-        if (!keepLocales.has(f)) {
-          fs.rmSync(path.join(localesDir, f), { force: true });
-        }
+  // 精简多语言包，仅保留简体中文与美式英语，减小约 35MB 体积
+  const localesDir = path.join(appOutDir, 'locales');
+  if (fs.existsSync(localesDir)) {
+    const keepLocales = new Set(['zh-CN.pak', 'en-US.pak']);
+    for (const f of fs.readdirSync(localesDir)) {
+      if (!keepLocales.has(f)) {
+        fs.rmSync(path.join(localesDir, f), { force: true });
       }
     }
   }
@@ -145,31 +140,19 @@ async function main() {
   copyDirFiltered(path.join(rootDir, 'dist'), path.join(stageDir, 'dist'));
 
   const targetResourcesDir = path.join(appOutDir, 'resources');
-  try {
-    const asar = await import('@electron/asar');
-    await asar.createPackage(stageDir, path.join(targetResourcesDir, 'app.asar'));
-  } catch {
-    copyDirFiltered(stageDir, path.join(targetResourcesDir, 'app'));
-  }
+  const asar = await import('@electron/asar');
+  await asar.createPackage(stageDir, path.join(targetResourcesDir, 'app.asar'));
   fs.rmSync(stageDir, { recursive: true, force: true });
 
   const mmdbSrc = path.join(rootDir, 'resources', 'geolite2-country.mmdb');
   if (!fs.existsSync(mmdbSrc)) {
     throw new Error(`未找到离线 GeoIP 数据库: ${mmdbSrc}`);
   }
-  try {
-    fs.copyFileSync(mmdbSrc, path.join(targetResourcesDir, 'geolite2-country.mmdb'));
-  } catch {
-    // 若正在运行且 mmdb 已被映射锁定，保留既有相同文件
-  }
+  fs.copyFileSync(mmdbSrc, path.join(targetResourcesDir, 'geolite2-country.mmdb'));
 
-  if (!inPlaceUpdate) {
-    console.log('4/5 正在写入可执行文件名称与图标元数据...');
-    fs.renameSync(srcExe, destExe);
-    await stampExeResourcesWithRetry(destExe, icoPath);
-  } else {
-    console.log('4/5 检测到卫士正在运行，已完成热更新打包 (resources/app.asar)...');
-  }
+  console.log('4/5 正在写入可执行文件名称与图标元数据...');
+  fs.renameSync(srcExe, destExe);
+  await stampExeResourcesWithRetry(destExe, icoPath);
 
   const zipName = `代理地区卫士-v${prodPkg.version}-win32-x64.zip`;
   const zipPath = path.join(releaseRoot, zipName);

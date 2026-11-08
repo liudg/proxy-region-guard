@@ -1,11 +1,12 @@
-import { execFile, execFileSync, spawn } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { ClaudeRuntimeState } from '../src/shared/types';
 import {
   decodeWinConsoleBuffer,
-  parseTasklistCsvOutput,
+  listRunningProcesses,
+  spawnDetachedWithProxyCheck,
 } from './processGuard';
 
 export const CLAUDE_DESKTOP_PROCESS_PATTERNS = [
@@ -18,14 +19,21 @@ export const CLAUDE_DESKTOP_PROCESS_PATTERNS = [
   'cowork-svc.exe',
 ];
 
-export const CLAUDE_TUN_PROCESS_NAMES = [...CLAUDE_DESKTOP_PROCESS_PATTERNS];
-
 const CLAUDE_UI_PROCESS_NAMES = new Set([
   'claude.exe',
   'claude-desktop.exe',
 ]);
 
 let cachedMsixDirectExe: string | null = null;
+let launchedClaudePort: number | null = null;
+
+export function markClaudeLaunchedByGuard(port: number | null): void {
+  launchedClaudePort = port;
+}
+
+export function getLaunchedClaudePort(): number | null {
+  return launchedClaudePort;
+}
 
 export function fileOrReparseExists(filePath: string | null | undefined): boolean {
   if (!filePath) return false;
@@ -186,61 +194,27 @@ export function areAnyPidsAlive(pids: number[]): { aliveCount: number; alivePids
   return { aliveCount: alivePids.length, alivePids };
 }
 
-let inflightClaudeCountPromise: Promise<{
-  running: boolean;
-  count: number;
-  pids: number[];
-}> | null = null;
-
-export function countRunningClaudeProcesses(): Promise<{
+export async function countRunningClaudeProcesses(forceFresh = false): Promise<{
   running: boolean;
   count: number;
   pids: number[];
 }> {
   if (process.platform !== 'win32') {
-    return Promise.resolve({ running: false, count: 0, pids: [] });
+    return { running: false, count: 0, pids: [] };
   }
 
-  if (inflightClaudeCountPromise) {
-    return inflightClaudeCountPromise;
-  }
-
-  const promise = new Promise<{
-    running: boolean;
-    count: number;
-    pids: number[];
-  }>((resolve) => {
-    execFile(
-      'tasklist.exe',
-      ['/FO', 'CSV', '/NH', '/FI', 'IMAGENAME eq claude*'],
-      { encoding: 'buffer', windowsHide: true, timeout: 3000, maxBuffer: 64 * 1024 },
-      (err, stdout) => {
-        if (err && (!stdout || stdout.length === 0)) {
-          resolve({ running: false, count: 0, pids: [] });
-          return;
-        }
-        const procs = parseTasklistCsvOutput(stdout);
-        const matchedPids: number[] = [];
-        for (const p of procs) {
-          if (CLAUDE_UI_PROCESS_NAMES.has(p.imageName.toLowerCase())) {
-            matchedPids.push(p.pid);
-          }
-        }
-        resolve({
-          running: matchedPids.length > 0,
-          count: matchedPids.length,
-          pids: matchedPids,
-        });
-      }
-    );
-  }).finally(() => {
-    if (inflightClaudeCountPromise === promise) {
-      inflightClaudeCountPromise = null;
+  const procs = await listRunningProcesses(forceFresh);
+  const matchedPids: number[] = [];
+  for (const p of procs) {
+    if (CLAUDE_UI_PROCESS_NAMES.has(p.imageName.toLowerCase())) {
+      matchedPids.push(p.pid);
     }
-  });
-
-  inflightClaudeCountPromise = promise;
-  return promise;
+  }
+  return {
+    running: matchedPids.length > 0,
+    count: matchedPids.length,
+    pids: matchedPids,
+  };
 }
 
 /**
@@ -294,52 +268,7 @@ export async function spawnClaudeWithDedicatedProxy(
     no_proxy: 'localhost,127.0.0.1,::1',
   };
 
-  const trySpawn = (targetExe: string): Promise<{ ok: boolean; error?: string }> => {
-    return new Promise((resolve) => {
-      try {
-        const child = spawn(targetExe, args, {
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: false,
-          env,
-        });
-
-        let settled = false;
-        const finish = (res: { ok: boolean; error?: string }) => {
-          if (settled) return;
-          settled = true;
-          clearTimeout(timer);
-          resolve(res);
-        };
-
-        child.once('error', (err) => {
-          finish({ ok: false, error: err.message });
-        });
-
-        child.once('exit', (code) => {
-          if (code !== null && code !== 0) {
-            finish({ ok: false, error: `进程异常退出 (代码 ${code})` });
-          }
-        });
-
-        const timer = setTimeout(() => {
-          try {
-            child.unref();
-          } catch {
-            // ignore
-          }
-          finish({ ok: true });
-        }, 450);
-      } catch (err) {
-        resolve({
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
-    });
-  };
-
-  const primaryRes = await trySpawn(exePath);
+  const primaryRes = await spawnDetachedWithProxyCheck(exePath, args, env);
   if (primaryRes.ok) {
     return primaryRes;
   }
@@ -351,7 +280,7 @@ export async function spawnClaudeWithDedicatedProxy(
       : null);
 
   if (resolvedFallback && resolvedFallback !== exePath) {
-    return trySpawn(resolvedFallback);
+    return spawnDetachedWithProxyCheck(resolvedFallback, args, env);
   }
 
   return primaryRes;

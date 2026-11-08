@@ -11,8 +11,8 @@ import {
   ClashProxyNodeOption,
   ClashRuntimeInfo,
 } from '../src/shared/types';
-import { ANTIGRAVITY_TUN_PROCESS_NAMES } from './antigravityController';
-import { CLAUDE_TUN_PROCESS_NAMES } from './claudeController';
+import { ANTIGRAVITY_PROCESS_PATTERNS } from './antigravityController';
+import { CLAUDE_DESKTOP_PROCESS_PATTERNS } from './claudeController';
 
 interface JsYamlModule {
   load: (str: string) => unknown;
@@ -89,8 +89,8 @@ const RELOAD_GRACE_WINDOW_MS = 6500;
 
 const MANAGED_PROCESS_RULE_PREFIXES = Array.from(
   new Set([
-    ...CLAUDE_TUN_PROCESS_NAMES.map((p) => `process-name,${p.toLowerCase()},`),
-    ...ANTIGRAVITY_TUN_PROCESS_NAMES.map((p) => `process-name,${p.toLowerCase()},`),
+    ...CLAUDE_DESKTOP_PROCESS_PATTERNS.map((p) => `process-name,${p.toLowerCase()},`),
+    ...ANTIGRAVITY_PROCESS_PATTERNS.map((p) => `process-name,${p.toLowerCase()},`),
   ])
 );
 
@@ -139,8 +139,6 @@ export interface DedicatedNodeBindResult {
   listening: boolean;
   profileUid?: string | null;
   profileName?: string | null;
-  nodeRaw?: Record<string, unknown> | null;
-  dialerRaw?: Array<Record<string, unknown>> | null;
   error?: string;
 }
 
@@ -191,7 +189,7 @@ export class ClashMonitor extends EventEmitter {
       listenerName: CLAUDE_LISTENER_NAME,
       internalProxyName: DEDICATED_PROXY_INTERNAL_NAME,
       dialerPrefix: DEDICATED_DIALER_PREFIX,
-      processNames: CLAUDE_TUN_PROCESS_NAMES,
+      processNames: CLAUDE_DESKTOP_PROCESS_PATTERNS,
       desiredNodeName: null,
       desiredProfileUid: null,
       desiredProfileName: null,
@@ -210,7 +208,7 @@ export class ClashMonitor extends EventEmitter {
       listenerName: ANTIGRAVITY_LISTENER_NAME,
       internalProxyName: ANTIGRAVITY_PROXY_INTERNAL_NAME,
       dialerPrefix: ANTIGRAVITY_DIALER_PREFIX,
-      processNames: ANTIGRAVITY_TUN_PROCESS_NAMES,
+      processNames: ANTIGRAVITY_PROCESS_PATTERNS,
       desiredNodeName: null,
       desiredProfileUid: null,
       desiredProfileName: null,
@@ -270,28 +268,24 @@ export class ClashMonitor extends EventEmitter {
     antigravityPort = 27898,
     initialProfileUid: string | null = null,
     initialProfileName: string | null = null,
-    initialNodeRaw: Record<string, unknown> | null = null,
-    initialDialerRaw: Array<Record<string, unknown>> | null = null,
     initialAgProfileUid: string | null = null,
-    initialAgProfileName: string | null = null,
-    initialAgNodeRaw: Record<string, unknown> | null = null,
-    initialAgDialerRaw: Array<Record<string, unknown>> | null = null
+    initialAgProfileName: string | null = null
   ): void {
     const claudeSlot = this.slots.claude;
     claudeSlot.desiredNodeName = initialClaudeNode ? initialClaudeNode.trim() : null;
     claudeSlot.desiredPort = claudePort;
     claudeSlot.desiredProfileUid = initialProfileUid ? initialProfileUid.trim() : null;
     claudeSlot.desiredProfileName = initialProfileName ? initialProfileName.trim() : null;
-    claudeSlot.desiredNodeRaw = initialNodeRaw ? structuredClone(initialNodeRaw) : null;
-    claudeSlot.desiredDialerRaw = initialDialerRaw ? structuredClone(initialDialerRaw) : null;
+    claudeSlot.desiredNodeRaw = null;
+    claudeSlot.desiredDialerRaw = null;
 
     const agSlot = this.slots.antigravity;
     agSlot.desiredNodeName = initialAntigravityNode ? initialAntigravityNode.trim() : null;
     agSlot.desiredPort = antigravityPort;
     agSlot.desiredProfileUid = initialAgProfileUid ? initialAgProfileUid.trim() : null;
     agSlot.desiredProfileName = initialAgProfileName ? initialAgProfileName.trim() : null;
-    agSlot.desiredNodeRaw = initialAgNodeRaw ? structuredClone(initialAgNodeRaw) : null;
-    agSlot.desiredDialerRaw = initialAgDialerRaw ? structuredClone(initialAgDialerRaw) : null;
+    agSlot.desiredNodeRaw = null;
+    agSlot.desiredDialerRaw = null;
 
     this.stopped = false;
 
@@ -386,8 +380,6 @@ export class ClashMonitor extends EventEmitter {
         listening: false,
         profileUid: slot.desiredProfileUid,
         profileName: slot.desiredProfileName,
-        nodeRaw: slot.desiredNodeRaw,
-        dialerRaw: slot.desiredDialerRaw,
         error: '未检测到运行中的 Clash Verge / Mihomo 控制接口',
       };
     }
@@ -410,8 +402,6 @@ export class ClashMonitor extends EventEmitter {
       listening,
       profileUid: slot.desiredProfileUid,
       profileName: slot.desiredProfileName,
-      nodeRaw: slot.desiredNodeRaw,
-      dialerRaw: slot.desiredDialerRaw,
       error: channelErr || res.generalError,
     };
   }
@@ -595,9 +585,7 @@ export class ClashMonitor extends EventEmitter {
         for (const slot of [claudeSlot, agSlot]) {
           if (!slot.desiredNodeName) continue;
           const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
-          const nodeAliveInKernel = Boolean(
-            proxiesMap[expectedInternal] || proxiesMap[slot.desiredNodeName]
-          );
+          const nodeAliveInKernel = Boolean(proxiesMap[expectedInternal]);
           const portAlive = nodeAliveInKernel
             ? await isLocalPortListening(slot.desiredPort)
             : false;
@@ -900,9 +888,7 @@ export class ClashMonitor extends EventEmitter {
         }
         if (forceRebind && !recentlyReloadedSameSig) return false;
         const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
-        const nodeAliveInKernel = Boolean(
-          proxiesMap[expectedInternal] || proxiesMap[slot.desiredNodeName]
-        );
+        const nodeAliveInKernel = Boolean(proxiesMap[expectedInternal]);
         if (!nodeAliveInKernel) return false;
         return (
           slot.boundNodeName === slot.desiredNodeName &&
@@ -924,7 +910,9 @@ export class ClashMonitor extends EventEmitter {
         return { claudeListening, antigravityListening };
       }
 
-      this.scanAllClashVergeProfiles(proxiesMap);
+      if (this.profileRawLookup.size === 0) {
+        this.scanAllClashVergeProfiles(proxiesMap);
+      }
 
       const savedSelections = this.mergeSelectorSelections(
         extractSelectorSelections(proxiesMap),
@@ -2504,7 +2492,6 @@ function extractConcreteNodesFromApi(
     if (!item || !item.type) return;
     if (
       EXCLUDED_NODE_NAMES.has(item.type.toUpperCase()) ||
-      GROUP_TYPES.has(item.type) ||
       GROUP_TYPES_LOWER.has(item.type.toLowerCase())
     ) {
       return;
@@ -2751,7 +2738,7 @@ function queryDohOverHttp2(
     const timer = setTimeout(() => finish(null), timeoutMs);
 
     try {
-      client = http2.connect(urlObj.origin, { rejectUnauthorized: false });
+      client = http2.connect(urlObj.origin);
       client.on('error', () => finish(null));
 
       const sep = urlObj.search ? '&' : '?';
@@ -2802,7 +2789,6 @@ function queryDohOverHttps1(
         reqUrl,
         {
           method: 'GET',
-          rejectUnauthorized: false,
           timeout: timeoutMs,
           headers: {
             Accept: 'application/dns-message',
