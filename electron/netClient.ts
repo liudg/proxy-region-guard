@@ -3,7 +3,8 @@ import * as https from 'node:https';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 
-const MAX_RESPONSE_BYTES = 64 * 1024;
+const MAX_RESPONSE_BYTES = 256 * 1024;
+const MAX_HEADER_BYTES = 64 * 1024;
 const REDIRECT_STATUS_CODES = new Set([301, 302, 303, 307, 308]);
 
 export function normalizeProxyUrlScheme(proxyUrl: string): string {
@@ -190,6 +191,7 @@ async function requestTextViaProxyOnce(
             method: 'GET',
             path: parsedUrl.toString(),
             timeout: timeoutMs,
+            maxHeaderSize: MAX_HEADER_BYTES,
             headers,
           },
           handleResponse
@@ -213,6 +215,7 @@ async function requestTextViaProxyOnce(
             method: 'GET',
             agent,
             timeout: timeoutMs,
+            maxHeaderSize: MAX_HEADER_BYTES,
             headers: baseHeaders,
           },
           handleResponse

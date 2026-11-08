@@ -15,7 +15,11 @@ import {
   ProbeResult,
   WindowsLocaleState,
 } from '../src/shared/types';
-import { getCountryNameZh, isValidIsoCountryCode } from '../src/shared/countries';
+import {
+  getCountryNameZh,
+  isValidIsoCountryCode,
+  normalizeIsoCountryCode,
+} from '../src/shared/countries';
 import {
   DEFAULT_CHINA_REGION_CODE,
   DEFAULT_CHINA_TIMEZONE_ID,
@@ -157,6 +161,17 @@ export class ProbeEngine extends EventEmitter {
   private lastNetFingerprint = '';
   private lastAlertSignature: string | null = null;
   private lastGuardFailSignature: string | null = null;
+  private targetVerifyCache = new Map<
+    string,
+    {
+      checkedAt: number;
+      googleCountryCode?: string;
+      googleCountryName?: string;
+      claudeTraceLoc?: string;
+      claudeTraceIp?: string;
+      regionMismatchDetail?: string | null;
+    }
+  >();
 
   constructor(configStore: ConfigStore, geoIp: GeoIpService, clashMonitor: ClashMonitor) {
     super();
@@ -585,8 +600,15 @@ export class ProbeEngine extends EventEmitter {
       }
 
       if (probeSuccess) {
+        await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'antigravity', true);
         this.antigravityNodeProbe = probeSuccess;
         this.antigravityNodeProbeError = null;
+        if (probeSuccess.regionMismatchDetail) {
+          this.addLog(
+            'warn',
+            `Antigravity 节点地区预警 [${cfg.antigravityClashNode}]：${probeSuccess.regionMismatchDetail}`
+          );
+        }
       } else {
         this.antigravityNodeProbe = null;
         this.antigravityNodeProbeError = simplifyNetworkError(lastErrMsg, channelDesc);
@@ -935,19 +957,41 @@ export class ProbeEngine extends EventEmitter {
         }
 
         if (probeSuccess) {
+          const isHeartbeat = reason.includes('心跳');
+          if (isHeartbeat) {
+            // 定时心跳巡检保持原状，绝不向 Google / Claude 发起高频请求；仅沿用同 IP 已有的目标服务校验结果
+            this.applyCachedTargetServiceVerification(proxyUrl, probeSuccess);
+          } else {
+            const forceRefresh =
+              reason.includes('手动') || reason.includes('切换') || !this.claudeNodeProbe;
+            await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'claude', forceRefresh);
+          }
+
           const prevIp = this.claudeNodeProbe?.ip;
           const prevCountry = this.claudeNodeProbe?.countryCode;
+          const prevMismatch = this.claudeNodeProbe?.regionMismatchDetail;
           this.claudeNodeProbe = probeSuccess;
           this.claudeNodeProbeError = null;
 
-          if (
+          if (probeSuccess.regionMismatchDetail) {
+            if (prevMismatch !== probeSuccess.regionMismatchDetail || !isHeartbeat) {
+              this.addLog(
+                'danger',
+                `Claude 节点真伪校验未通过 [${label}]：${probeSuccess.regionMismatchDetail}`
+              );
+            }
+          } else if (
             prevIp !== probeSuccess.ip ||
             prevCountry !== probeSuccess.countryCode ||
-            !reason.includes('心跳')
+            !isHeartbeat
           ) {
+            const verifiedTag =
+              probeSuccess.googleCountryCode || probeSuccess.claudeTraceLoc
+                ? ' · 目标服务地区校验通过'
+                : '';
             this.addLog(
               'info',
-              `Claude 节点检测 [${label}]：${probeSuccess.countryName} (${probeSuccess.countryCode}) · IP: ${probeSuccess.ip} (${probeSuccess.latencyMs}ms)`
+              `Claude 节点检测 [${label}]：${probeSuccess.countryName} (${probeSuccess.countryCode})${verifiedTag} · IP: ${probeSuccess.ip} (${probeSuccess.latencyMs}ms)`
             );
           }
         } else {
@@ -1372,6 +1416,14 @@ export class ProbeEngine extends EventEmitter {
       };
     }
 
+    if (this.claudeNodeProbe.regionMismatchDetail) {
+      return {
+        safe: false,
+        reason: `节点真伪校验未通过：${this.claudeNodeProbe.regionMismatchDetail}`,
+        alertType: 'mismatch',
+      };
+    }
+
     const localeMatched = isWindowsLocaleMatchingCountry(
       this.winLocale.timeZoneId,
       this.winLocale.regionCode,
@@ -1413,7 +1465,10 @@ export class ProbeEngine extends EventEmitter {
       : false;
 
     const threeWayMatched = Boolean(
-      proxyCountryCode && winRegionMatched && winTimeZoneMatched
+      proxyCountryCode &&
+        !this.claudeNodeProbe?.regionMismatchDetail &&
+        winRegionMatched &&
+        winTimeZoneMatched
     );
 
     let launchBlockReason: string | null = null;
@@ -1431,6 +1486,8 @@ export class ProbeEngine extends EventEmitter {
       launchBlockReason = `Claude 节点出口探测异常：${
         this.claudeNodeProbeError || '未获取到有效出口国家'
       }`;
+    } else if (this.claudeNodeProbe?.regionMismatchDetail) {
+      launchBlockReason = `节点真伪校验未通过：${this.claudeNodeProbe.regionMismatchDetail}，请更换节点`;
     } else if (!winRegionMatched) {
       launchBlockReason = `系统区域 [${this.winLocale.regionName} (${this.winLocale.regionCode})] 与 Claude 节点出口 [${proxyCountryName} (${proxyCountryCode})] 不一致，请点击下方一键同步`;
     } else if (!winTimeZoneMatched) {
@@ -2424,12 +2481,23 @@ export class ProbeEngine extends EventEmitter {
         : clash.activeNode || clash.mode
       : null;
 
+    const actualMismatchCode = refProbe?.regionMismatchDetail
+      ? refProbe.googleCountryCode && refProbe.googleCountryCode !== refProbe.countryCode
+        ? refProbe.googleCountryCode
+        : refProbe.claudeTraceLoc && refProbe.claudeTraceLoc !== refProbe.countryCode
+        ? refProbe.claudeTraceLoc
+        : refProbe.countryCode
+      : refProbe?.countryCode || null;
+    const actualMismatchName = actualMismatchCode
+      ? getCountryNameZh(actualMismatchCode)
+      : refProbe?.countryName || null;
+
     const payload: AlertPayload = {
       alertType: opts.alertType,
       expectedCode: opts.expectedCode,
       expectedName: opts.expectedName,
-      actualCode: isDisconnect ? null : refProbe?.countryCode || null,
-      actualName: isDisconnect ? '连接断开' : refProbe?.countryName || null,
+      actualCode: isDisconnect ? null : actualMismatchCode,
+      actualName: isDisconnect ? '连接断开' : actualMismatchName,
       actualIp: isDisconnect ? null : refProbe?.ip || null,
       edgeLoc: refProbe?.edgeLoc,
       viaChannel: refProbe?.viaChannel,
@@ -2479,6 +2547,133 @@ export class ProbeEngine extends EventEmitter {
     }
     list.push(...BUILTIN_TRACE_ENDPOINTS);
     return list;
+  }
+
+  /**
+   * 定时心跳巡检时复用同 IP 已有的目标服务地区校验结果，不向 Google / Claude 发起任何高频请求
+   */
+  private applyCachedTargetServiceVerification(
+    proxyUrl: string,
+    probe: ProbeResult
+  ): void {
+    const baseCode = probe.countryCode.toUpperCase();
+    const cacheKey = `${proxyUrl}|${probe.ip}|${baseCode}`;
+    const cached = this.targetVerifyCache.get(cacheKey);
+    if (cached) {
+      probe.googleCountryCode = cached.googleCountryCode;
+      probe.googleCountryName = cached.googleCountryName;
+      probe.claudeTraceLoc = cached.claudeTraceLoc;
+      probe.claudeTraceIp = cached.claudeTraceIp;
+      probe.regionMismatchDetail = cached.regionMismatchDetail;
+      return;
+    }
+    if (
+      this.claudeNodeProbe &&
+      this.claudeNodeProbe.ip === probe.ip &&
+      this.claudeNodeProbe.countryCode.toUpperCase() === baseCode
+    ) {
+      probe.googleCountryCode = this.claudeNodeProbe.googleCountryCode;
+      probe.googleCountryName = this.claudeNodeProbe.googleCountryName;
+      probe.claudeTraceLoc = this.claudeNodeProbe.claudeTraceLoc;
+      probe.claudeTraceIp = this.claudeNodeProbe.claudeTraceIp;
+      probe.regionMismatchDetail = this.claudeNodeProbe.regionMismatchDetail;
+    }
+  }
+
+  /**
+   * 对 Google / Claude 目标服务做一次真实地区校验（仅在切换代理、手动重测或启动前触发，精准识别「送中/假地区」或「机场服务端分流不一致」节点）
+   */
+  private async verifyTargetServiceRegion(
+    proxyUrl: string,
+    probe: ProbeResult,
+    targetApp: 'claude' | 'antigravity',
+    forceRefresh = false
+  ): Promise<void> {
+    const baseCode = probe.countryCode.toUpperCase();
+    if (!isValidIsoCountryCode(baseCode)) return;
+
+    const cacheKey = `${proxyUrl}|${probe.ip}|${baseCode}`;
+    const cached = this.targetVerifyCache.get(cacheKey);
+    if (!forceRefresh && cached && Date.now() - cached.checkedAt < 45000) {
+      probe.googleCountryCode = cached.googleCountryCode;
+      probe.googleCountryName = cached.googleCountryName;
+      probe.claudeTraceLoc = cached.claudeTraceLoc;
+      probe.claudeTraceIp = cached.claudeTraceIp;
+      probe.regionMismatchDetail = cached.regionMismatchDetail;
+      return;
+    }
+
+    const [googleSettled, claudeSettled] = await Promise.allSettled([
+      probeGoogleRegionViaProxy(proxyUrl),
+      targetApp === 'claude' ? probeClaudeTraceViaProxy(proxyUrl) : Promise.resolve(null),
+    ]);
+
+    const googleRes =
+      googleSettled.status === 'fulfilled' ? googleSettled.value : null;
+    const claudeRes =
+      claudeSettled.status === 'fulfilled' ? claudeSettled.value : null;
+
+    let googleCode: string | undefined;
+    if (googleRes) {
+      if (googleRes.altCountryCode && googleRes.altCountryCode !== baseCode) {
+        googleCode = googleRes.altCountryCode;
+      } else {
+        googleCode = googleRes.countryCode;
+      }
+    }
+
+    if (googleCode && isValidIsoCountryCode(googleCode)) {
+      probe.googleCountryCode = googleCode;
+      probe.googleCountryName = getCountryNameZh(googleCode);
+    }
+
+    if (claudeRes && isValidIsoCountryCode(claudeRes.loc)) {
+      probe.claudeTraceLoc = claudeRes.loc;
+      if (claudeRes.ip) {
+        probe.claudeTraceIp = claudeRes.ip;
+      }
+    }
+
+    const googleMismatch = Boolean(
+      probe.googleCountryCode && probe.googleCountryCode !== baseCode
+    );
+    const claudeMismatch = Boolean(
+      targetApp === 'claude' &&
+        probe.claudeTraceLoc &&
+        probe.claudeTraceLoc !== baseCode
+    );
+
+    let mismatchDetail: string | null = null;
+    if (googleMismatch && claudeMismatch && probe.googleCountryCode && probe.claudeTraceLoc) {
+      mismatchDetail = `离线库为 ${probe.countryName} (${baseCode})，但 Google 实际识别为 ${probe.googleCountryName} (${probe.googleCountryCode})、Claude 识别为 ${getCountryNameZh(probe.claudeTraceLoc)} (${probe.claudeTraceLoc})（疑似假${probe.countryName}/送中节点）`;
+    } else if (googleMismatch && probe.googleCountryCode) {
+      mismatchDetail = `离线库为 ${probe.countryName} (${baseCode})，但 Google 实际识别为 ${probe.googleCountryName} (${probe.googleCountryCode})（疑似假${probe.countryName}/送中节点）`;
+    } else if (claudeMismatch && probe.claudeTraceLoc) {
+      const splitIpNote =
+        probe.claudeTraceIp && probe.claudeTraceIp !== probe.ip
+          ? `，且分流出口 IP 变为 ${probe.claudeTraceIp}`
+          : '';
+      mismatchDetail = `离线库为 ${probe.countryName} (${baseCode})，但访问 Claude 实际识别为 ${getCountryNameZh(probe.claudeTraceLoc)} (${probe.claudeTraceLoc})${splitIpNote}`;
+    }
+
+    probe.regionMismatchDetail = mismatchDetail;
+
+    if (probe.googleCountryCode || probe.claudeTraceLoc) {
+      if (this.targetVerifyCache.size >= 64) {
+        const oldestKey = this.targetVerifyCache.keys().next().value;
+        if (oldestKey !== undefined) {
+          this.targetVerifyCache.delete(oldestKey);
+        }
+      }
+      this.targetVerifyCache.set(cacheKey, {
+        checkedAt: Date.now(),
+        googleCountryCode: probe.googleCountryCode,
+        googleCountryName: probe.googleCountryName,
+        claudeTraceLoc: probe.claudeTraceLoc,
+        claudeTraceIp: probe.claudeTraceIp,
+        regionMismatchDetail: mismatchDetail,
+      });
+    }
   }
 
   /**
@@ -2625,4 +2820,93 @@ function simplifyNetworkError(errMsg: string, channelDesc: string): string {
     return `DNS 解析失败 (${channelDesc})，网络连接异常`;
   }
   return `${errMsg} (${channelDesc})`;
+}
+
+async function probeGoogleRegionViaProxy(
+  proxyUrl: string
+): Promise<{ countryCode: string; ip?: string; altCountryCode?: string } | null> {
+  const parseSwJsData = (raw: string): { countryCode: string; ip?: string } | null => {
+    const m = raw.match(
+      /\["yt\.sw\.adr"\s*,\s*null\s*,\s*\[\[\[\s*"[^"]*"\s*,\s*"([A-Za-z]{2,3})"\s*,\s*null\s*,\s*"([^"]*)"/
+    );
+    if (m) {
+      const code = normalizeIsoCountryCode(m[1]);
+      if (code) {
+        const ipStr = m[2].trim();
+        return { countryCode: code, ip: net.isIP(ipStr) ? ipStr : undefined };
+      }
+    }
+    try {
+      const cleaned = raw.replace(/^\)\]\}'\s*/, '');
+      const parsed = JSON.parse(cleaned) as unknown[];
+      const firstEntry = (parsed?.[0] as unknown[])?.[2] as unknown[];
+      const inner = (firstEntry?.[0] as unknown[])?.[0] as unknown[];
+      if (Array.isArray(inner)) {
+        const code = normalizeIsoCountryCode(String(inner[1] || ''));
+        const ipCandidate = String(inner[3] || '').trim();
+        if (code) {
+          return {
+            countryCode: code,
+            ip: net.isIP(ipCandidate) ? ipCandidate : undefined,
+          };
+        }
+      }
+    } catch {
+      // ignore JSON parse failure
+    }
+    return null;
+  };
+
+  const parseGoogleSearchHtml = (raw: string): { countryCode: string } | null => {
+    const m =
+      raw.match(/,\d+,\d+,200,"([A-Za-z]{2,3})",null/) ||
+      raw.match(/"MgUcDb"\s*:\s*"([A-Za-z]{2,3})"/);
+    if (m) {
+      const code = normalizeIsoCountryCode(m[1]);
+      if (code) {
+        return { countryCode: code };
+      }
+    }
+    return null;
+  };
+
+  const [ytSettled, gSearchSettled] = await Promise.allSettled([
+    requestTextViaProxy('https://www.youtube.com/sw.js_data', proxyUrl, 4500),
+    requestTextViaProxy('https://www.google.com/?hl=en', proxyUrl, 4500, 'text/html, */*'),
+  ]);
+
+  const ytRes =
+    ytSettled.status === 'fulfilled' ? parseSwJsData(ytSettled.value) : null;
+  const gSearchRes =
+    gSearchSettled.status === 'fulfilled' ? parseGoogleSearchHtml(gSearchSettled.value) : null;
+
+  if (ytRes && gSearchRes && ytRes.countryCode !== gSearchRes.countryCode) {
+    return {
+      countryCode: gSearchRes.countryCode,
+      ip: ytRes.ip,
+      altCountryCode: ytRes.countryCode,
+    };
+  }
+
+  if (gSearchRes) {
+    return { countryCode: gSearchRes.countryCode, ip: ytRes?.ip };
+  }
+  return ytRes;
+}
+
+async function probeClaudeTraceViaProxy(
+  proxyUrl: string
+): Promise<{ loc: string; ip: string | null } | null> {
+  try {
+    const raw = await requestTextViaProxy('https://claude.ai/cdn-cgi/trace', proxyUrl, 4500);
+    const parsed = parseTraceResponse(raw, 'cf-trace');
+    const loc = normalizeIsoCountryCode(parsed.loc);
+    if (!loc && !parsed.ip) return null;
+    return {
+      loc: loc || 'UNKNOWN',
+      ip: parsed.ip,
+    };
+  } catch {
+    return null;
+  }
 }

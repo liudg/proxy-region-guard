@@ -83,6 +83,76 @@ const NON_COUNTRY_CODES = new Set([
   'ZZ',
 ]);
 
+const ISO_ALPHA3_TO_ALPHA2: Record<string, string> = {
+  USA: 'US',
+  JPN: 'JP',
+  SGP: 'SG',
+  HKG: 'HK',
+  TWN: 'TW',
+  KOR: 'KR',
+  GBR: 'GB',
+  DEU: 'DE',
+  NLD: 'NL',
+  FRA: 'FR',
+  CAN: 'CA',
+  AUS: 'AU',
+  MYS: 'MY',
+  THA: 'TH',
+  VNM: 'VN',
+  PHL: 'PH',
+  IDN: 'ID',
+  IND: 'IN',
+  TUR: 'TR',
+  RUS: 'RU',
+  BRA: 'BR',
+  ARG: 'AR',
+  CHE: 'CH',
+  SWE: 'SE',
+  IRL: 'IE',
+  ARE: 'AE',
+  CHN: 'CN',
+  MAC: 'MO',
+  ITA: 'IT',
+  ESP: 'ES',
+  POL: 'PL',
+  AUT: 'AT',
+  BEL: 'BE',
+  DNK: 'DK',
+  FIN: 'FI',
+  NOR: 'NO',
+  PRT: 'PT',
+  CZE: 'CZ',
+  HUN: 'HU',
+  ROU: 'RO',
+  UKR: 'UA',
+  ISR: 'IL',
+  SAU: 'SA',
+  ZAF: 'ZA',
+  MEX: 'MX',
+  CHL: 'CL',
+  COL: 'CO',
+  PER: 'PE',
+  NZL: 'NZ',
+  PAK: 'PK',
+  BGD: 'BD',
+  KHM: 'KH',
+  MMR: 'MM',
+  LAO: 'LA',
+  PRK: 'KP',
+  MNG: 'MN',
+  KAZ: 'KZ',
+};
+
+export function normalizeIsoCountryCode(code: string | null | undefined): string | null {
+  if (!code) return null;
+  const upper = code.trim().toUpperCase();
+  if (upper === 'UK') return 'GB';
+  if (/^[A-Z]{3}$/.test(upper) && ISO_ALPHA3_TO_ALPHA2[upper]) {
+    return ISO_ALPHA3_TO_ALPHA2[upper];
+  }
+  return isValidIsoCountryCode(upper) ? upper : null;
+}
+
 export function isValidIsoCountryCode(code: string | null | undefined): code is string {
   if (!code) return false;
   const upper = code.trim().toUpperCase();

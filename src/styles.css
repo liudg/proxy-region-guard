@@ -1613,6 +1613,11 @@ code {
   color: var(--text-muted);
 }
 
+.check-step-body small.text-danger {
+  color: #fca5a5;
+  font-weight: 600;
+}
+
 .claude-block-banner {
   display: flex;
   flex-direction: column;
@@ -1937,6 +1942,32 @@ code {
   border: 1px solid rgba(148, 163, 184, 0.16);
 }
 
+.ag-node-exit-card.mismatch-card {
+  border-color: rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.08);
+}
+
+.target-verify-pill {
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 7px;
+  border-radius: 5px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+.target-verify-pill.verified {
+  background: rgba(16, 185, 129, 0.15);
+  border: 1px solid rgba(16, 185, 129, 0.32);
+  color: #6ee7b7;
+}
+
+.target-verify-pill.mismatch {
+  background: rgba(239, 68, 68, 0.2);
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  color: #fca5a5;
+}
+
 .ag-exit-main {
   display: flex;
   align-items: center;
@@ -2067,6 +2098,25 @@ code {
   flex-shrink: 0;
   margin-top: 2px;
   color: #60a5fa;
+}
+
+.ag-warn-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 9px 11px;
+  border-radius: 8px;
+  background: rgba(239, 68, 68, 0.14);
+  border: 1px solid rgba(239, 68, 68, 0.38);
+  color: #fecaca;
+  font-size: 11.5px;
+  line-height: 1.45;
+}
+
+.ag-warn-banner svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: #f87171;
 }
 
 /* =========================================================

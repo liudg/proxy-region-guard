@@ -675,7 +675,11 @@ export const MainDashboard: React.FC = () => {
                   </div>
 
                   {/* 所选节点出口信息展示（纯展示，无任何监控/时区拦截） */}
-                  <div className="ag-node-exit-card">
+                  <div
+                    className={`ag-node-exit-card ${
+                      antigravityState.nodeProbe?.regionMismatchDetail ? 'mismatch-card' : ''
+                    }`}
+                  >
                     {config.antigravityClashNode ? (
                       antigravityState.nodeProbe ? (
                         <div className="ag-exit-main">
@@ -689,6 +693,23 @@ export const MainDashboard: React.FC = () => {
                               <span className="iso-pill">
                                 {antigravityState.nodeProbe.countryCode}
                               </span>
+                              {antigravityState.nodeProbe.regionMismatchDetail &&
+                              antigravityState.nodeProbe.googleCountryCode ? (
+                                <span
+                                  className="target-verify-pill mismatch"
+                                  title={antigravityState.nodeProbe.regionMismatchDetail}
+                                >
+                                  ⚠️ Google识别: {antigravityState.nodeProbe.googleCountryName} (
+                                  {antigravityState.nodeProbe.googleCountryCode})
+                                </span>
+                              ) : antigravityState.nodeProbe.googleCountryCode ? (
+                                <span
+                                  className="target-verify-pill verified"
+                                  title="已通过 Google 目标服务真实地区校验"
+                                >
+                                  ✓ Google验证: {antigravityState.nodeProbe.googleCountryCode}
+                                </span>
+                              ) : null}
                               <span className="ag-node-tag ellipsis">
                                 {config.antigravityClashNode}
                               </span>
@@ -716,7 +737,7 @@ export const MainDashboard: React.FC = () => {
                           <RefreshCw className="spin" size={15} />
                           <span>
                             正在通过专属端口 127.0.0.1:{config.antigravityDedicatedPort}{' '}
-                            获取节点 [{config.antigravityClashNode}] 出口信息...
+                            获取节点 [{config.antigravityClashNode}] 出口信息并校验 Google 真实地区...
                           </span>
                         </div>
                       ) : (
@@ -737,6 +758,17 @@ export const MainDashboard: React.FC = () => {
                       </div>
                     )}
                   </div>
+
+                  {antigravityState.nodeProbe?.regionMismatchDetail && (
+                    <div className="ag-warn-banner">
+                      <AlertTriangle size={14} />
+                      <span>
+                        <strong>假地区 / 送中节点预警：</strong>
+                        {antigravityState.nodeProbe.regionMismatchDetail}
+                        ，Antigravity 可能会报错地区不受支持，建议更换其他节点。
+                      </span>
+                    </div>
+                  )}
 
                   {/* 全进程代理覆盖状态明细：Antigravity.exe + language_server.exe */}
                   <div className="ag-process-grid">
@@ -1032,14 +1064,18 @@ export const MainDashboard: React.FC = () => {
                   <div className="three-way-check-grid">
                     <div
                       className={`check-step-card ${
-                        claudeState.proxyCountryCode && config.selectedClashNode
+                        claudeState.proxyCountryCode &&
+                        config.selectedClashNode &&
+                        !claudeState.nodeProbe?.regionMismatchDetail
                           ? 'matched'
                           : 'unmatched'
                       }`}
                     >
                       <div className="check-step-header">
                         <span className="step-num">1. 指定代理出口</span>
-                        {claudeState.proxyCountryCode && config.selectedClashNode ? (
+                        {claudeState.proxyCountryCode &&
+                        config.selectedClashNode &&
+                        !claudeState.nodeProbe?.regionMismatchDetail ? (
                           <CheckCircle2 size={14} className="step-icon-ok" />
                         ) : (
                           <XCircle size={14} className="step-icon-err" />
@@ -1054,12 +1090,31 @@ export const MainDashboard: React.FC = () => {
                                 {claudeState.proxyCountryName} ({claudeState.proxyCountryCode})
                               </strong>
                             </div>
-                            <small
-                              className="ellipsis"
-                              title={`${claudeState.nodeProbe.ip} (${claudeState.nodeProbe.latencyMs} ms)`}
-                            >
-                              IP: {claudeState.nodeProbe.ip} · {claudeState.nodeProbe.latencyMs} ms
-                            </small>
+                            {claudeState.nodeProbe.regionMismatchDetail ? (
+                              <small
+                                className="ellipsis text-danger"
+                                title={claudeState.nodeProbe.regionMismatchDetail}
+                              >
+                                ⚠️ 实际识别:{' '}
+                                {claudeState.nodeProbe.googleCountryCode &&
+                                claudeState.nodeProbe.googleCountryCode !==
+                                  claudeState.proxyCountryCode
+                                  ? `Google=${claudeState.nodeProbe.googleCountryName}(${claudeState.nodeProbe.googleCountryCode})`
+                                  : `Claude=${claudeState.nodeProbe.claudeTraceLoc}`}
+                              </small>
+                            ) : (
+                              <small
+                                className="ellipsis"
+                                title={`${claudeState.nodeProbe.ip} (${claudeState.nodeProbe.latencyMs} ms)`}
+                              >
+                                IP: {claudeState.nodeProbe.ip} · {claudeState.nodeProbe.latencyMs}{' '}
+                                ms
+                                {claudeState.nodeProbe.googleCountryCode ||
+                                claudeState.nodeProbe.claudeTraceLoc
+                                  ? ' · 已验真'
+                                  : ''}
+                              </small>
+                            )}
                           </>
                         ) : (
                           <>
@@ -1145,6 +1200,7 @@ export const MainDashboard: React.FC = () => {
                         <span>{claudeState.launchBlockReason}</span>
                       </div>
                       {claudeState.proxyCountryCode &&
+                        !claudeState.nodeProbe?.regionMismatchDetail &&
                         (!claudeState.winRegionMatched ||
                           !claudeState.winTimeZoneMatched) && (
                           <button

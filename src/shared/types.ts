@@ -113,6 +113,12 @@ export interface ProbeResult {
   viaChannel: string;     // 本次检测实际使用的通道说明
   latencyMs: number;
   checkedAt: number;
+  // 目标服务真实地区校验（仅在切换代理、手动校验或启动前低频触发）
+  googleCountryCode?: string;     // Google GFE 内部识别的国家/地区代码，如 "JP" / "CN" / "HK"
+  googleCountryName?: string;     // Google 识别地区中文名
+  claudeTraceLoc?: string;        // claude.ai/cdn-cgi/trace 边缘识别的国家代码
+  claudeTraceIp?: string;         // claude.ai 看到的实际出口 IP
+  regionMismatchDetail?: string | null; // 当发现送中/假地区或分流不一致时的详细告警说明
 }
 
 export interface ClaudeRuntimeState {
