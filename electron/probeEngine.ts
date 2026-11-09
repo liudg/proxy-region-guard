@@ -384,16 +384,12 @@ export class ProbeEngine extends EventEmitter {
     if (sec > 0) {
       this.heartbeatTimer = setInterval(() => {
         const cfg = this.configStore.get();
-        const hasCustomGuard =
-          cfg.killProcessesEnabled && cfg.protectedProcessPatterns.length > 0;
-        // 1. Claude 选定节点独立巡检：当 Claude 运行中或已配置专属节点时，后台独立巡检 Claude 专属端口 (27897)
+        // 1. Claude 选定节点独立巡检：当 Claude 运行中且已配置专属节点时，后台独立巡检 Claude 专属端口 (27897)
         if (this.claudeRunning && cfg.selectedClashNode) {
           void this.probeClaudeNodeNow('Claude 运行期心跳巡检');
         }
-        // 2. 实时监控通道巡检：当开启实时监控告警或启用额外守护进程时，后台巡检 Clash 选中通道
-        if (cfg.monitorAlertEnabled || hasCustomGuard) {
-          void this.checkNow('轻量心跳巡检');
-        }
+        // 2. 实时监控通道巡检：后台定时静默复核出口 IP 是否漂移
+        void this.checkNow('轻量心跳巡检');
       }, sec * 1000);
     }
   }
@@ -1217,7 +1213,7 @@ export class ProbeEngine extends EventEmitter {
             }
             this.emitState();
 
-            if (cfg.alertPopupEnabled && (report.killedCount > 0 || report.errorDetail)) {
+            if (report.killedCount > 0 || report.errorDetail) {
               this.emitAlert({
                 source: 'claude',
                 alertType: 'unauthorized-launch',
@@ -1318,7 +1314,7 @@ export class ProbeEngine extends EventEmitter {
     }
     this.emitState();
 
-    if (cfg.alertPopupEnabled && (report.killedCount > 0 || report.errorDetail)) {
+    if (report.killedCount > 0 || report.errorDetail) {
       const expectedCode = this.claudeNodeProbe?.countryCode || this.winLocale.regionCode;
       const expectedName = this.claudeNodeProbe?.countryName || this.winLocale.regionName;
       this.emitAlert({
@@ -2024,14 +2020,46 @@ export class ProbeEngine extends EventEmitter {
           : null;
       const defCountry = cfg.defaultCountryCode ? cfg.defaultCountryCode.toUpperCase() : null;
 
+      const wasClaudeRunning = this.claudeRunning;
       const claudeNeedsKill =
-        this.claudeRunning ||
+        wasClaudeRunning ||
         (claudeCountry !== null && claudeCountry !== DEFAULT_CHINA_REGION_CODE);
       const guardNeedsKill =
         cfg.killProcessesEnabled &&
         cfg.protectedProcessPatterns.length > 0 &&
         ((ipCountry !== null && ipCountry !== DEFAULT_CHINA_REGION_CODE) ||
           (defCountry !== null && defCountry !== DEFAULT_CHINA_REGION_CODE));
+
+      const emitRestoreLocaleAlert = (triggerReason: string, killError?: string) => {
+        const involvesClaude =
+          wasClaudeRunning ||
+          !guardNeedsKill ||
+          killedProcesses.some((s) => /claude|cowork/i.test(s));
+        const alertSource: 'claude' | 'monitor' =
+          claudeNeedsKill && involvesClaude ? 'claude' : 'monitor';
+        const expectedCode =
+          alertSource === 'claude'
+            ? claudeCountry || ipCountry || defCountry || DEFAULT_CHINA_REGION_CODE
+            : ipCountry || defCountry || claudeCountry || DEFAULT_CHINA_REGION_CODE;
+        const expectedName =
+          (alertSource === 'claude' && claudeCountry
+            ? this.claudeNodeProbe?.countryName
+            : ipCountry
+            ? this.lastProbe?.countryName
+            : defCountry
+            ? cfg.defaultCountryName
+            : null) || getCountryNameZh(expectedCode);
+
+        this.emitAlert({
+          source: alertSource,
+          alertType: 'locale-mismatch',
+          expectedCode,
+          expectedName,
+          triggerReason,
+          killedProcesses: killedProcesses.length > 0 ? killedProcesses : undefined,
+          killError,
+        });
+      };
 
       const combinedPatterns = Array.from(
         new Set([
@@ -2059,26 +2087,10 @@ export class ProbeEngine extends EventEmitter {
           }，已中止还原中国时区以防暴露！`;
           this.addLog('danger', abortMsg);
 
-          const expectedCode =
-            claudeCountry || ipCountry || defCountry || DEFAULT_CHINA_REGION_CODE;
-          const expectedName =
-            this.claudeNodeProbe?.countryName ||
-            this.lastProbe?.countryName ||
-            cfg.defaultCountryName ||
-            expectedCode;
-          const alertSource: 'claude' | 'monitor' =
-            claudeNeedsKill && (!guardNeedsKill || cfg.alertPopupEnabled)
-              ? 'claude'
-              : 'monitor';
-          this.emitAlert({
-            source: alertSource,
-            alertType: 'locale-mismatch',
-            expectedCode,
-            expectedName,
-            triggerReason: '还原中国时区被安全拦截（受保护进程未能终止）',
-            killedProcesses: killedProcesses.length > 0 ? killedProcesses : undefined,
-            killError: killReport.errorDetail,
-          });
+          emitRestoreLocaleAlert(
+            '还原中国时区被安全拦截（受保护进程未能终止）',
+            killReport.errorDetail
+          );
 
           return {
             ok: false,
@@ -2110,6 +2122,17 @@ export class ProbeEngine extends EventEmitter {
         };
       }
 
+      // 若本次还原已先行强杀进程，预先对齐实时监控的 4 段式告警签名，防止 evaluateStatusOnly 异步触发普通时区不一致弹窗覆盖强杀结果
+      if (
+        killedProcesses.length > 0 &&
+        cfg.monitorAlertEnabled &&
+        this.lastProbe &&
+        isValidIsoCountryCode(this.lastProbe.countryCode)
+      ) {
+        const probeCode = this.lastProbe.countryCode.toUpperCase();
+        this.lastAlertSignature = `locale-mismatch:${probeCode}:${this.winLocale.regionCode}:${this.winLocale.timeZoneId}`;
+      }
+
       this.evaluateStatusOnly('还原默认中国时区');
 
       const killedSuffix =
@@ -2118,26 +2141,7 @@ export class ProbeEngine extends EventEmitter {
       this.addLog('info', okMsg);
 
       if (killedProcesses.length > 0) {
-        const expectedCode =
-          claudeCountry || ipCountry || defCountry || DEFAULT_CHINA_REGION_CODE;
-        const expectedName =
-          this.claudeNodeProbe?.countryName ||
-          this.lastProbe?.countryName ||
-          cfg.defaultCountryName ||
-          expectedCode;
-        const alertSource: 'claude' | 'monitor' =
-          claudeNeedsKill && (!guardNeedsKill || cfg.alertPopupEnabled)
-            ? 'claude'
-            : 'monitor';
-        this.lastAlertSignature = `locale-mismatch:${expectedCode}`;
-        this.emitAlert({
-          source: alertSource,
-          alertType: 'locale-mismatch',
-          expectedCode,
-          expectedName,
-          triggerReason: '手动还原中国时区（与代理地区不一致，已先行强杀进程）',
-          killedProcesses,
-        });
+        emitRestoreLocaleAlert('手动还原中国时区（与代理地区不一致，已先行强杀进程）');
       }
 
       return {
@@ -2327,11 +2331,11 @@ export class ProbeEngine extends EventEmitter {
       this.emitState();
     }
 
-    const hasKillEvent = Boolean((killedProcesses && killedProcesses.length > 0) || killError);
     if (!cfg.monitorAlertEnabled) {
       return;
     }
 
+    const hasKillEvent = Boolean((killedProcesses && killedProcesses.length > 0) || killError);
     const sig = `mismatch:${cfg.defaultCountryCode}->${this.lastProbe.countryCode}`;
     const isSameSig = this.lastAlertSignature === sig;
     this.lastAlertSignature = sig;

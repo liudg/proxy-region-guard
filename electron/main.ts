@@ -381,7 +381,12 @@ function showCustomAlertPopup(payload: AlertPayload): void {
 }
 
 function notifyAlertRecovered(payload: AlertPayload): void {
-  if (!alertWindow || alertWindow.isDestroyed() || !alertWindow.isVisible()) {
+  if (
+    !alertWindow ||
+    alertWindow.isDestroyed() ||
+    !alertWindow.isVisible() ||
+    latestAlertPayload?.source === 'claude'
+  ) {
     return;
   }
   latestAlertPayload = payload;
@@ -763,6 +768,13 @@ function registerIpcHandlers(): void {
   ipcMain.handle('guard:update-config', async (_e, partial: Partial<AppConfig>) => {
     const prevCfg = configStore.get();
     let nextCfg = configStore.update(partial);
+
+    if (
+      (!nextCfg.alertPopupEnabled && latestAlertPayload?.source === 'claude') ||
+      (!nextCfg.monitorAlertEnabled && latestAlertPayload?.source !== 'claude')
+    ) {
+      hideAlertWindow();
+    }
 
     if (prevCfg.autoLaunch !== nextCfg.autoLaunch) {
       const actualAutoLaunch = applyAutoLaunchSetting(nextCfg.autoLaunch);

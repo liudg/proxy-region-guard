@@ -524,7 +524,7 @@ export const MainDashboard: React.FC = () => {
         >
           <Activity size={14} />
           <span>实时监控</span>
-          {config.protectedProcessPatterns.length > 0 && (
+          {config.killProcessesEnabled && config.protectedProcessPatterns.length > 0 && (
             <span className="tab-count">{config.protectedProcessPatterns.length}</span>
           )}
         </button>
@@ -1362,9 +1362,7 @@ export const MainDashboard: React.FC = () => {
                       className="toggle-switch"
                       checked={config.alertPopupEnabled}
                       onChange={(e) =>
-                        void window.guardAPI
-                          .updateConfig({ alertPopupEnabled: e.target.checked })
-                          .then(setState)
+                        void window.guardAPI.updateConfig({ alertPopupEnabled: e.target.checked })
                       }
                     />
                   </div>
@@ -1466,8 +1464,16 @@ export const MainDashboard: React.FC = () => {
               >
                 <ShieldAlert size={14} />
                 <span>联动进程强杀</span>
-                <span className="subtab-mode-badge guard">
-                  {config.protectedProcessPatterns.length > 0
+                <span
+                  className={`subtab-mode-badge ${
+                    config.killProcessesEnabled && config.protectedProcessPatterns.length > 0
+                      ? 'guard'
+                      : 'muted'
+                  }`}
+                >
+                  {!config.killProcessesEnabled
+                    ? '已关闭'
+                    : config.protectedProcessPatterns.length > 0
                     ? `守护 ${config.protectedProcessPatterns.length} 项`
                     : '未配置规则'}
                 </span>

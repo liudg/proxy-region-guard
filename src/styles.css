@@ -1806,6 +1806,12 @@ code {
   border: 1px solid rgba(16, 185, 129, 0.3);
 }
 
+.subtab-mode-badge.muted {
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--text-secondary);
+  border: 1px solid rgba(148, 163, 184, 0.24);
+}
+
 .tab-status-dot.external {
   background: #fbbf24;
   box-shadow: 0 0 5px rgba(251, 191, 36, 0.6);
