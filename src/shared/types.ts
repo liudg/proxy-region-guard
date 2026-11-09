@@ -19,10 +19,10 @@ export interface AppConfig {
   };
   heartbeatIntervalSec: number; // 0 = 仅事件触发, >0 = 心跳秒数
   customProbeUrl: string;
-  alertPopupEnabled: boolean;
-  alertSoundEnabled: boolean;
-  alertOnDisconnect: boolean;
-  monitorAlertEnabled: boolean; // 实时监控（Clash选中通道）异常弹窗告警开关
+  alertPopupEnabled: boolean;   // Claude 专栏异常拦截/强杀置顶弹窗开关
+  alertSoundEnabled: boolean;   // 全局警告弹窗提示音开关
+  alertOnDisconnect: boolean;   // 实时监控代理断连/超时弹窗报警子开关
+  monitorAlertEnabled: boolean; // 实时监控（含联动进程强杀）异常弹窗告警总开关
   closeToTray: boolean;
   autoLaunch: boolean;
 

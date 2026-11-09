@@ -2066,7 +2066,12 @@ export class ProbeEngine extends EventEmitter {
             this.lastProbe?.countryName ||
             cfg.defaultCountryName ||
             expectedCode;
+          const alertSource: 'claude' | 'monitor' =
+            claudeNeedsKill && (!guardNeedsKill || cfg.alertPopupEnabled)
+              ? 'claude'
+              : 'monitor';
           this.emitAlert({
+            source: alertSource,
             alertType: 'locale-mismatch',
             expectedCode,
             expectedName,
@@ -2120,8 +2125,13 @@ export class ProbeEngine extends EventEmitter {
           this.lastProbe?.countryName ||
           cfg.defaultCountryName ||
           expectedCode;
+        const alertSource: 'claude' | 'monitor' =
+          claudeNeedsKill && (!guardNeedsKill || cfg.alertPopupEnabled)
+            ? 'claude'
+            : 'monitor';
         this.lastAlertSignature = `locale-mismatch:${expectedCode}`;
         this.emitAlert({
+          source: alertSource,
           alertType: 'locale-mismatch',
           expectedCode,
           expectedName,
@@ -2318,7 +2328,7 @@ export class ProbeEngine extends EventEmitter {
     }
 
     const hasKillEvent = Boolean((killedProcesses && killedProcesses.length > 0) || killError);
-    if (!cfg.monitorAlertEnabled && !hasKillEvent) {
+    if (!cfg.monitorAlertEnabled) {
       return;
     }
 
@@ -2377,7 +2387,7 @@ export class ProbeEngine extends EventEmitter {
     }
 
     const hasKillEvent = Boolean((killedProcesses && killedProcesses.length > 0) || killError);
-    if ((!cfg.monitorAlertEnabled || !cfg.alertOnDisconnect) && !hasKillEvent) {
+    if (!cfg.monitorAlertEnabled || (!cfg.alertOnDisconnect && !hasKillEvent)) {
       return;
     }
 
@@ -2412,11 +2422,15 @@ export class ProbeEngine extends EventEmitter {
     source?: 'claude' | 'monitor';
   }): void {
     const cfg = this.configStore.get();
-    if (!cfg.alertPopupEnabled) return;
+    const isClaudeSource = opts.source === 'claude';
+    if (isClaudeSource) {
+      if (!cfg.alertPopupEnabled) return;
+    } else {
+      if (!cfg.monitorAlertEnabled) return;
+    }
 
     const clash = this.clashMonitor.getRuntimeInfo();
     const isDisconnect = opts.alertType === 'disconnect';
-    const isClaudeSource = opts.source === 'claude';
     const refProbe = isClaudeSource ? this.claudeNodeProbe : this.lastProbe;
 
     const selectedFullLabel = cfg.selectedClashNode

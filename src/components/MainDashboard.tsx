@@ -3,7 +3,6 @@ import {
   Activity,
   AlertTriangle,
   Ban,
-  BellRing,
   Bot,
   Check,
   CheckCircle2,
@@ -45,13 +44,15 @@ import {
 import { CountryFlag } from './CountryFlag';
 import { ClashNodeSelector } from './ClashNodeSelector';
 
-type ActiveTab = 'launcher' | 'monitor' | 'guard' | 'settings' | 'logs';
+type ActiveTab = 'launcher' | 'monitor' | 'settings' | 'logs';
 type LauncherSubTab = 'antigravity' | 'claude';
+type MonitorSubTab = 'status' | 'guard';
 
 export const MainDashboard: React.FC = () => {
   const [state, setState] = useState<AppStateSnapshot | null>(null);
   const [activeTab, setActiveTab] = useState<ActiveTab>('launcher');
   const [launcherSubTab, setLauncherSubTab] = useState<LauncherSubTab>('antigravity');
+  const [monitorSubTab, setMonitorSubTab] = useState<MonitorSubTab>('status');
   const [copiedIp, setCopiedIp] = useState(false);
   const [copiedAgIp, setCopiedAgIp] = useState(false);
 
@@ -507,7 +508,7 @@ export const MainDashboard: React.FC = () => {
         </div>
       </header>
 
-      {/* 顶部导航栏（保持 5 个一级 Tab，清爽不拥挤） */}
+      {/* 顶部导航栏（精简为 4 个一级 Tab：启动器 / 实时监控 / 设置 / 日志） */}
       <nav className="nav-tabs">
         <button
           className={`nav-tab ${activeTab === 'launcher' ? 'active' : ''}`}
@@ -523,13 +524,6 @@ export const MainDashboard: React.FC = () => {
         >
           <Activity size={14} />
           <span>实时监控</span>
-        </button>
-        <button
-          className={`nav-tab ${activeTab === 'guard' ? 'active' : ''}`}
-          onClick={() => setActiveTab('guard')}
-        >
-          <ShieldAlert size={14} />
-          <span>进程守护</span>
           {config.protectedProcessPatterns.length > 0 && (
             <span className="tab-count">{config.protectedProcessPatterns.length}</span>
           )}
@@ -1358,6 +1352,23 @@ export const MainDashboard: React.FC = () => {
                     />
                   </div>
 
+                  <div className="setting-row">
+                    <div>
+                      <strong>Claude 异常拦截弹窗提醒</strong>
+                      <p>外部启动被拦截或运行期环境异常触发强杀时，在屏幕右下角弹出置顶提醒</p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      className="toggle-switch"
+                      checked={config.alertPopupEnabled}
+                      onChange={(e) =>
+                        void window.guardAPI
+                          .updateConfig({ alertPopupEnabled: e.target.checked })
+                          .then(setState)
+                      }
+                    />
+                  </div>
+
                   <div className="claude-exe-path-box">
                     <div className="exe-path-header">
                       <span>专属代理监听端口：</span>
@@ -1428,439 +1439,478 @@ export const MainDashboard: React.FC = () => {
 
         {activeTab === 'monitor' && (
           <div className="tab-pane">
-            {/* 1. 当前出口状态主卡片 */}
-            <section className={`hero-card ${statusMeta.cls}`}>
-              <div className="hero-top-row">
-                <div className={`status-pill ${statusMeta.cls}`}>
-                  {statusMeta.icon}
-                  <span>{statusMeta.badge}</span>
-                </div>
-                <button
-                  className="btn-refresh"
-                  disabled={isChecking}
-                  onClick={() => void window.guardAPI.checkNow('手动立即刷新')}
-                >
-                  <RefreshCw className={isChecking ? 'spin' : ''} size={14} />
-                  <span>{isChecking ? '检测中...' : '立即检测'}</span>
-                </button>
-              </div>
-
-              {lastProbe ? (
-                <div className="hero-main-info">
-                  <div className="hero-country-row">
-                    <CountryFlag code={lastProbe.countryCode} size="lg" />
-                    <div className="hero-country-titles">
-                      <div className="country-primary">
-                        <h1>{lastProbe.countryName}</h1>
-                        <span className="iso-pill">{lastProbe.countryCode}</span>
-                        {lastProbe.edgeLoc &&
-                          isValidIsoCountryCode(lastProbe.countryCode) &&
-                          lastProbe.edgeLoc !== lastProbe.countryCode && (
-                            <span
-                              className="edge-hint-pill"
-                              title="IP 离线库归属地与 CDN 边缘节点物理位置不同（常见于广播 IP 或跨区路由）"
-                            >
-                              路由点: {lastProbe.edgeLoc}
-                            </span>
-                          )}
-                      </div>
-                      <div className="ip-row">
-                        <span className="ip-label">出口 IP:</span>
-                        <code className="ip-code">{lastProbe.ip}</code>
-                        <button
-                          className="btn-icon-tiny"
-                          onClick={handleCopyIp}
-                          title="复制出口 IP"
-                        >
-                          {copiedIp ? <Check size={13} /> : <Copy size={13} />}
-                        </button>
-                        <span className="latency-tag">{lastProbe.latencyMs} ms</span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {lastError && status === 'error' && (
-                    <div className="inline-error-banner">
-                      <WifiOff size={14} />
-                      <span>最新检测异常：{lastError}</span>
-                    </div>
-                  )}
-
-                  <div className="hero-footer-meta">
-                    <span className="ellipsis" title={lastProbe.viaChannel}>
-                      检测通道：{lastProbe.viaChannel}
-                    </span>
-                    <span>更新于 {formatTime(lastProbe.checkedAt)}</span>
-                  </div>
-                </div>
-              ) : (
-                <div className="hero-empty-state">
-                  {lastError ? (
-                    <div className="error-empty-box">
-                      <WifiOff size={28} />
-                      <p>{lastError}</p>
-                      <small>请确认 Clash Verge 已连接并选择有效节点</small>
-                    </div>
-                  ) : (
-                    <p>正在通过代理隧道验证真实出口 IP...</p>
-                  )}
-                </div>
-              )}
-            </section>
-
-            {/* 2. Windows 时区与区域同步卡片 */}
-            <section className="panel-card">
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <Globe size={15} />
-                  <span>Windows 时区与区域</span>
-                </div>
-                {effectiveTargetCode && (
-                  <span
-                    className={`mini-badge ${isWinLocaleMatched ? 'connected' : 'warn-badge'}`}
-                  >
-                    {isWinLocaleMatched ? '已与保护地区一致' : '与保护地区不一致'}
-                  </span>
-                )}
-              </div>
-
-              <div className="win-locale-grid">
-                <div className="win-locale-box">
-                  <div className="win-locale-icon">
-                    <Clock size={16} />
-                  </div>
-                  <div className="win-locale-info">
-                    <span className="win-locale-label">时区</span>
-                    <strong
-                      className="win-locale-val ellipsis"
-                      title={winLocale.timeZoneDisplayName}
-                    >
-                      {winLocale.timeZoneDisplayName}
-                    </strong>
-                  </div>
-                </div>
-
-                <div className="win-locale-box region-box">
-                  <div className="win-locale-icon">
-                    <CountryFlag code={winLocale.regionCode} size="sm" />
-                  </div>
-                  <div className="win-locale-info">
-                    <span className="win-locale-label">区域</span>
-                    <strong className="win-locale-val">{winLocale.regionName}</strong>
-                  </div>
-                </div>
-              </div>
-
-              <div className="locale-actions-row">
-                <button
-                  className="btn-sync-locale"
-                  disabled={!effectiveTargetCode || isSyncingLocale}
-                  onClick={() => void handleSyncLocale()}
-                  title={
-                    effectiveTargetCode
-                      ? '将 Windows 时区与区域同步至目标保护地区（多时区大国自动匹配城市时区）'
-                      : '请先选择代理节点或设置保护地区'
-                  }
-                >
-                  <RefreshCw className={isSyncingLocale ? 'spin' : ''} size={14} />
-                  <span>
-                    {isSyncingLocale
-                      ? '正在设置系统时区...'
-                      : effectiveTargetName
-                      ? `一键同步至 [${effectiveTargetName}]`
-                      : '请先选择代理节点'}
-                  </span>
-                </button>
-
-                <button
-                  className="btn-restore-locale"
-                  disabled={isSyncingLocale || isAlreadyChinaDefaultLocale}
-                  onClick={() => void handleRestoreLocale()}
-                  title={
-                    isAlreadyChinaDefaultLocale
-                      ? '当前系统已处于默认中国时区与区域'
-                      : '若当前代理非中国，将先强杀 Claude 与守护进程后再还原回中国时区与区域'
-                  }
-                >
-                  <RotateCcw size={14} />
-                  <span>{isAlreadyChinaDefaultLocale ? '已是中国时区' : '还原默认时区'}</span>
-                </button>
-              </div>
-
-              {localeFeedback && (
-                <div className={`locale-feedback ${localeFeedback.ok ? 'ok' : 'err'}`}>
-                  {localeFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
-                  <span>{localeFeedback.text}</span>
-                </div>
-              )}
-            </section>
-
-            {/* 3. 默认保护地区卡片 */}
-            <section className="panel-card">
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <Lock size={15} />
-                  <span>默认保护地区设置</span>
-                </div>
-                {config.defaultCountryCode && (
-                  <button
-                    className="btn-link-clear"
-                    onClick={() => void window.guardAPI.setDefaultRegion(null)}
-                    title="取消固定默认地区限制"
-                  >
-                    <Unlock size={13} />
-                    <span>清除默认</span>
-                  </button>
-                )}
-              </div>
-
-              <div className="default-region-body">
-                <div className="default-current-display">
-                  {config.defaultCountryCode ? (
-                    <>
-                      <CountryFlag code={config.defaultCountryCode} size="md" />
-                      <div className="default-text">
-                        <strong>
-                          {config.defaultCountryName} ({config.defaultCountryCode})
-                        </strong>
-                        <small>出口偏离该地区时立即告警并拦截受保护进程</small>
-                      </div>
-                    </>
-                  ) : (
-                    <div className="default-unset-hint">
-                      <span>未锁定固定地区，首次选定节点后将自动初始化</span>
-                    </div>
-                  )}
-                </div>
-
-                <div className="default-actions-row">
-                  <button
-                    className={`btn-primary-set ${isCurrentAlreadyDefault ? 'btn-already' : ''}`}
-                    disabled={!canLockCurrentProbe || isCurrentAlreadyDefault}
-                    onClick={() => void window.guardAPI.setDefaultCurrent()}
-                  >
-                    <Sparkles size={15} />
-                    <span>
-                      {isCurrentAlreadyDefault
-                        ? `当前 [${lastProbe?.countryName}] 已是默认`
-                        : canLockCurrentProbe && lastProbe
-                        ? `将当前 [${lastProbe.countryName}] 设为默认`
-                        : '等待检测有效地区...'}
-                    </span>
-                  </button>
-
-                  <select
-                    className="region-select"
-                    value={config.defaultCountryCode || ''}
-                    onChange={(e) => {
-                      const val = e.target.value || null;
-                      void window.guardAPI.setDefaultRegion(val);
-                    }}
-                    title="也可直接手动指定期望的国家/地区"
-                  >
-                    <option value="">手动指定地区...</option>
-                    {isCustomCountryOutsideCommon && config.defaultCountryCode && (
-                      <option value={config.defaultCountryCode}>
-                        {config.defaultCountryName} ({config.defaultCountryCode})
-                      </option>
-                    )}
-                    {COMMON_COUNTRIES.map((c) => (
-                      <option key={c.code} value={c.code}>
-                        {c.name} ({c.code})
-                      </option>
-                    ))}
-                  </select>
-                </div>
-
-                <div className="setting-row no-border-bottom">
-                  <div>
-                    <strong>实时监控异常弹窗告警</strong>
-                    <p>开启后，Clash 选中通道与保护地区/系统时区不符或断连时弹出置顶提醒</p>
-                  </div>
-                  <input
-                    type="checkbox"
-                    className="toggle-switch"
-                    checked={config.monitorAlertEnabled}
-                    onChange={(e) =>
-                      void window.guardAPI
-                        .updateConfig({ monitorAlertEnabled: e.target.checked })
-                        .then(setState)
-                    }
-                  />
-                </div>
-              </div>
-            </section>
-          </div>
-        )}
-
-        {activeTab === 'guard' && (
-          <div className="tab-pane">
-            {/* 1. 强杀触发策略卡片 */}
-            <section className="panel-card">
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <ShieldAlert size={15} />
-                  <span>触发拦截条件</span>
-                </div>
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>启用额外进程守护</strong>
-                  <p>异常时按进程树强杀下方列表应用（Claude 已由专栏内置保护）</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  checked={config.killProcessesEnabled}
-                  onChange={(e) =>
-                    void window.guardAPI.updateConfig({ killProcessesEnabled: e.target.checked })
-                  }
+            {/* 实时监控内部二级切换器：状态与时区 vs 联动进程强杀 */}
+            <div className="launcher-subtabs">
+              <button
+                className={`launcher-subtab ${monitorSubTab === 'status' ? 'active' : ''}`}
+                onClick={() => setMonitorSubTab('status')}
+              >
+                <Activity size={14} />
+                <span>状态与时区</span>
+                <span
+                  className={`tab-status-dot ${
+                    status === 'ok'
+                      ? 'running'
+                      : status === 'mismatch' || status === 'error'
+                      ? 'locked'
+                      : status === 'checking'
+                      ? 'checking'
+                      : 'ready'
+                  }`}
                 />
-              </div>
+              </button>
 
-              <div className="setting-row">
-                <div>
-                  <strong>代理断连或超时时强杀</strong>
-                  <p>代理连接断开或探测超时期间禁止运行</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  disabled={!config.killProcessesEnabled}
-                  checked={config.killOnDisconnect}
-                  onChange={(e) =>
-                    void window.guardAPI.updateConfig({ killOnDisconnect: e.target.checked })
-                  }
-                />
-              </div>
-
-              <div className="setting-row no-border-bottom">
-                <div>
-                  <strong>系统时区/区域不一致时强杀</strong>
-                  <p>系统时区或国家区域与代理出口不符时立即终止</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  disabled={!config.killProcessesEnabled}
-                  checked={config.killOnLocaleMismatch}
-                  onChange={(e) =>
-                    void window.guardAPI.updateConfig({ killOnLocaleMismatch: e.target.checked })
-                  }
-                />
-              </div>
-            </section>
-
-            {/* 2. 进程匹配规则列表卡片 */}
-            <section className="panel-card">
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <Lock size={15} />
-                  <span>额外守护进程列表</span>
-                </div>
-                <span className="mini-badge neutral">
-                  共 {config.protectedProcessPatterns.length} 条
+              <button
+                className={`launcher-subtab ${monitorSubTab === 'guard' ? 'active' : ''}`}
+                onClick={() => setMonitorSubTab('guard')}
+              >
+                <ShieldAlert size={14} />
+                <span>联动进程强杀</span>
+                <span className="subtab-mode-badge guard">
+                  {config.protectedProcessPatterns.length > 0
+                    ? `守护 ${config.protectedProcessPatterns.length} 项`
+                    : '未配置规则'}
                 </span>
-              </div>
+              </button>
+            </div>
 
-              <div className="pattern-input-group">
-                <div className="pattern-input-row">
-                  <input
-                    type="text"
-                    value={patternInput}
-                    onChange={(e) => {
-                      setPatternInput(e.target.value);
-                      if (patternSubmitErr) setPatternSubmitErr(null);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') {
-                        void handleAddPattern();
-                      }
-                    }}
-                    placeholder="输入进程名、通配符或正则，如 *cursor*"
-                  />
-                  <button className="btn-save-inline" onClick={() => void handleAddPattern()}>
-                    <Plus size={14} />
-                    <span>添加</span>
-                  </button>
-                </div>
-
-                {patternSubmitErr ? (
-                  <div className="pattern-hint err">
-                    <AlertTriangle size={12} />
-                    <span>{patternSubmitErr}</span>
+            {monitorSubTab === 'status' ? (
+              <>
+                {/* 1. 当前出口状态主卡片 */}
+                <section className={`hero-card ${statusMeta.cls}`}>
+                  <div className="hero-top-row">
+                    <div className={`status-pill ${statusMeta.cls}`}>
+                      {statusMeta.icon}
+                      <span>{statusMeta.badge}</span>
+                    </div>
+                    <button
+                      className="btn-refresh"
+                      disabled={isChecking}
+                      onClick={() => void window.guardAPI.checkNow('手动立即刷新')}
+                    >
+                      <RefreshCw className={isChecking ? 'spin' : ''} size={14} />
+                      <span>{isChecking ? '检测中...' : '立即检测'}</span>
+                    </button>
                   </div>
-                ) : livePatternCheck ? (
-                  livePatternCheck.valid ? (
-                    <div className="pattern-hint valid">
-                      <Check size={12} />
-                      <span>
-                        识别为
-                        <strong>
-                          {livePatternCheck.mode === 'regex' ? ' 正则表达式 ' : ' 通配符 '}
-                        </strong>
-                        模式（回车添加）
-                      </span>
+
+                  {lastProbe ? (
+                    <div className="hero-main-info">
+                      <div className="hero-country-row">
+                        <CountryFlag code={lastProbe.countryCode} size="lg" />
+                        <div className="hero-country-titles">
+                          <div className="country-primary">
+                            <h1>{lastProbe.countryName}</h1>
+                            <span className="iso-pill">{lastProbe.countryCode}</span>
+                            {lastProbe.edgeLoc &&
+                              isValidIsoCountryCode(lastProbe.countryCode) &&
+                              lastProbe.edgeLoc !== lastProbe.countryCode && (
+                                <span
+                                  className="edge-hint-pill"
+                                  title="IP 离线库归属地与 CDN 边缘节点物理位置不同（常见于广播 IP 或跨区路由）"
+                                >
+                                  路由点: {lastProbe.edgeLoc}
+                                </span>
+                              )}
+                          </div>
+                          <div className="ip-row">
+                            <span className="ip-label">出口 IP:</span>
+                            <code className="ip-code">{lastProbe.ip}</code>
+                            <button
+                              className="btn-icon-tiny"
+                              onClick={handleCopyIp}
+                              title="复制出口 IP"
+                            >
+                              {copiedIp ? <Check size={13} /> : <Copy size={13} />}
+                            </button>
+                            <span className="latency-tag">{lastProbe.latencyMs} ms</span>
+                          </div>
+                        </div>
+                      </div>
+
+                      {lastError && status === 'error' && (
+                        <div className="inline-error-banner">
+                          <WifiOff size={14} />
+                          <span>最新检测异常：{lastError}</span>
+                        </div>
+                      )}
+
+                      <div className="hero-footer-meta">
+                        <span className="ellipsis" title={lastProbe.viaChannel}>
+                          检测通道：{lastProbe.viaChannel}
+                        </span>
+                        <span>更新于 {formatTime(lastProbe.checkedAt)}</span>
+                      </div>
                     </div>
                   ) : (
-                    <div className="pattern-hint err">
-                      <AlertTriangle size={12} />
-                      <span>{livePatternCheck.error}</span>
+                    <div className="hero-empty-state">
+                      {lastError ? (
+                        <div className="error-empty-box">
+                          <WifiOff size={28} />
+                          <p>{lastError}</p>
+                          <small>请确认 Clash Verge 已连接并选择有效节点</small>
+                        </div>
+                      ) : (
+                        <p>正在通过代理隧道验证真实出口 IP...</p>
+                      )}
                     </div>
-                  )
-                ) : (
-                  <p className="pattern-syntax-tip">
-                    支持通配符（如 <code>*cursor*</code>）或正则（<code>/pattern/</code>），大小写不敏感。
-                  </p>
-                )}
-              </div>
+                  )}
+                </section>
 
-              {config.protectedProcessPatterns.length === 0 ? (
-                <div className="pattern-empty">
-                  Claude 已由专栏内置保护。如需联动保护其他应用，可在上方添加规则。
-                </div>
-              ) : (
-                <div className="pattern-list">
-                  {config.protectedProcessPatterns.map((pat) => {
-                    const info = inspectProcessPattern(pat);
-                    return (
-                      <div key={pat} className="pattern-item">
-                        <div className="pattern-item-left">
-                          <code className="pattern-code">{pat}</code>
-                          <span
-                            className={`pattern-mode-tag ${
-                              info.mode === 'regex' ? 'regex' : 'wildcard'
-                            }`}
-                          >
-                            {info.mode === 'regex' ? '正则' : '通配符'}
+                {/* 2. Windows 时区与区域同步卡片 */}
+                <section className="panel-card">
+                  <div className="panel-card-header">
+                    <div className="panel-title">
+                      <Globe size={15} />
+                      <span>Windows 时区与区域</span>
+                    </div>
+                    {effectiveTargetCode && (
+                      <span
+                        className={`mini-badge ${
+                          isWinLocaleMatched ? 'connected' : 'warn-badge'
+                        }`}
+                      >
+                        {isWinLocaleMatched ? '已与保护地区一致' : '与保护地区不一致'}
+                      </span>
+                    )}
+                  </div>
+
+                  <div className="win-locale-grid">
+                    <div className="win-locale-box">
+                      <div className="win-locale-icon">
+                        <Clock size={16} />
+                      </div>
+                      <div className="win-locale-info">
+                        <span className="win-locale-label">时区</span>
+                        <strong
+                          className="win-locale-val ellipsis"
+                          title={winLocale.timeZoneDisplayName}
+                        >
+                          {winLocale.timeZoneDisplayName}
+                        </strong>
+                      </div>
+                    </div>
+
+                    <div className="win-locale-box region-box">
+                      <div className="win-locale-icon">
+                        <CountryFlag code={winLocale.regionCode} size="sm" />
+                      </div>
+                      <div className="win-locale-info">
+                        <span className="win-locale-label">区域</span>
+                        <strong className="win-locale-val">{winLocale.regionName}</strong>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="locale-actions-row">
+                    <button
+                      className="btn-sync-locale"
+                      disabled={!effectiveTargetCode || isSyncingLocale}
+                      onClick={() => void handleSyncLocale()}
+                      title={
+                        effectiveTargetCode
+                          ? '将 Windows 时区与区域同步至目标保护地区（多时区大国自动匹配城市时区）'
+                          : '请先选择代理节点或设置保护地区'
+                      }
+                    >
+                      <RefreshCw className={isSyncingLocale ? 'spin' : ''} size={14} />
+                      <span>
+                        {isSyncingLocale
+                          ? '正在设置系统时区...'
+                          : effectiveTargetName
+                          ? `一键同步至 [${effectiveTargetName}]`
+                          : '请先选择代理节点'}
+                      </span>
+                    </button>
+
+                    <button
+                      className="btn-restore-locale"
+                      disabled={isSyncingLocale || isAlreadyChinaDefaultLocale}
+                      onClick={() => void handleRestoreLocale()}
+                      title={
+                        isAlreadyChinaDefaultLocale
+                          ? '当前系统已处于默认中国时区与区域'
+                          : '若当前代理非中国，将先强杀 Claude 与守护进程后再还原回中国时区与区域'
+                      }
+                    >
+                      <RotateCcw size={14} />
+                      <span>
+                        {isAlreadyChinaDefaultLocale ? '已是中国时区' : '还原默认时区'}
+                      </span>
+                    </button>
+                  </div>
+
+                  {localeFeedback && (
+                    <div className={`locale-feedback ${localeFeedback.ok ? 'ok' : 'err'}`}>
+                      {localeFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
+                      <span>{localeFeedback.text}</span>
+                    </div>
+                  )}
+                </section>
+
+                {/* 3. 默认保护地区卡片 */}
+                <section className="panel-card">
+                  <div className="panel-card-header">
+                    <div className="panel-title">
+                      <Lock size={15} />
+                      <span>默认保护地区设置</span>
+                    </div>
+                    {config.defaultCountryCode && (
+                      <button
+                        className="btn-link-clear"
+                        onClick={() => void window.guardAPI.setDefaultRegion(null)}
+                        title="取消固定默认地区限制"
+                      >
+                        <Unlock size={13} />
+                        <span>清除默认</span>
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="default-region-body">
+                    <div className="default-current-display">
+                      {config.defaultCountryCode ? (
+                        <>
+                          <CountryFlag code={config.defaultCountryCode} size="md" />
+                          <div className="default-text">
+                            <strong>
+                              {config.defaultCountryName} ({config.defaultCountryCode})
+                            </strong>
+                            <small>出口偏离该地区时立即告警并拦截受保护进程</small>
+                          </div>
+                        </>
+                      ) : (
+                        <div className="default-unset-hint">
+                          <span>未锁定固定地区，首次选定节点后将自动初始化</span>
+                        </div>
+                      )}
+                    </div>
+
+                    <div className="default-actions-row">
+                      <button
+                        className={`btn-primary-set ${
+                          isCurrentAlreadyDefault ? 'btn-already' : ''
+                        }`}
+                        disabled={!canLockCurrentProbe || isCurrentAlreadyDefault}
+                        onClick={() => void window.guardAPI.setDefaultCurrent()}
+                      >
+                        <Sparkles size={15} />
+                        <span>
+                          {isCurrentAlreadyDefault
+                            ? `当前 [${lastProbe?.countryName}] 已是默认`
+                            : canLockCurrentProbe && lastProbe
+                            ? `将当前 [${lastProbe.countryName}] 设为默认`
+                            : '等待检测有效地区...'}
+                        </span>
+                      </button>
+
+                      <select
+                        className="region-select"
+                        value={config.defaultCountryCode || ''}
+                        onChange={(e) => {
+                          const val = e.target.value || null;
+                          void window.guardAPI.setDefaultRegion(val);
+                        }}
+                        title="也可直接手动指定期望的国家/地区"
+                      >
+                        <option value="">手动指定地区...</option>
+                        {isCustomCountryOutsideCommon && config.defaultCountryCode && (
+                          <option value={config.defaultCountryCode}>
+                            {config.defaultCountryName} ({config.defaultCountryCode})
+                          </option>
+                        )}
+                        {COMMON_COUNTRIES.map((c) => (
+                          <option key={c.code} value={c.code}>
+                            {c.name} ({c.code})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
+                </section>
+              </>
+            ) : (
+              <>
+                {/* 1. 强杀触发策略卡片 */}
+                <section className="panel-card">
+                  <div className="panel-card-header">
+                    <div className="panel-title">
+                      <ShieldAlert size={15} />
+                      <span>实时监控联动拦截条件</span>
+                    </div>
+                  </div>
+
+                  <div className="setting-row">
+                    <div>
+                      <strong>启用实时监控联动进程强杀</strong>
+                      <p>
+                        当实时监控通道异常时按进程树强杀下方列表应用（Claude 已由启动器专栏独立保护）
+                      </p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      className="toggle-switch"
+                      checked={config.killProcessesEnabled}
+                      onChange={(e) =>
+                        void window.guardAPI.updateConfig({
+                          killProcessesEnabled: e.target.checked,
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div className="setting-row">
+                    <div>
+                      <strong>代理断连或超时时强杀</strong>
+                      <p>实时监控代理连接断开或探测超时期间禁止运行</p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      className="toggle-switch"
+                      disabled={!config.killProcessesEnabled}
+                      checked={config.killOnDisconnect}
+                      onChange={(e) =>
+                        void window.guardAPI.updateConfig({
+                          killOnDisconnect: e.target.checked,
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div className="setting-row no-border-bottom">
+                    <div>
+                      <strong>系统时区/区域不一致时强杀</strong>
+                      <p>系统时区或国家区域与实时监控保护地区不符时立即终止</p>
+                    </div>
+                    <input
+                      type="checkbox"
+                      className="toggle-switch"
+                      disabled={!config.killProcessesEnabled}
+                      checked={config.killOnLocaleMismatch}
+                      onChange={(e) =>
+                        void window.guardAPI.updateConfig({
+                          killOnLocaleMismatch: e.target.checked,
+                        })
+                      }
+                    />
+                  </div>
+                </section>
+
+                {/* 2. 进程匹配规则列表卡片 */}
+                <section className="panel-card">
+                  <div className="panel-card-header">
+                    <div className="panel-title">
+                      <Lock size={15} />
+                      <span>联动守护进程列表</span>
+                    </div>
+                    <span className="mini-badge neutral">
+                      共 {config.protectedProcessPatterns.length} 条
+                    </span>
+                  </div>
+
+                  <div className="pattern-input-group">
+                    <div className="pattern-input-row">
+                      <input
+                        type="text"
+                        value={patternInput}
+                        onChange={(e) => {
+                          setPatternInput(e.target.value);
+                          if (patternSubmitErr) setPatternSubmitErr(null);
+                        }}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter') {
+                            void handleAddPattern();
+                          }
+                        }}
+                        placeholder="输入进程名、通配符或正则，如 *cursor*"
+                      />
+                      <button
+                        className="btn-save-inline"
+                        onClick={() => void handleAddPattern()}
+                      >
+                        <Plus size={14} />
+                        <span>添加</span>
+                      </button>
+                    </div>
+
+                    {patternSubmitErr ? (
+                      <div className="pattern-hint err">
+                        <AlertTriangle size={12} />
+                        <span>{patternSubmitErr}</span>
+                      </div>
+                    ) : livePatternCheck ? (
+                      livePatternCheck.valid ? (
+                        <div className="pattern-hint valid">
+                          <Check size={12} />
+                          <span>
+                            识别为
+                            <strong>
+                              {livePatternCheck.mode === 'regex' ? ' 正则表达式 ' : ' 通配符 '}
+                            </strong>
+                            模式（回车添加）
                           </span>
                         </div>
-                        <button
-                          className="btn-remove-pattern"
-                          onClick={() => void handleRemovePattern(pat)}
-                          title="移除该规则"
-                        >
-                          <Trash2 size={14} />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-            </section>
+                      ) : (
+                        <div className="pattern-hint err">
+                          <AlertTriangle size={12} />
+                          <span>{livePatternCheck.error}</span>
+                        </div>
+                      )
+                    ) : (
+                      <p className="pattern-syntax-tip">
+                        支持通配符（如 <code>*cursor*</code>）或正则（<code>/pattern/</code>
+                        ），大小写不敏感。
+                      </p>
+                    )}
+                  </div>
+
+                  {config.protectedProcessPatterns.length === 0 ? (
+                    <div className="pattern-empty">
+                      Claude 已由启动器专栏内置保护。如需根据实时监控通道联动保护其他应用，可在上方添加规则。
+                    </div>
+                  ) : (
+                    <div className="pattern-list">
+                      {config.protectedProcessPatterns.map((pat) => {
+                        const info = inspectProcessPattern(pat);
+                        return (
+                          <div key={pat} className="pattern-item">
+                            <div className="pattern-item-left">
+                              <code className="pattern-code">{pat}</code>
+                              <span
+                                className={`pattern-mode-tag ${
+                                  info.mode === 'regex' ? 'regex' : 'wildcard'
+                                }`}
+                              >
+                                {info.mode === 'regex' ? '正则' : '通配符'}
+                              </span>
+                            </div>
+                            <button
+                              className="btn-remove-pattern"
+                              onClick={() => void handleRemovePattern(pat)}
+                              title="移除该规则"
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </section>
+              </>
+            )}
           </div>
         )}
 
         {activeTab === 'settings' && (
           <div className="tab-pane">
-            {/* 代理获取模式 */}
+            {/* 1. 实时监控专属设置（检测通道模式 + 监控异常告警） */}
             <section className="panel-card">
               <div className="panel-card-header">
                 <div className="panel-title">
-                  <Settings size={15} />
-                  <span>实时监控检测通道模式</span>
+                  <Activity size={15} />
+                  <span>实时监控设置（通道与告警）</span>
                 </div>
+                <span className="mini-badge neutral">仅作用于实时监控</span>
               </div>
 
               <div className="radio-group">
@@ -1948,21 +1998,52 @@ export const MainDashboard: React.FC = () => {
                   </div>
                 </label>
               </div>
+
+              <div className="setting-row">
+                <div>
+                  <strong>实时监控异常弹窗告警</strong>
+                  <p>开启后，Clash 选中通道与保护地区/系统时区不一致，或触发联动进程强杀时弹出置顶提醒</p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="toggle-switch"
+                  checked={config.monitorAlertEnabled}
+                  onChange={(e) =>
+                    void window.guardAPI.updateConfig({ monitorAlertEnabled: e.target.checked })
+                  }
+                />
+              </div>
+
+              <div className="setting-row no-border-bottom">
+                <div>
+                  <strong>实时监控断连或超时报警</strong>
+                  <p>实时监控代理连接失败或节点超时时也弹窗提醒（需先开启实时监控异常弹窗）</p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="toggle-switch"
+                  disabled={!config.monitorAlertEnabled}
+                  checked={config.alertOnDisconnect}
+                  onChange={(e) =>
+                    void window.guardAPI.updateConfig({ alertOnDisconnect: e.target.checked })
+                  }
+                />
+              </div>
             </section>
 
-            {/* 监测频率与提醒开关 */}
+            {/* 2. 软件全局通用设置 */}
             <section className="panel-card">
               <div className="panel-card-header">
                 <div className="panel-title">
-                  <BellRing size={15} />
-                  <span>巡检与提醒设置</span>
+                  <Settings size={15} />
+                  <span>软件全局通用设置</span>
                 </div>
               </div>
 
               <div className="setting-row">
                 <div>
                   <strong>运行期后台巡检间隔</strong>
-                  <p>Claude 或守护进程运行期间，定时静默复核出口 IP 是否漂移</p>
+                  <p>后台定时静默复核出口 IP 是否漂移（同时作用于运行中的 Claude 与实时监控）</p>
                 </div>
                 <select
                   className="compact-select"
@@ -1984,39 +2065,8 @@ export const MainDashboard: React.FC = () => {
 
               <div className="setting-row">
                 <div>
-                  <strong>置顶警告弹窗（总开关）</strong>
-                  <p>Claude 异常拦截或触发告警时在屏幕右下角弹出置顶提醒</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  checked={config.alertPopupEnabled}
-                  onChange={(e) =>
-                    void window.guardAPI.updateConfig({ alertPopupEnabled: e.target.checked })
-                  }
-                />
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>实时监控异常弹窗告警</strong>
-                  <p>开启后，Clash 选中通道与保护地区/系统时区不一致或断连时也弹出提醒</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  disabled={!config.alertPopupEnabled}
-                  checked={config.monitorAlertEnabled}
-                  onChange={(e) =>
-                    void window.guardAPI.updateConfig({ monitorAlertEnabled: e.target.checked })
-                  }
-                />
-              </div>
-
-              <div className="setting-row">
-                <div>
                   <strong>异常警告提示音</strong>
-                  <p>触发弹窗警告时播放短促提示音</p>
+                  <p>任何模块触发右下角置顶警告弹窗时播放短促提示音</p>
                 </div>
                 <input
                   type="checkbox"
@@ -2024,21 +2074,6 @@ export const MainDashboard: React.FC = () => {
                   checked={config.alertSoundEnabled}
                   onChange={(e) =>
                     void window.guardAPI.updateConfig({ alertSoundEnabled: e.target.checked })
-                  }
-                />
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>代理断连或超时报警</strong>
-                  <p>代理连接失败或节点超时时弹窗提醒</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  checked={config.alertOnDisconnect}
-                  onChange={(e) =>
-                    void window.guardAPI.updateConfig({ alertOnDisconnect: e.target.checked })
                   }
                 />
               </div>
