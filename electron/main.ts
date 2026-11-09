@@ -87,8 +87,8 @@ if (process.platform === 'win32') {
   app.setAppUserModelId('com.antigravity.proxy-region-guard');
 }
 
-// 限制 V8 老生代堆上限并禁用无需使用的 Chromium 后台特性，显著降低主进程与渲染进程内存占用
-app.commandLine.appendSwitch('js-flags', '--max-old-space-size=96');
+// 限制 V8 老生代堆上限并禁用无需使用的 Chromium 后台特性，兼顾大订阅 YAML 解析安全与低内存占用
+app.commandLine.appendSwitch('js-flags', '--max-old-space-size=256');
 app.commandLine.appendSwitch(
   'disable-features',
   'SpareRendererForSitePerProcess,WinDelaySpellcheckServiceInit,WinRetrieveSuggestionsOnlyOnDemand,CalculateNativeWinOcclusion,HardwareMediaKeyHandling,MediaSessionService'
@@ -720,11 +720,12 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('guard:browse-claude-exe', async () => {
     const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
-    const res = await dialog.showOpenDialog(win as BrowserWindow, {
+    const options: Electron.OpenDialogOptions = {
       title: '选择 Claude Desktop 可执行文件 (Claude.exe)',
       filters: [{ name: '可执行文件 (*.exe)', extensions: ['exe'] }],
       properties: ['openFile'],
-    });
+    };
+    const res = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
     if (!res.canceled && res.filePaths.length > 0) {
       configStore.update({ claudeExePath: res.filePaths[0] });
       await probeEngine.refreshClaudeInstallDetection();
@@ -753,11 +754,12 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('guard:browse-antigravity-exe', async () => {
     const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : undefined;
-    const res = await dialog.showOpenDialog(win as BrowserWindow, {
+    const options: Electron.OpenDialogOptions = {
       title: '选择 Antigravity 可执行文件 (Antigravity.exe)',
       filters: [{ name: '可执行文件 (*.exe)', extensions: ['exe'] }],
       properties: ['openFile'],
-    });
+    };
+    const res = win ? await dialog.showOpenDialog(win, options) : await dialog.showOpenDialog(options);
     if (!res.canceled && res.filePaths.length > 0) {
       configStore.update({ antigravityExePath: res.filePaths[0] });
       await probeEngine.refreshAntigravityInstallDetection();

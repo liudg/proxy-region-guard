@@ -134,6 +134,10 @@ export class ProbeEngine extends EventEmitter {
   private claudeLaunchGraceUntil = 0;
   private claudeIsProbing = false;
   private claudeProbePromise: Promise<AppStateSnapshot> | null = null;
+  private claudeProbeSeq = 0;
+  private claudePendingProbe: { reason: string; skipSafetyEnforcement: boolean } | null = null;
+  private claudeSwitchingCount = 0;
+  private isEnforcingClaudeSafety = false;
   private claudeNodeProbe: ProbeResult | null = null;
   private claudeNodeProbeError: string | null = null;
 
@@ -147,6 +151,8 @@ export class ProbeEngine extends EventEmitter {
   private antigravityProxiedSession = false;
   private antigravityIsProbing = false;
   private antigravityProbePromise: Promise<AppStateSnapshot> | null = null;
+  private antigravityProbeSeq = 0;
+  private antigravityPendingReprobe = false;
   private antigravityNodeProbe: ProbeResult | null = null;
   private antigravityNodeProbeError: string | null = null;
 
@@ -432,6 +438,7 @@ export class ProbeEngine extends EventEmitter {
       prevCfg.antigravityClashNode !== cleanNode ||
       prevCfg.antigravityClashProfileUid !== effectiveProfileUid
     ) {
+      this.antigravityProbeSeq++;
       this.antigravityNodeProbe = null;
       this.antigravityNodeProbeError = null;
     }
@@ -472,6 +479,8 @@ export class ProbeEngine extends EventEmitter {
       );
       return this.probeAntigravityNodeNow();
     } else {
+      this.antigravityProbeSeq++;
+      this.antigravityPendingReprobe = false;
       const cfg = this.configStore.update({
         antigravityClashNode: null,
         antigravityClashProfileUid: null,
@@ -499,6 +508,8 @@ export class ProbeEngine extends EventEmitter {
   public async probeAntigravityNodeNow(): Promise<AppStateSnapshot> {
     const cfg = this.configStore.get();
     if (!cfg.antigravityClashNode) {
+      this.antigravityProbeSeq++;
+      this.antigravityPendingReprobe = false;
       this.antigravityNodeProbe = null;
       this.antigravityNodeProbeError = null;
       this.emitState();
@@ -506,6 +517,7 @@ export class ProbeEngine extends EventEmitter {
     }
 
     if (this.antigravityProbePromise) {
+      this.antigravityPendingReprobe = true;
       return this.antigravityProbePromise;
     }
 
@@ -514,68 +526,118 @@ export class ProbeEngine extends EventEmitter {
       this.emitState();
 
       try {
-        const curCfg = this.configStore.get();
-        if (!curCfg.antigravityClashNode) {
-          this.antigravityNodeProbe = null;
-          this.antigravityNodeProbeError = null;
-          return this.getSnapshot();
-        }
-
-        let clash = this.clashMonitor.getRuntimeInfo();
-        if (!clash.connected || !clash.antigravityPortListening) {
-          const bindRes = await this.clashMonitor.configureAntigravityNode(
-            curCfg.antigravityClashNode,
-            curCfg.antigravityDedicatedPort,
-            curCfg.antigravityClashProfileUid,
-            false
-          );
-          clash = this.clashMonitor.getRuntimeInfo();
-          if (!bindRes.ok || !bindRes.listening) {
+        while (!this.stopped) {
+          this.antigravityPendingReprobe = false;
+          const seqAtStart = ++this.antigravityProbeSeq;
+          const curCfg = this.configStore.get();
+          const targetNode = curCfg.antigravityClashNode;
+          const targetProfileUid = curCfg.antigravityClashProfileUid;
+          if (!targetNode) {
             this.antigravityNodeProbe = null;
-            this.antigravityNodeProbeError =
-              bindRes.error ||
-              `专属端口 127.0.0.1:${curCfg.antigravityDedicatedPort} 未就绪`;
-            return this.getSnapshot();
+            this.antigravityNodeProbeError = null;
+            break;
           }
-        }
 
-        const proxyUrl = `http://127.0.0.1:${curCfg.antigravityDedicatedPort}`;
-        const channelDesc = `Antigravity 专属端口 (127.0.0.1:${curCfg.antigravityDedicatedPort})`;
-
-        const firstPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5500);
-        let probeSuccess = firstPass.result;
-        let lastErrMsg = firstPass.errMsg;
-
-        if (!probeSuccess && curCfg.antigravityClashNode) {
-          await sleep(320);
-          const rebindRes = await this.clashMonitor.configureAntigravityNode(
-            curCfg.antigravityClashNode,
-            curCfg.antigravityDedicatedPort,
-            curCfg.antigravityClashProfileUid,
-            true
-          );
-          if (rebindRes.ok && rebindRes.listening) {
-            const secondPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5500);
-            probeSuccess = secondPass.result;
-            if (!probeSuccess) {
-              lastErrMsg = secondPass.errMsg;
+          let clash = this.clashMonitor.getRuntimeInfo();
+          if (!clash.connected || !clash.antigravityPortListening) {
+            const bindRes = await this.clashMonitor.configureAntigravityNode(
+              targetNode,
+              curCfg.antigravityDedicatedPort,
+              targetProfileUid,
+              false
+            );
+            clash = this.clashMonitor.getRuntimeInfo();
+            if (!bindRes.ok || !bindRes.listening) {
+              const latestCfg = this.configStore.get();
+              if (
+                this.antigravityProbeSeq !== seqAtStart ||
+                latestCfg.antigravityClashNode !== targetNode ||
+                latestCfg.antigravityClashProfileUid !== targetProfileUid
+              ) {
+                if (latestCfg.antigravityClashNode) continue;
+                this.antigravityNodeProbe = null;
+                this.antigravityNodeProbeError = null;
+                break;
+              }
+              this.antigravityNodeProbe = null;
+              this.antigravityNodeProbeError =
+                bindRes.error ||
+                `专属端口 127.0.0.1:${curCfg.antigravityDedicatedPort} 未就绪`;
+              if (this.antigravityPendingReprobe && this.configStore.get().antigravityClashNode) {
+                continue;
+              }
+              break;
             }
           }
-        }
 
-        if (probeSuccess) {
-          await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'antigravity', true);
-          this.antigravityNodeProbe = probeSuccess;
-          this.antigravityNodeProbeError = null;
-          if (probeSuccess.regionMismatchDetail) {
-            this.addLog(
-              'warn',
-              `Antigravity 节点地区预警 [${curCfg.antigravityClashNode}]：${probeSuccess.regionMismatchDetail}`
+          const proxyUrl = `http://127.0.0.1:${curCfg.antigravityDedicatedPort}`;
+          const channelDesc = `Antigravity 专属端口 (127.0.0.1:${curCfg.antigravityDedicatedPort})`;
+
+          const firstPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5500);
+          let probeSuccess = firstPass.result;
+          let lastErrMsg = firstPass.errMsg;
+
+          if (
+            !probeSuccess &&
+            this.antigravityProbeSeq === seqAtStart &&
+            this.configStore.get().antigravityClashNode === targetNode
+          ) {
+            await sleep(320);
+            const rebindRes = await this.clashMonitor.configureAntigravityNode(
+              targetNode,
+              curCfg.antigravityDedicatedPort,
+              targetProfileUid,
+              true
             );
+            if (rebindRes.ok && rebindRes.listening) {
+              const secondPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5500);
+              probeSuccess = secondPass.result;
+              if (!probeSuccess) {
+                lastErrMsg = secondPass.errMsg;
+              }
+            }
           }
-        } else {
-          this.antigravityNodeProbe = null;
-          this.antigravityNodeProbeError = simplifyNetworkError(lastErrMsg, channelDesc);
+
+          if (
+            probeSuccess &&
+            this.antigravityProbeSeq === seqAtStart &&
+            this.configStore.get().antigravityClashNode === targetNode
+          ) {
+            await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'antigravity', true);
+          }
+
+          const afterCfg = this.configStore.get();
+          if (
+            this.antigravityProbeSeq !== seqAtStart ||
+            afterCfg.antigravityClashNode !== targetNode ||
+            afterCfg.antigravityClashProfileUid !== targetProfileUid
+          ) {
+            if (afterCfg.antigravityClashNode) {
+              continue;
+            }
+            this.antigravityNodeProbe = null;
+            this.antigravityNodeProbeError = null;
+            break;
+          }
+
+          if (probeSuccess) {
+            this.antigravityNodeProbe = probeSuccess;
+            this.antigravityNodeProbeError = null;
+            if (probeSuccess.regionMismatchDetail) {
+              this.addLog(
+                'warn',
+                `Antigravity 节点地区预警 [${targetNode}]：${probeSuccess.regionMismatchDetail}`
+              );
+            }
+          } else {
+            this.antigravityNodeProbe = null;
+            this.antigravityNodeProbeError = simplifyNetworkError(lastErrMsg, channelDesc);
+          }
+
+          if (this.antigravityPendingReprobe && this.configStore.get().antigravityClashNode) {
+            continue;
+          }
+          break;
         }
       } finally {
         this.antigravityIsProbing = false;
@@ -753,21 +815,29 @@ export class ProbeEngine extends EventEmitter {
       prevCfg.selectedClashNode !== cleanNode ||
       prevCfg.selectedClashProfileUid !== effectiveProfileUid
     ) {
+      this.claudeProbeSeq++;
       this.claudeNodeProbe = null;
       this.claudeNodeProbeError = null;
     }
 
     if (cleanNode) {
+      this.claudeSwitchingCount++;
       this.addLog(
         'info',
         `正在将 Claude 专属代理通道切换至 Clash 节点：[${cleanNode}] (127.0.0.1:${prevCfg.dedicatedProxyPort})...`
       );
-      const bindRes = await this.clashMonitor.configureDedicatedNode(
-        cleanNode,
-        prevCfg.dedicatedProxyPort,
-        effectiveProfileUid,
-        true
-      );
+      let bindRes: Awaited<ReturnType<ClashMonitor['configureDedicatedNode']>>;
+      try {
+        bindRes = await this.clashMonitor.configureDedicatedNode(
+          cleanNode,
+          prevCfg.dedicatedProxyPort,
+          effectiveProfileUid,
+          true
+        );
+      } catch (err) {
+        this.claudeSwitchingCount = Math.max(0, this.claudeSwitchingCount - 1);
+        throw err;
+      }
 
       const cfg = this.configStore.update({
         selectedClashNode: cleanNode,
@@ -780,6 +850,7 @@ export class ProbeEngine extends EventEmitter {
         : cleanNode;
 
       if (!bindRes.ok) {
+        this.claudeSwitchingCount = Math.max(0, this.claudeSwitchingCount - 1);
         const errText = bindRes.error || `绑定 Claude 节点 [${fullLabel}] 失败`;
         this.claudeNodeProbeError = errText;
         this.addLog('warn', errText);
@@ -795,14 +866,23 @@ export class ProbeEngine extends EventEmitter {
         `已锁定 Claude 专属节点 [${fullLabel}] → 本地专属端口 127.0.0.1:${cfg.dedicatedProxyPort}`
       );
 
-      return this.probeClaudeNodeNow(`切换 Claude 专属节点: ${fullLabel}`);
+      const probeTask = this.probeClaudeNodeNow(`切换 Claude 专属节点: ${fullLabel}`);
+      this.claudeSwitchingCount = Math.max(0, this.claudeSwitchingCount - 1);
+      return probeTask;
     } else {
+      this.claudeProbeSeq++;
+      this.claudePendingProbe = null;
+      this.claudeSwitchingCount++;
       const cfg = this.configStore.update({
         selectedClashNode: null,
         selectedClashProfileUid: null,
         selectedClashProfileName: null,
       });
-      await this.clashMonitor.configureDedicatedNode(null, cfg.dedicatedProxyPort, null, true);
+      try {
+        await this.clashMonitor.configureDedicatedNode(null, cfg.dedicatedProxyPort, null, true);
+      } finally {
+        this.claudeSwitchingCount = Math.max(0, this.claudeSwitchingCount - 1);
+      }
       this.claudeNodeProbe = null;
       this.claudeNodeProbeError = null;
       if (prevCfg.selectedClashNode) {
@@ -825,6 +905,8 @@ export class ProbeEngine extends EventEmitter {
   ): Promise<AppStateSnapshot> {
     const cfg = this.configStore.get();
     if (!cfg.selectedClashNode) {
+      this.claudeProbeSeq++;
+      this.claudePendingProbe = null;
       this.claudeNodeProbe = null;
       this.claudeNodeProbeError = null;
       this.emitState();
@@ -832,120 +914,202 @@ export class ProbeEngine extends EventEmitter {
     }
 
     if (this.claudeProbePromise) {
+      if (!reason.includes('心跳')) {
+        this.claudePendingProbe = {
+          reason,
+          skipSafetyEnforcement,
+        };
+      }
       return this.claudeProbePromise;
     }
+
+    let activeReason = reason;
+    let activeSkipSafety = skipSafetyEnforcement;
 
     const runProbe = async (): Promise<AppStateSnapshot> => {
       this.claudeIsProbing = true;
       this.emitState();
 
       try {
-        let curCfg = this.configStore.get();
-        if (!curCfg.selectedClashNode) {
-          this.claudeNodeProbe = null;
-          this.claudeNodeProbeError = null;
-          return this.getSnapshot();
-        }
-
-        let clash = this.clashMonitor.getRuntimeInfo();
-        if (!clash.connected || !clash.dedicatedPortListening) {
-          const bindRes = await this.clashMonitor.configureDedicatedNode(
-            curCfg.selectedClashNode,
-            curCfg.dedicatedProxyPort,
-            curCfg.selectedClashProfileUid,
-            false
-          );
-          if (bindRes.profileUid || bindRes.profileName) {
-            curCfg = this.configStore.update({
-              selectedClashProfileUid: bindRes.profileUid ?? curCfg.selectedClashProfileUid,
-              selectedClashProfileName: bindRes.profileName ?? curCfg.selectedClashProfileName,
-            });
-          }
-          clash = this.clashMonitor.getRuntimeInfo();
-          if (!bindRes.ok || !bindRes.listening) {
+        while (!this.stopped) {
+          const seqAtStart = ++this.claudeProbeSeq;
+          let curCfg = this.configStore.get();
+          const targetNode = curCfg.selectedClashNode;
+          const targetProfileUid = curCfg.selectedClashProfileUid;
+          if (!targetNode) {
             this.claudeNodeProbe = null;
-            this.claudeNodeProbeError =
-              bindRes.error ||
-              `Claude 专属端口 127.0.0.1:${curCfg.dedicatedProxyPort} 未就绪`;
-            return this.getSnapshot();
+            this.claudeNodeProbeError = null;
+            break;
           }
-        }
 
-        const label =
-          curCfg.selectedClashProfileName || clash.boundProfileName
-            ? `${curCfg.selectedClashProfileName || clash.boundProfileName} / ${
-                curCfg.selectedClashNode
-              }`
-            : curCfg.selectedClashNode;
-        const proxyUrl = `http://127.0.0.1:${curCfg.dedicatedProxyPort}`;
-        const channelDesc = `Claude 专属节点 [${label}] (127.0.0.1:${curCfg.dedicatedProxyPort})`;
-
-        const firstPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5800);
-        let probeSuccess = firstPass.result;
-        let lastErrMsg = firstPass.errMsg;
-
-        if (!probeSuccess && curCfg.selectedClashNode) {
-          await sleep(320);
-          const rebindRes = await this.clashMonitor.configureDedicatedNode(
-            curCfg.selectedClashNode,
-            curCfg.dedicatedProxyPort,
-            curCfg.selectedClashProfileUid,
-            true
-          );
-          if (rebindRes.ok && rebindRes.listening) {
-            const secondPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5800);
-            probeSuccess = secondPass.result;
-            if (!probeSuccess) {
-              lastErrMsg = secondPass.errMsg;
+          let clash = this.clashMonitor.getRuntimeInfo();
+          if (!clash.connected || !clash.dedicatedPortListening) {
+            const bindRes = await this.clashMonitor.configureDedicatedNode(
+              targetNode,
+              curCfg.dedicatedProxyPort,
+              targetProfileUid,
+              false
+            );
+            if (
+              (bindRes.profileUid || bindRes.profileName) &&
+              this.claudeProbeSeq === seqAtStart &&
+              this.configStore.get().selectedClashNode === targetNode
+            ) {
+              curCfg = this.configStore.update({
+                selectedClashProfileUid: bindRes.profileUid ?? curCfg.selectedClashProfileUid,
+                selectedClashProfileName: bindRes.profileName ?? curCfg.selectedClashProfileName,
+              });
+            }
+            clash = this.clashMonitor.getRuntimeInfo();
+            if (!bindRes.ok || !bindRes.listening) {
+              const latestCfg = this.configStore.get();
+              if (
+                this.claudeProbeSeq !== seqAtStart ||
+                latestCfg.selectedClashNode !== targetNode ||
+                latestCfg.selectedClashProfileUid !== (curCfg.selectedClashProfileUid ?? targetProfileUid)
+              ) {
+                if (this.claudePendingProbe) {
+                  const next = this.claudePendingProbe;
+                  this.claudePendingProbe = null;
+                  activeReason = next.reason;
+                  activeSkipSafety = next.skipSafetyEnforcement;
+                  continue;
+                }
+                if (latestCfg.selectedClashNode) continue;
+                this.claudeNodeProbe = null;
+                this.claudeNodeProbeError = null;
+                break;
+              }
+              this.claudeNodeProbe = null;
+              this.claudeNodeProbeError =
+                bindRes.error ||
+                `Claude 专属端口 127.0.0.1:${curCfg.dedicatedProxyPort} 未就绪`;
+              if (this.claudePendingProbe && this.configStore.get().selectedClashNode) {
+                const next = this.claudePendingProbe;
+                this.claudePendingProbe = null;
+                activeReason = next.reason;
+                activeSkipSafety = next.skipSafetyEnforcement;
+                continue;
+              }
+              break;
             }
           }
-        }
 
-        if (probeSuccess) {
-          const isHeartbeat = reason.includes('心跳');
-          if (isHeartbeat) {
-            // 定时心跳巡检保持原状，绝不向 Google / Claude 发起高频请求；仅沿用同 IP 已有的目标服务校验结果
-            this.applyCachedTargetServiceVerification(proxyUrl, probeSuccess, 'claude');
-          } else {
-            const forceRefresh =
-              reason.includes('手动') ||
-              reason.includes('切换') ||
-              reason.includes('启动') ||
-              !this.claudeNodeProbe;
-            await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'claude', forceRefresh);
+          const effectiveProfileUid = curCfg.selectedClashProfileUid;
+          const label =
+            curCfg.selectedClashProfileName || clash.boundProfileName
+              ? `${curCfg.selectedClashProfileName || clash.boundProfileName} / ${targetNode}`
+              : targetNode;
+          const proxyUrl = `http://127.0.0.1:${curCfg.dedicatedProxyPort}`;
+          const channelDesc = `Claude 专属节点 [${label}] (127.0.0.1:${curCfg.dedicatedProxyPort})`;
+
+          const firstPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5800);
+          let probeSuccess = firstPass.result;
+          let lastErrMsg = firstPass.errMsg;
+
+          if (
+            !probeSuccess &&
+            this.claudeProbeSeq === seqAtStart &&
+            this.configStore.get().selectedClashNode === targetNode
+          ) {
+            await sleep(320);
+            const rebindRes = await this.clashMonitor.configureDedicatedNode(
+              targetNode,
+              curCfg.dedicatedProxyPort,
+              effectiveProfileUid,
+              true
+            );
+            if (rebindRes.ok && rebindRes.listening) {
+              const secondPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5800);
+              probeSuccess = secondPass.result;
+              if (!probeSuccess) {
+                lastErrMsg = secondPass.errMsg;
+              }
+            }
           }
 
-          const prevIp = this.claudeNodeProbe?.ip;
-          const prevCountry = this.claudeNodeProbe?.countryCode;
-          const prevMismatch = this.claudeNodeProbe?.regionMismatchDetail;
-          this.claudeNodeProbe = probeSuccess;
-          this.claudeNodeProbeError = null;
+          const isHeartbeat = activeReason.includes('心跳');
+          if (
+            probeSuccess &&
+            this.claudeProbeSeq === seqAtStart &&
+            this.configStore.get().selectedClashNode === targetNode
+          ) {
+            if (isHeartbeat) {
+              // 定时心跳巡检保持原状，绝不向 Google / Claude 发起高频请求；仅沿用同 IP 已有的目标服务校验结果
+              this.applyCachedTargetServiceVerification(proxyUrl, probeSuccess, 'claude');
+            } else {
+              const forceRefresh =
+                activeReason.includes('手动') ||
+                activeReason.includes('切换') ||
+                activeReason.includes('启动') ||
+                !this.claudeNodeProbe;
+              await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'claude', forceRefresh);
+            }
+          }
 
-          if (probeSuccess.regionMismatchDetail) {
-            if (prevMismatch !== probeSuccess.regionMismatchDetail || !isHeartbeat) {
+          const afterCfg = this.configStore.get();
+          if (
+            this.claudeProbeSeq !== seqAtStart ||
+            afterCfg.selectedClashNode !== targetNode ||
+            afterCfg.selectedClashProfileUid !== effectiveProfileUid
+          ) {
+            if (this.claudePendingProbe) {
+              const next = this.claudePendingProbe;
+              this.claudePendingProbe = null;
+              activeReason = next.reason;
+              activeSkipSafety = next.skipSafetyEnforcement;
+              continue;
+            }
+            if (afterCfg.selectedClashNode) {
+              continue;
+            }
+            this.claudeNodeProbe = null;
+            this.claudeNodeProbeError = null;
+            break;
+          }
+
+          if (probeSuccess) {
+            const prevIp = this.claudeNodeProbe?.ip;
+            const prevCountry = this.claudeNodeProbe?.countryCode;
+            const prevMismatch = this.claudeNodeProbe?.regionMismatchDetail;
+            this.claudeNodeProbe = probeSuccess;
+            this.claudeNodeProbeError = null;
+
+            if (probeSuccess.regionMismatchDetail) {
+              if (prevMismatch !== probeSuccess.regionMismatchDetail || !isHeartbeat) {
+                this.addLog(
+                  'danger',
+                  `Claude 节点真伪校验未通过 [${label}]：${probeSuccess.regionMismatchDetail}`
+                );
+              }
+            } else if (
+              prevIp !== probeSuccess.ip ||
+              prevCountry !== probeSuccess.countryCode ||
+              !isHeartbeat
+            ) {
+              const verifiedTag =
+                probeSuccess.googleCountryCode || probeSuccess.claudeTraceLoc
+                  ? ' · 目标服务地区校验通过'
+                  : '';
               this.addLog(
-                'danger',
-                `Claude 节点真伪校验未通过 [${label}]：${probeSuccess.regionMismatchDetail}`
+                'info',
+                `Claude 节点检测 [${label}]：${probeSuccess.countryName} (${probeSuccess.countryCode})${verifiedTag} · IP: ${probeSuccess.ip} (${probeSuccess.latencyMs}ms)`
               );
             }
-          } else if (
-            prevIp !== probeSuccess.ip ||
-            prevCountry !== probeSuccess.countryCode ||
-            !isHeartbeat
-          ) {
-            const verifiedTag =
-              probeSuccess.googleCountryCode || probeSuccess.claudeTraceLoc
-                ? ' · 目标服务地区校验通过'
-                : '';
-            this.addLog(
-              'info',
-              `Claude 节点检测 [${label}]：${probeSuccess.countryName} (${probeSuccess.countryCode})${verifiedTag} · IP: ${probeSuccess.ip} (${probeSuccess.latencyMs}ms)`
-            );
+          } else {
+            this.claudeNodeProbe = null;
+            this.claudeNodeProbeError = simplifyNetworkError(lastErrMsg, channelDesc);
+            this.addLog('warn', `Claude 节点检测失败：${this.claudeNodeProbeError}`);
           }
-        } else {
-          this.claudeNodeProbe = null;
-          this.claudeNodeProbeError = simplifyNetworkError(lastErrMsg, channelDesc);
-          this.addLog('warn', `Claude 节点检测失败：${this.claudeNodeProbeError}`);
+
+          if (this.claudePendingProbe && this.configStore.get().selectedClashNode) {
+            const next = this.claudePendingProbe;
+            this.claudePendingProbe = null;
+            activeReason = next.reason;
+            activeSkipSafety = next.skipSafetyEnforcement;
+            continue;
+          }
+          break;
         }
       } finally {
         this.claudeIsProbing = false;
@@ -956,8 +1120,8 @@ export class ProbeEngine extends EventEmitter {
       }
 
       // 若 Claude 正在运行，探测完成后立即核验其选定节点与系统时区/区域的一致性
-      if (!skipSafetyEnforcement && this.claudeRunning) {
-        await this.enforceClaudeRunningSafety(reason);
+      if (!activeSkipSafety && this.claudeRunning) {
+        await this.enforceClaudeRunningSafety(activeReason);
       }
 
       return this.getSnapshot();
@@ -1229,7 +1393,7 @@ export class ProbeEngine extends EventEmitter {
           }
 
           // 拦截 2：无论是否开启唯一启动入口，只要 Claude 在运行，一旦出现「Claude 选定节点地区 ↔ 系统时区/区域」不一致或断连，立即剥夺授权并强杀！
-          if (proc.running && !this.claudeIsProbing) {
+          if (proc.running && !this.claudeIsProbing && this.claudeSwitchingCount === 0) {
             const killedOrBlocked = await this.enforceClaudeRunningSafety('Claude 运行期实时监控');
             if (killedOrBlocked) {
               scheduleNext(1500);
@@ -1263,76 +1427,88 @@ export class ProbeEngine extends EventEmitter {
    * 校验正在运行的 Claude 是否满足其独立选定节点的三重安全条件，不满足时尝试自愈复核，仍不满足则立即强杀并弹窗
    */
   private async enforceClaudeRunningSafety(triggerContext: string): Promise<boolean> {
-    if (!this.claudeRunning || this.claudeIsProbing) return false;
-    const cfg = this.configStore.get();
-
-    let check = this.evaluateClaudeSafety(
-      this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
-    );
-
-    // 若因 Clash 切换订阅组导致专属端口短暂重绑，立即尝试自动重绑并独立复核 Claude 节点，成功则无缝保持 Claude 运行
-    const launchedPort = getLaunchedClaudePort();
-    const portMatchesSession =
-      !this.claudeAuthorizedSession ||
-      launchedPort === null ||
-      launchedPort === cfg.dedicatedProxyPort;
-
     if (
-      !check.safe &&
-      check.alertType === 'disconnect' &&
-      cfg.selectedClashNode &&
-      portMatchesSession
+      !this.claudeRunning ||
+      this.claudeIsProbing ||
+      this.claudeSwitchingCount > 0 ||
+      this.isEnforcingClaudeSafety
     ) {
-      const healRes = await this.clashMonitor.configureDedicatedNode(
-        cfg.selectedClashNode,
-        cfg.dedicatedProxyPort,
-        cfg.selectedClashProfileUid,
-        true
-      );
-      if (healRes.listening) {
-        await this.probeClaudeNodeNow('Clash 订阅切换后 Claude 专属通道自愈复核', true);
-        check = this.evaluateClaudeSafety(
-          this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
-        );
-      }
-    }
-
-    if (check.safe) {
       return false;
     }
+    this.isEnforcingClaudeSafety = true;
+    try {
+      const cfg = this.configStore.get();
 
-    this.unsetClaudeAuthLock();
-
-    const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
-    if (report.killedCount > 0) {
-      this.addLog(
-        'danger',
-        `Claude 安全校验失效 (${check.reason})，已立即强杀：${report.killedSummary.join(', ')}`
+      let check = this.evaluateClaudeSafety(
+        this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
       );
-    } else if (report.errorDetail) {
-      this.addLog('warn', report.errorDetail);
-    }
-    this.emitState();
 
-    if (report.killedCount > 0 || report.errorDetail) {
-      const expectedCode = this.claudeNodeProbe?.countryCode || this.winLocale.regionCode;
-      const expectedName = this.claudeNodeProbe?.countryName || this.winLocale.regionName;
-      this.emitAlert({
-        source: 'claude',
-        alertType: check.alertType,
-        expectedCode,
-        expectedName,
-        triggerReason: `${triggerContext}：${check.reason}`,
-        errorDetail:
-          check.alertType === 'disconnect'
-            ? this.claudeNodeProbeError || undefined
-            : undefined,
-        killedProcesses: report.killedCount > 0 ? report.killedSummary : undefined,
-        killError: report.errorDetail,
-      });
-    }
+      // 若因 Clash 切换订阅组导致专属端口短暂重绑，立即尝试自动重绑并独立复核 Claude 节点，成功则无缝保持 Claude 运行
+      const launchedPort = getLaunchedClaudePort();
+      const portMatchesSession =
+        !this.claudeAuthorizedSession ||
+        launchedPort === null ||
+        launchedPort === cfg.dedicatedProxyPort;
 
-    return true;
+      if (
+        !check.safe &&
+        check.alertType === 'disconnect' &&
+        cfg.selectedClashNode &&
+        portMatchesSession
+      ) {
+        const healRes = await this.clashMonitor.configureDedicatedNode(
+          cfg.selectedClashNode,
+          cfg.dedicatedProxyPort,
+          cfg.selectedClashProfileUid,
+          true
+        );
+        if (healRes.listening) {
+          await this.probeClaudeNodeNow('Clash 订阅切换后 Claude 专属通道自愈复核', true);
+          check = this.evaluateClaudeSafety(
+            this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
+          );
+        }
+      }
+
+      if (check.safe) {
+        return false;
+      }
+
+      this.unsetClaudeAuthLock();
+
+      const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
+      if (report.killedCount > 0) {
+        this.addLog(
+          'danger',
+          `Claude 安全校验失效 (${check.reason})，已立即强杀：${report.killedSummary.join(', ')}`
+        );
+      } else if (report.errorDetail) {
+        this.addLog('warn', report.errorDetail);
+      }
+      this.emitState();
+
+      if (report.killedCount > 0 || report.errorDetail) {
+        const expectedCode = this.claudeNodeProbe?.countryCode || this.winLocale.regionCode;
+        const expectedName = this.claudeNodeProbe?.countryName || this.winLocale.regionName;
+        this.emitAlert({
+          source: 'claude',
+          alertType: check.alertType,
+          expectedCode,
+          expectedName,
+          triggerReason: `${triggerContext}：${check.reason}`,
+          errorDetail:
+            check.alertType === 'disconnect'
+              ? this.claudeNodeProbeError || undefined
+              : undefined,
+          killedProcesses: report.killedCount > 0 ? report.killedSummary : undefined,
+          killError: report.errorDetail,
+        });
+      }
+
+      return true;
+    } finally {
+      this.isEnforcingClaudeSafety = false;
+    }
   }
 
   private evaluateClaudeSafety(requireDedicatedNode = true): {
@@ -1909,16 +2085,38 @@ export class ProbeEngine extends EventEmitter {
     const killedProcesses: string[] = [];
 
     try {
-      // 若 Claude 正在运行，且即将切换的目标时区国家与 Claude 选定节点国家不一致，必须先终止 Claude 以防暴露
-      if (this.claudeRunning && claudeCode && claudeCode !== targetCode) {
+      // 若 Claude 正在运行，且即将切换的目标时区国家与 Claude 选定节点国家不一致（或 Claude 节点尚未检测出地区），必须先终止 Claude 以防暴露
+      if (this.claudeRunning && claudeCode !== targetCode) {
         this.unsetClaudeAuthLock();
         const killReport = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
+        const claudeRegionLabel = claudeCode ? getCountryNameZh(claudeCode) : '未知/未就绪';
         if (killReport.killedCount > 0) {
           killedProcesses.push(...killReport.killedSummary);
           this.addLog(
             'danger',
-            `同步系统时区至 [${getCountryNameZh(targetCode)}] 前检测到与运行中的 Claude 节点地区 [${getCountryNameZh(claudeCode)}] 不符，已先行终止：${killReport.killedSummary.join(', ')}`
+            `同步系统时区至 [${getCountryNameZh(targetCode)}] 前检测到与运行中的 Claude 节点地区 [${claudeRegionLabel}] 不符，已先行终止：${killReport.killedSummary.join(', ')}`
           );
+        }
+        if (killReport.failedPids.length > 0) {
+          const abortMsg = `${
+            killReport.errorDetail || '运行中的 Claude 进程无法终止'
+          }，已中止同步系统时区以防暴露！`;
+          this.addLog('danger', abortMsg);
+          this.emitAlert({
+            source: 'claude',
+            alertType: 'locale-mismatch',
+            expectedCode: claudeCode || targetCode,
+            expectedName: claudeCode ? getCountryNameZh(claudeCode) : getCountryNameZh(targetCode),
+            triggerReason: '同步系统时区被安全拦截（运行中的 Claude 进程未能终止）',
+            killedProcesses: killedProcesses.length > 0 ? killedProcesses : undefined,
+            killError: killReport.errorDetail,
+          });
+          return {
+            ok: false,
+            message: abortMsg,
+            killedProcesses,
+            state: this.getSnapshot(),
+          };
         }
       }
 

@@ -1686,7 +1686,7 @@ export const MainDashboard: React.FC = () => {
                         </>
                       ) : (
                         <div className="default-unset-hint">
-                          <span>未锁定固定地区，首次选定节点后将自动初始化</span>
+                          <span>未锁定固定地区，当前自动以实时出口地区作为时区对比基准</span>
                         </div>
                       )}
                     </div>

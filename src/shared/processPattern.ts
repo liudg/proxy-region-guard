@@ -41,7 +41,7 @@ export const CRITICAL_SYSTEM_PROCESSES = [
 ] as const;
 
 export function inspectProcessPattern(input: string): PatternInspection {
-  const normalized = input.trim();
+  let normalized = input.trim().replace(/^["']+|["']+$/g, '').trim();
   if (!normalized) {
     return {
       valid: false,
@@ -49,6 +49,21 @@ export function inspectProcessPattern(input: string): PatternInspection {
       mode: 'wildcard',
       error: '请输入进程名或匹配规则',
     };
+  }
+
+  // 若用户直接粘贴了 Windows 完整路径或相对路径（如 C:\...\Claude.exe），自动提取文件名作为进程名匹配规则
+  if (
+    !SLASH_REGEX_RE.test(normalized) &&
+    (/^[a-zA-Z]:[\\/]/.test(normalized) ||
+      /^\\\\[^\\]/.test(normalized) ||
+      /^\.{1,2}[\\/]/.test(normalized) ||
+      (!normalized.startsWith('/') && normalized.includes('/')))
+  ) {
+    const parts = normalized.split(/[\\/]+/).filter(Boolean);
+    const basename = parts[parts.length - 1];
+    if (basename) {
+      normalized = basename.trim();
+    }
   }
 
   let mode: PatternMode = 'wildcard';

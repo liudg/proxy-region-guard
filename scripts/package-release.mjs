@@ -83,7 +83,7 @@ async function main() {
       fs.closeSync(fd);
     } catch {
       throw new Error(
-        '检测到「代理地区卫士.exe」正在以管理员权限运行且无法从当前非管理员终端自动关闭。请先手动退出运行中的「代理地区卫士」，或以管理员身份运行 npm run dist。'
+        '检测到「代理地区卫士.exe」正在以管理员权限运行且无法从当前非管理员终端自动关闭。请先手动退出运行中的「代理地区卫士」，或以管理员身份运行 npm run package。'
       );
     }
   }

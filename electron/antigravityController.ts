@@ -157,19 +157,27 @@ export async function inspectRunningAntigravityProcesses(
 
   uiPids.sort((a, b) => a - b);
   const sig = uiPids.join(',');
-  if (sig !== cachedUiPidsSignature || cachedCheckedPort !== dedicatedPort) {
-    cachedUiPidsSignature = sig;
+  const inLaunchGrace =
+    launchedByGuardPort === dedicatedPort && Date.now() - launchedByGuardAt <= 6000;
+
+  if (
+    sig !== cachedUiPidsSignature ||
+    cachedCheckedPort !== dedicatedPort ||
+    (inLaunchGrace && !cachedCmdlineProxied)
+  ) {
     cachedCheckedPort = dedicatedPort;
     cachedCmdlineProxied = await checkAntigravityCommandLineProxy(dedicatedPort);
     if (cachedCmdlineProxied) {
+      cachedUiPidsSignature = sig;
       launchedByGuardPort = dedicatedPort;
-    } else if (Date.now() - launchedByGuardAt > 6000) {
+    } else if (inLaunchGrace) {
+      // 启动宽限期内若 WMI/CIM 查询因启动负载暂未检出命令行参数，不锁死签名缓存，确保宽限期结束后仍会复核一次
+      cachedUiPidsSignature = '';
+    } else {
+      cachedUiPidsSignature = sig;
       launchedByGuardPort = null;
     }
   }
-
-  const inLaunchGrace =
-    launchedByGuardPort === dedicatedPort && Date.now() - launchedByGuardAt <= 6000;
 
   return {
     running: true,

@@ -15,7 +15,7 @@ import { ANTIGRAVITY_PROCESS_PATTERNS } from './antigravityController';
 import { CLAUDE_DESKTOP_PROCESS_PATTERNS } from './claudeController';
 
 interface JsYamlModule {
-  load: (str: string) => unknown;
+  load: (str: string, opts?: { json?: boolean }) => unknown;
   dump: (obj: unknown, opts?: { lineWidth?: number; noRefs?: boolean }) => string;
 }
 
@@ -583,7 +583,12 @@ export class ClashMonitor extends EventEmitter {
         let needsSync = false;
 
         for (const slot of [claudeSlot, agSlot]) {
-          if (!slot.desiredNodeName) continue;
+          if (!slot.desiredNodeName) {
+            if (slot.boundNodeName !== null || Boolean(proxiesMap[slot.internalProxyName])) {
+              needsSync = true;
+            }
+            continue;
+          }
           const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
           const nodeAliveInKernel = Boolean(proxiesMap[expectedInternal]);
           const portAlive = nodeAliveInKernel
@@ -884,7 +889,7 @@ export class ClashMonitor extends EventEmitter {
 
       const isSlotAlreadyOk = async (slot: DedicatedChannelSlot): Promise<boolean> => {
         if (!slot.desiredNodeName) {
-          return !slot.boundNodeName;
+          return !slot.boundNodeName && !proxiesMap[slot.internalProxyName];
         }
         if (forceRebind && !recentlyReloadedSameSig) return false;
         const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
@@ -1042,6 +1047,7 @@ export class ClashMonitor extends EventEmitter {
             ? (doc['hosts'] as Record<string, unknown>)
             : {};
         doc['hosts'] = { ...mergedExtraHosts, ...curHosts };
+        doc['use-hosts'] = true;
         if (doc['dns'] && typeof doc['dns'] === 'object' && !Array.isArray(doc['dns'])) {
           (doc['dns'] as Record<string, unknown>)['use-hosts'] = true;
         }
@@ -1264,6 +1270,39 @@ export class ClashMonitor extends EventEmitter {
         proxyObj['sni'] = rawServer;
         proxyObj['servername'] = rawServer;
       }
+      const netType =
+        typeof proxyObj['network'] === 'string' ? proxyObj['network'].trim().toLowerCase() : '';
+      if (netType === 'ws') {
+        const wsOpts =
+          proxyObj['ws-opts'] &&
+          typeof proxyObj['ws-opts'] === 'object' &&
+          !Array.isArray(proxyObj['ws-opts'])
+            ? (proxyObj['ws-opts'] as Record<string, unknown>)
+            : {};
+        const headers =
+          wsOpts['headers'] &&
+          typeof wsOpts['headers'] === 'object' &&
+          !Array.isArray(wsOpts['headers'])
+            ? (wsOpts['headers'] as Record<string, unknown>)
+            : {};
+        const hasHostHeader = Object.keys(headers).some((k) => k.toLowerCase() === 'host');
+        if (!hasHostHeader) {
+          headers['Host'] = rawServer;
+          wsOpts['headers'] = headers;
+          proxyObj['ws-opts'] = wsOpts;
+        }
+      } else if (netType === 'h2') {
+        const h2Opts =
+          proxyObj['h2-opts'] &&
+          typeof proxyObj['h2-opts'] === 'object' &&
+          !Array.isArray(proxyObj['h2-opts'])
+            ? (proxyObj['h2-opts'] as Record<string, unknown>)
+            : {};
+        if (!Array.isArray(h2Opts['host']) || h2Opts['host'].length === 0) {
+          h2Opts['host'] = [rawServer];
+          proxyObj['h2-opts'] = h2Opts;
+        }
+      }
       proxyObj['server'] = resolvedIp;
     }
   }
@@ -1313,7 +1352,7 @@ export class ClashMonitor extends EventEmitter {
       return null;
     }
     const rawYaml = fs.readFileSync(yamlPath, 'utf-8');
-    const parsed = yaml.load(rawYaml);
+    const parsed = yaml.load(rawYaml, { json: true });
     if (!parsed || typeof parsed !== 'object') {
       return null;
     }
@@ -1810,7 +1849,7 @@ export class ClashMonitor extends EventEmitter {
         return cached.parsed;
       }
       const raw = fs.readFileSync(filePath, 'utf-8');
-      const loaded = yaml.load(raw);
+      const loaded = yaml.load(raw, { json: true });
       if (!loaded || typeof loaded !== 'object') return null;
       const parsed = loaded as Record<string, unknown>;
       this.profilesIndexCache.set(filePath, {
@@ -1837,7 +1876,7 @@ export class ClashMonitor extends EventEmitter {
       }
 
       const rawYaml = fs.readFileSync(filePath, 'utf-8');
-      const loaded = yaml.load(rawYaml);
+      const loaded = yaml.load(rawYaml, { json: true });
       if (!loaded || typeof loaded !== 'object') return null;
       const doc = loaded as Record<string, unknown>;
 
@@ -1897,7 +1936,10 @@ export class ClashMonitor extends EventEmitter {
               if (fs.existsSync(cand)) {
                 try {
                   const provRaw = fs.readFileSync(cand, 'utf-8');
-                  const provDoc = yaml.load(provRaw) as Record<string, unknown> | null;
+                  const provDoc = yaml.load(provRaw, { json: true }) as Record<
+                    string,
+                    unknown
+                  > | null;
                   if (provDoc && typeof provDoc === 'object') {
                     addRawProxyList(provDoc['proxies']);
                     addRawProxyList(provDoc['payload']);
@@ -2465,7 +2507,12 @@ function extractSelectorSelections(
 ): Array<{ group: string; now: string }> {
   const saved: Array<{ group: string; now: string }> = [];
   for (const [k, item] of Object.entries(proxies)) {
-    if (item && item.type === 'Selector' && item.now && k !== 'GLOBAL') {
+    if (
+      item &&
+      item.type === 'Selector' &&
+      item.now &&
+      !item.now.startsWith(GUARD_INTERNAL_PROXY_PREFIX)
+    ) {
       saved.push({ group: k, now: item.now });
     }
   }
@@ -2749,11 +2796,23 @@ function queryDohOverHttp2(
         accept: 'application/dns-message',
       });
 
+      let statusOk = false;
+      req.on('response', (headers) => {
+        statusOk = Number(headers[':status']) === 200;
+        if (!statusOk) {
+          finish(null);
+        }
+      });
+
       const chunks: Buffer[] = [];
       req.on('data', (chunk: Buffer | string) => {
         chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
       });
       req.on('end', () => {
+        if (!statusOk) {
+          finish(null);
+          return;
+        }
         const buf = Buffer.concat(chunks);
         finish(parseDnsWireARecord(buf));
       });
@@ -2795,6 +2854,11 @@ function queryDohOverHttps1(
           },
         },
         (res) => {
+          if (res.statusCode !== 200) {
+            res.resume();
+            finish(null);
+            return;
+          }
           const chunks: Buffer[] = [];
           res.on('data', (chunk: Buffer | string) => {
             chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
