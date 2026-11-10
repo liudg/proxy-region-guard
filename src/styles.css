@@ -1234,7 +1234,7 @@ code {
   display: flex;
   flex: 1;
   flex-direction: column;
-  gap: 10px;
+  gap: 9px;
   min-height: 0;
   overflow-y: auto;
   margin: 10px 0;
@@ -1248,21 +1248,6 @@ code {
   overflow-wrap: anywhere;
   white-space: normal;
   user-select: text;
-}
-
-.claude-verification-notice {
-  margin: 12px 0;
-  padding: 10px 12px;
-  border: 1px solid rgba(245, 158, 11, 0.4);
-  border-radius: 8px;
-  color: #fcd34d;
-  font-size: 12px;
-  line-height: 1.6;
-  overflow-wrap: anywhere;
-}
-
-.claude-verification-notice p {
-  margin: 3px 0;
 }
 
 .alert-meta-item:has(.alert-detail) {
@@ -1352,12 +1337,16 @@ code {
   gap: 6px;
   font-size: 12px;
   color: #fcd34d;
-  line-height: 1.35;
+  line-height: 1.4;
+}
+.disconnect-err-msg svg {
+  flex-shrink: 0;
+  margin-top: 2px;
 }
 
 .alert-killed-banner {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 7px;
   padding: 6px 10px;
   border-radius: 7px;
@@ -1366,24 +1355,30 @@ code {
   color: #fecaca;
   font-size: 12px;
   font-weight: 600;
+  line-height: 1.45;
 }
 .alert-killed-banner svg {
   flex-shrink: 0;
+  margin-top: 2px;
   color: #f87171;
 }
 
 .alert-kill-error {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 6px;
   padding: 5px 9px;
   border-radius: 6px;
   background: rgba(245, 158, 11, 0.2);
+  border: 1px solid rgba(245, 158, 11, 0.35);
   color: #fde68a;
   font-size: 11px;
+  line-height: 1.45;
 }
 .alert-kill-error svg {
   flex-shrink: 0;
+  margin-top: 2px;
+  color: #fbbf24;
 }
 
 .alert-meta-lines {
@@ -1391,12 +1386,16 @@ code {
   flex-direction: column;
   gap: 4px;
   font-size: 11.5px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
 }
 .alert-meta-item {
   display: flex;
   align-items: center;
   gap: 5px;
   min-width: 0;
+  line-height: 1.45;
 }
 .meta-k {
   color: var(--text-muted);
@@ -1585,6 +1584,50 @@ code {
 .check-step-body small.text-danger {
   color: #fca5a5;
   font-weight: 600;
+}
+
+.claude-verification-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  background: rgba(245, 158, 11, 0.14);
+  border: 1px solid rgba(245, 158, 11, 0.38);
+  color: #fde68a;
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.verification-notice-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: #fbbf24;
+}
+
+.verification-notice-body {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+  flex: 1;
+}
+
+.verification-notice-reason {
+  font-size: 12px;
+  font-weight: 600;
+  color: #fcd34d;
+}
+
+.verification-notice-body p {
+  font-size: 11.5px;
+  color: #fde68a;
+}
+
+.verification-notice-body small {
+  font-size: 11px;
+  color: var(--text-secondary);
 }
 
 .claude-block-banner {

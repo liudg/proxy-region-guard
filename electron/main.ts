@@ -272,13 +272,40 @@ function resizeAlertWindow(win: BrowserWindow, width: number, height: number): v
   suppressAlertMoveTrack = false;
 }
 
+function estimateTextLines(text: string | undefined | null, cjkPerLine: number): number {
+  if (!text) return 0;
+  let units = 0;
+  for (const ch of text) {
+    units += ch.charCodeAt(0) > 255 ? 1 : 0.55;
+  }
+  return Math.max(1, Math.ceil(units / cjkPerLine));
+}
+
 function computeAlertWindowHeight(payload: AlertPayload): number {
-  if (payload.source === 'claude') return 420;
   const hasKilled = Boolean(payload.killedProcesses && payload.killedProcesses.length > 0);
   const hasErr = Boolean(payload.killError);
-  if (hasKilled && hasErr) return 356;
-  if (hasKilled || hasErr) return 318;
-  return 276;
+  const hasIp = Boolean(payload.actualIp);
+  const isCompactBox =
+    payload.alertType === 'disconnect' ||
+    payload.alertType === 'unauthorized-launch' ||
+    payload.alertType === 'verification-unavailable';
+
+  let height = isCompactBox ? 228 : 254;
+  if (hasIp) height += 22;
+  if (hasKilled) height += 38;
+  if (hasErr) height += 34;
+
+  const reasonText = `${payload.activeNode ? `[${payload.activeNode}] · ` : ''}${payload.triggerReason || ''}`;
+  const extraReasonLines = Math.max(0, estimateTextLines(reasonText, 24) - 1);
+  const extraKilledLines = hasKilled
+    ? Math.max(0, estimateTextLines(`已强杀进程树：${payload.killedProcesses!.join(', ')}`, 25) - 1)
+    : 0;
+  const extraErrLines = hasErr
+    ? Math.max(0, estimateTextLines(payload.killError, 27) - 1)
+    : 0;
+
+  const extraHeight = (extraReasonLines + extraKilledLines + extraErrLines) * 17;
+  return Math.min(420, height + extraHeight);
 }
 
 function ensureAlertWindow(): BrowserWindow {

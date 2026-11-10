@@ -1451,15 +1451,20 @@ export const MainDashboard: React.FC = () => {
 
                   {claudeState.verificationFailure && (
                     <div className="claude-verification-notice">
-                      <p>{claudeState.verificationFailure.reason}</p>
-                      <p>
-                        首次失败 {formatTime(claudeState.verificationFailure.startedAt)} ·
-                        持续至 {formatTime(claudeState.verificationFailure.deadlineAt)} 仍未恢复将终止 Claude 并提醒。
-                      </p>
-                      <p>
-                        最后成功校验：{claudeState.lastVerificationSuccessAt
-                          ? formatTime(claudeState.lastVerificationSuccessAt) : '暂无成功记录'}
-                      </p>
+                      <Clock size={15} className="verification-notice-icon" />
+                      <div className="verification-notice-body">
+                        <strong className="verification-notice-reason">
+                          {claudeState.verificationFailure.reason}
+                        </strong>
+                        <p>
+                          首次失败 {formatTime(claudeState.verificationFailure.startedAt)} ·
+                          持续至 {formatTime(claudeState.verificationFailure.deadlineAt)} 仍未恢复将终止 Claude 并提醒。
+                        </p>
+                        <small>
+                          最后成功校验：{claudeState.lastVerificationSuccessAt
+                            ? formatTime(claudeState.lastVerificationSuccessAt) : '暂无成功记录'}
+                        </small>
+                      </div>
                     </div>
                   )}
 
@@ -1798,6 +1803,9 @@ export const MainDashboard: React.FC = () => {
                             保护措施终止 Claude 时始终弹窗。请求暂时失败期间静默复核，持续 30 秒未恢复时终止并提醒。
                           </p>
                         </div>
+                        <span className="mini-badge connected" style={{ flexShrink: 0 }}>
+                          始终开启
+                        </span>
                       </div>
 
                       <div className="claude-exe-path-box">

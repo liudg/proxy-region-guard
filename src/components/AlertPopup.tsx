@@ -159,8 +159,23 @@ export const AlertPopup: React.FC = () => {
       <div className="alert-body">
         {isVerificationUnavailable ? (
           <div className="alert-disconnect-box">
-            <strong>持续 30 秒无法完成地区校验</strong>
-            <div className="disconnect-err-msg">已执行 Claude 保护终止，处理结果如下。</div>
+            <div className="disconnect-expect-line">
+              <span>保护地区：</span>
+              {payload.expectedCode ? (
+                <>
+                  <CountryFlag code={payload.expectedCode} size="sm" />
+                  <strong>
+                    {payload.expectedName} ({payload.expectedCode})
+                  </strong>
+                </>
+              ) : (
+                <strong>Claude 专属代理通道</strong>
+              )}
+            </div>
+            <div className="disconnect-err-msg">
+              <AlertTriangle size={15} />
+              <span>持续 30 秒无法完成地区校验，已执行 Claude 保护终止。</span>
+            </div>
           </div>
         ) : isUnauthorizedLaunch ? (
           <div className="alert-disconnect-box">
