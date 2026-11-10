@@ -1747,7 +1747,7 @@ export class ProbeEngine extends EventEmitter {
     if (!this.claudeDetectedExe) {
       launchBlockReason = '未检测到 Claude Desktop 安装路径，请手动指定 Claude.exe';
     } else if (!cfg.selectedClashNode) {
-      launchBlockReason = '请先在下方选择要为 Claude 绑定的 Clash 代理节点';
+      launchBlockReason = '请先在上方选择要为 Claude 绑定的 Clash 代理节点';
     } else if (!clash.connected) {
       launchBlockReason = '未连接到 Clash Verge Rev 控制接口，请确认 Clash Verge 已启动';
     } else if (!clash.dedicatedPortListening) {
@@ -1793,7 +1793,7 @@ export class ProbeEngine extends EventEmitter {
     if (!this.antigravityDetectedExe) {
       launchHint = '未检测到 Antigravity.exe 安装路径，请在下方手动浏览指定';
     } else if (!cfg.antigravityClashNode) {
-      launchHint = '请先在下方下拉框中选择要绑定的 Clash 代理节点';
+      launchHint = '请先在上方下拉框中选择要绑定的 Clash 代理节点';
     } else if (!clash.connected) {
       launchHint = '未连接到 Clash Verge / Mihomo 控制接口，请确认 Clash 已启动';
     } else if (!clash.antigravityPortListening) {
@@ -1970,12 +1970,21 @@ export class ProbeEngine extends EventEmitter {
       transition = 'disconnect';
     } else if (this.lastProbe) {
       const probeCode = this.lastProbe.countryCode.toUpperCase();
+      const enforceLocaleMatch =
+        Boolean(cfg.defaultCountryCode) ||
+        cfg.monitorAlertEnabled ||
+        (cfg.killProcessesEnabled &&
+          cfg.killOnLocaleMismatch &&
+          cfg.protectedProcessPatterns.length > 0);
       if (!isValidIsoCountryCode(probeCode)) {
         this.status = 'unset';
       } else if (cfg.defaultCountryCode && probeCode !== cfg.defaultCountryCode.toUpperCase()) {
         this.status = 'mismatch';
         transition = 'mismatch';
-      } else if (!isWindowsLocaleMatchingCountry(this.winLocale.timeZoneId, this.winLocale.regionCode, probeCode)) {
+      } else if (
+        enforceLocaleMatch &&
+        !isWindowsLocaleMatchingCountry(this.winLocale.timeZoneId, this.winLocale.regionCode, probeCode)
+      ) {
         this.status = 'mismatch';
         transition = 'locale-mismatch';
       } else {
@@ -1991,10 +2000,21 @@ export class ProbeEngine extends EventEmitter {
       const detail = this.lastError || (this.lastProbe
         ? `${this.lastProbe.countryName} (${this.lastProbe.countryCode}) · IP: ${this.lastProbe.ip}`
         : '尚未获得出口信息');
+      const localeMatched = this.lastProbe
+        ? isWindowsLocaleMatchingCountry(
+            this.winLocale.timeZoneId,
+            this.winLocale.regionCode,
+            this.lastProbe.countryCode.toUpperCase()
+          )
+        : false;
       const label = transition === 'disconnect' ? '代理连接失败'
         : transition === 'mismatch' ? `出口偏离保护地区 [${cfg.defaultCountryName}]`
         : transition === 'locale-mismatch' ? '出口与系统时区/区域不一致'
-        : this.status === 'ok' ? '出口与系统时区/区域一致' : '出口地区待确认';
+        : this.status === 'ok'
+        ? localeMatched
+          ? '出口与系统时区/区域一致'
+          : '代理出口正常（未锁定默认保护地区）'
+        : '出口地区待确认';
       this.addLog(this.status === 'ok' ? 'success' : transition ? 'warn' : 'info', `${label}：${detail}`);
     }
     try {

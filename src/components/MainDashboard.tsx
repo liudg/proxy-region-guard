@@ -6,6 +6,8 @@ import {
   Bot,
   Check,
   CheckCircle2,
+  ChevronDown,
+  ChevronUp,
   Clock,
   Copy,
   Cpu,
@@ -94,11 +96,35 @@ export const MainDashboard: React.FC = () => {
     text: string;
   } | null>(null);
 
+  // 低频路径与端口设置折叠态（未检测到安装路径时自动展开）
+  const [agSettingsOpen, setAgSettingsOpen] = useState(false);
+  const [claudeSettingsOpen, setClaudeSettingsOpen] = useState(false);
+
+  // 运行中应用破坏性操作（重启/强杀/切换节点/改端口）二次确认态
+  const [pendingAgConfirm, setPendingAgConfirm] = useState<'restart' | 'kill' | null>(null);
+  const [pendingClaudeConfirm, setPendingClaudeConfirm] = useState<
+    | { type: 'kill' }
+    | { type: 'switch-node'; nodeName: string | null; profileUid: string | null }
+    | { type: 'change-port'; port: number }
+    | null
+  >(null);
+
+  // 全局非启动器页操作提示/错误反馈
+  const [globalNotice, setGlobalNotice] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
+
   useEffect(() => {
-    void window.guardAPI.getState().then((initial) => {
-      setState(initial);
-      syncFormFromConfig(initial.config);
-    });
+    void window.guardAPI
+      .getState()
+      .then((initial) => {
+        setState(initial);
+        syncFormFromConfig(initial.config);
+      })
+      .catch(() => {
+        // ignore initial load error
+      });
 
     const unsub = window.guardAPI.onStateChanged((next) => {
       setState(next);
@@ -115,6 +141,38 @@ export const MainDashboard: React.FC = () => {
     setAgDedicatedPortInput(String(cfg.antigravityDedicatedPort));
     setCustomProbe(cfg.customProbeUrl);
   };
+
+  useEffect(() => {
+    if (!state) return;
+    setDedicatedPortInput(String(state.config.dedicatedProxyPort));
+    setAgDedicatedPortInput(String(state.config.antigravityDedicatedPort));
+    setCustomProbe(state.config.customProbeUrl);
+    if (!pendingManualMode) {
+      setManualProto(state.config.manualProxy.protocol);
+      setManualHost(state.config.manualProxy.host);
+      setManualPort(String(state.config.manualProxy.port));
+    }
+  }, [
+    state?.config.dedicatedProxyPort,
+    state?.config.antigravityDedicatedPort,
+    state?.config.customProbeUrl,
+    state?.config.manualProxy.protocol,
+    state?.config.manualProxy.host,
+    state?.config.manualProxy.port,
+    pendingManualMode,
+  ]);
+
+  useEffect(() => {
+    if (!state?.antigravityState.running && pendingAgConfirm) {
+      setPendingAgConfirm(null);
+    }
+  }, [state?.antigravityState.running, pendingAgConfirm]);
+
+  useEffect(() => {
+    if (!state?.claudeState.running && pendingClaudeConfirm) {
+      setPendingClaudeConfirm(null);
+    }
+  }, [state?.claudeState.running, pendingClaudeConfirm]);
 
   if (!state) {
     return (
@@ -156,30 +214,9 @@ export const MainDashboard: React.FC = () => {
     setTimeout(() => setCopiedAgIp(false), 1600);
   };
 
-  const handleSelectClaudeNode = async (
-    nodeName: string | null,
-    profileUid: string | null
-  ) => {
-    setIsSwitchingNode(true);
-    try {
-      const next = await window.guardAPI.selectClashNode(nodeName, profileUid);
-      setState(next);
-    } finally {
-      setIsSwitchingNode(false);
-    }
-  };
-
-  const handleSelectAntigravityNode = async (
-    nodeName: string | null,
-    profileUid: string | null
-  ) => {
-    setIsSwitchingAgNode(true);
-    try {
-      const next = await window.guardAPI.selectAntigravityClashNode(nodeName, profileUid);
-      setState(next);
-    } finally {
-      setIsSwitchingAgNode(false);
-    }
+  const extractErrorMessage = (err: unknown): string => {
+    const raw = err instanceof Error ? err.message : String(err || '操作失败');
+    return raw.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/i, '').trim();
   };
 
   const showTimedClaudeFeedback = (ok: boolean, text: string) => {
@@ -196,49 +233,218 @@ export const MainDashboard: React.FC = () => {
     }, 6000);
   };
 
+  const showTimedLocaleFeedback = (ok: boolean, text: string) => {
+    setLocaleFeedback({ ok, text });
+    setTimeout(() => {
+      setLocaleFeedback((prev) => (prev && prev.text === text ? null : prev));
+    }, 5500);
+  };
+
+  const showTimedGlobalNotice = (ok: boolean, text: string) => {
+    setGlobalNotice({ ok, text });
+    setTimeout(() => {
+      setGlobalNotice((prev) => (prev && prev.text === text ? null : prev));
+    }, 5000);
+  };
+
+  const notifyError = (
+    err: unknown,
+    target: 'ag' | 'claude' | 'locale' | 'global' = 'global'
+  ) => {
+    const msg = extractErrorMessage(err);
+    if (target === 'ag') showTimedAgFeedback(false, msg);
+    else if (target === 'claude') showTimedClaudeFeedback(false, msg);
+    else if (target === 'locale') showTimedLocaleFeedback(false, msg);
+    else showTimedGlobalNotice(false, msg);
+  };
+
+  const updateConfigSafe = async (
+    partial: Partial<AppConfig>,
+    target: 'ag' | 'claude' | 'locale' | 'global' = 'global'
+  ): Promise<AppStateSnapshot | null> => {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const next = await window.guardAPI.updateConfig(partial);
+        setState(next);
+        return next;
+      } catch (err) {
+        const msg = extractErrorMessage(err);
+        if (attempt < 2 && msg.includes('正在进行')) {
+          await new Promise((r) => setTimeout(r, 320));
+          continue;
+        }
+        notifyError(err, target);
+        return null;
+      }
+    }
+    return null;
+  };
+
+  const executeSelectClaudeNode = async (
+    nodeName: string | null,
+    profileUid: string | null
+  ) => {
+    setPendingClaudeConfirm(null);
+    setIsSwitchingNode(true);
+    try {
+      const next = await window.guardAPI.selectClashNode(nodeName, profileUid);
+      setState(next);
+    } catch (err) {
+      notifyError(err, 'claude');
+    } finally {
+      setIsSwitchingNode(false);
+    }
+  };
+
+  const handleSelectClaudeNode = async (
+    nodeName: string | null,
+    profileUid: string | null
+  ) => {
+    const isSame =
+      nodeName === config.selectedClashNode &&
+      (profileUid || null) === (config.selectedClashProfileUid || null);
+    if (isSame) return;
+
+    if (claudeState.running) {
+      setPendingClaudeConfirm({
+        type: 'switch-node',
+        nodeName,
+        profileUid,
+      });
+      return;
+    }
+
+    await executeSelectClaudeNode(nodeName, profileUid);
+  };
+
+  const handleSelectAntigravityNode = async (
+    nodeName: string | null,
+    profileUid: string | null
+  ) => {
+    const wasRunning = antigravityState.running && antigravityState.proxiedSession;
+    setIsSwitchingAgNode(true);
+    try {
+      const next = await window.guardAPI.selectAntigravityClashNode(nodeName, profileUid);
+      setState(next);
+      if (wasRunning && nodeName) {
+        showTimedAgFeedback(
+          true,
+          `专属端口已热切换至节点 [${nodeName}]，当前运行中的 Antigravity 即刻生效（无需重启 IDE）`
+        );
+      }
+    } catch (err) {
+      notifyError(err, 'ag');
+    } finally {
+      setIsSwitchingAgNode(false);
+    }
+  };
+
   const handleLaunchClaude = async () => {
+    setPendingClaudeConfirm(null);
     setIsLaunchingClaude(true);
     setClaudeFeedback(null);
     try {
       const res = await window.guardAPI.launchClaude();
       setState(res.state);
       showTimedClaudeFeedback(res.ok, res.message);
+    } catch (err) {
+      notifyError(err, 'claude');
     } finally {
       setIsLaunchingClaude(false);
     }
   };
 
-  const handleTerminateClaude = async () => {
+  const executeTerminateClaude = async () => {
+    setPendingClaudeConfirm(null);
     setClaudeFeedback(null);
-    const res = await window.guardAPI.terminateClaudeNow();
-    setState(res.state);
-    showTimedClaudeFeedback(res.ok, res.message);
+    try {
+      const res = await window.guardAPI.terminateClaudeNow();
+      setState(res.state);
+      showTimedClaudeFeedback(res.ok, res.message);
+    } catch (err) {
+      notifyError(err, 'claude');
+    }
+  };
+
+  const handleTerminateClaude = () => {
+    if (claudeState.running) {
+      setPendingClaudeConfirm({ type: 'kill' });
+      return;
+    }
+    void executeTerminateClaude();
   };
 
   const handleSyncLocaleFromClaude = async () => {
     setClaudeFeedback(null);
-    const res = await window.guardAPI.syncSystemLocaleToDefault('claude');
-    setState(res.state);
-    showTimedClaudeFeedback(res.ok, res.message);
+    try {
+      const res = await window.guardAPI.syncSystemLocaleToDefault('claude');
+      setState(res.state);
+      showTimedClaudeFeedback(res.ok, res.message);
+    } catch (err) {
+      notifyError(err, 'claude');
+    }
   };
 
-  const handleLaunchAntigravity = async () => {
+  const executeLaunchAntigravity = async () => {
+    setPendingAgConfirm(null);
     setIsLaunchingAg(true);
     setAgFeedback(null);
     try {
       const res = await window.guardAPI.launchAntigravity();
       setState(res.state);
       showTimedAgFeedback(res.ok, res.message);
+    } catch (err) {
+      notifyError(err, 'ag');
     } finally {
       setIsLaunchingAg(false);
     }
   };
 
-  const handleTerminateAntigravity = async () => {
+  const handleLaunchAntigravity = () => {
+    if (antigravityState.running) {
+      setPendingAgConfirm('restart');
+      return;
+    }
+    void executeLaunchAntigravity();
+  };
+
+  const executeTerminateAntigravity = async () => {
+    setPendingAgConfirm(null);
     setAgFeedback(null);
-    const res = await window.guardAPI.terminateAntigravityNow();
-    setState(res.state);
-    showTimedAgFeedback(res.ok, res.message);
+    try {
+      const res = await window.guardAPI.terminateAntigravityNow();
+      setState(res.state);
+      showTimedAgFeedback(res.ok, res.message);
+    } catch (err) {
+      notifyError(err, 'ag');
+    }
+  };
+
+  const handleTerminateAntigravity = () => {
+    if (antigravityState.running) {
+      setPendingAgConfirm('kill');
+      return;
+    }
+    void executeTerminateAntigravity();
+  };
+
+  const executeSaveDedicatedPort = async (portNum: number) => {
+    setPendingClaudeConfirm(null);
+    setIsSwitchingNode(true);
+    try {
+      const next = await updateConfigSafe(
+        { dedicatedProxyPort: portNum },
+        'claude'
+      );
+      if (next) {
+        showTimedClaudeFeedback(
+          true,
+          `Claude 专属代理端口已更新为 127.0.0.1:${portNum}`
+        );
+      }
+    } finally {
+      setIsSwitchingNode(false);
+    }
   };
 
   const handleSaveDedicatedPort = async () => {
@@ -255,16 +461,11 @@ export const MainDashboard: React.FC = () => {
     }
     setDedicatedPortInput(String(portNum));
     if (portNum === config.dedicatedProxyPort) return;
-    setIsSwitchingNode(true);
-    try {
-      const next = await window.guardAPI.updateConfig({
-        dedicatedProxyPort: portNum,
-      });
-      setState(next);
-      showTimedClaudeFeedback(true, `Claude 专属代理端口已更新为 127.0.0.1:${portNum}`);
-    } finally {
-      setIsSwitchingNode(false);
+    if (claudeState.running) {
+      setPendingClaudeConfirm({ type: 'change-port', port: portNum });
+      return;
     }
+    await executeSaveDedicatedPort(portNum);
   };
 
   const handleSaveAgDedicatedPort = async () => {
@@ -283,11 +484,20 @@ export const MainDashboard: React.FC = () => {
     if (portNum === config.antigravityDedicatedPort) return;
     setIsSwitchingAgNode(true);
     try {
-      const next = await window.guardAPI.updateConfig({
-        antigravityDedicatedPort: portNum,
-      });
-      setState(next);
-      showTimedAgFeedback(true, `Antigravity 专属代理端口已更新为 127.0.0.1:${portNum}`);
+      const next = await updateConfigSafe(
+        { antigravityDedicatedPort: portNum },
+        'ag'
+      );
+      if (next) {
+        showTimedAgFeedback(
+          true,
+          `Antigravity 专属代理端口已更新为 127.0.0.1:${portNum}${
+            antigravityState.running
+              ? '（运行中的 Antigravity 需重启后才使用新端口）'
+              : ''
+          }`
+        );
+      }
     } finally {
       setIsSwitchingAgNode(false);
     }
@@ -296,8 +506,7 @@ export const MainDashboard: React.FC = () => {
   const handleSwitchNonManualMode = async (mode: 'auto' | 'direct') => {
     setPendingManualMode(false);
     if (config.proxyMode === mode) return;
-    const next = await window.guardAPI.updateConfig({ proxyMode: mode });
-    setState(next);
+    await updateConfigSafe({ proxyMode: mode }, 'global');
   };
 
   const handleSaveManualProxy = async () => {
@@ -307,15 +516,17 @@ export const MainDashboard: React.FC = () => {
     setManualPort(String(portNum));
     setPendingManualMode(false);
 
-    const next = await window.guardAPI.updateConfig({
-      proxyMode: 'manual',
-      manualProxy: {
-        protocol: manualProto,
-        host: cleanHost,
-        port: portNum,
+    await updateConfigSafe(
+      {
+        proxyMode: 'manual',
+        manualProxy: {
+          protocol: manualProto,
+          host: cleanHost,
+          port: portNum,
+        },
       },
-    });
-    setState(next);
+      'global'
+    );
   };
 
   const handleSaveCustomProbe = async () => {
@@ -334,31 +545,32 @@ export const MainDashboard: React.FC = () => {
     }
     setProbeUrlErr(null);
     setCustomProbe(trimmed);
-    const next = await window.guardAPI.updateConfig({
-      customProbeUrl: trimmed,
-    });
-    setState(next);
-  };
-
-  const showTimedLocaleFeedback = (ok: boolean, text: string) => {
-    setLocaleFeedback({ ok, text });
-    setTimeout(() => {
-      setLocaleFeedback((prev) => (prev && prev.text === text ? null : prev));
-    }, 5500);
+    const next = await updateConfigSafe({ customProbeUrl: trimmed }, 'global');
+    if (next) {
+      showTimedGlobalNotice(true, trimmed ? '已更新自定义探测源并重新检测' : '已恢复默认全球探测源');
+    }
   };
 
   const handleSyncLocale = async () => {
     setLocaleFeedback(null);
-    const res = await window.guardAPI.syncSystemLocaleToDefault('monitor');
-    setState(res.state);
-    showTimedLocaleFeedback(res.ok, res.message);
+    try {
+      const res = await window.guardAPI.syncSystemLocaleToDefault('monitor');
+      setState(res.state);
+      showTimedLocaleFeedback(res.ok, res.message);
+    } catch (err) {
+      notifyError(err, 'locale');
+    }
   };
 
   const handleRestoreLocale = async () => {
     setLocaleFeedback(null);
-    const res = await window.guardAPI.restoreDefaultChinaLocale();
-    setState(res.state);
-    showTimedLocaleFeedback(res.ok, res.message);
+    try {
+      const res = await window.guardAPI.restoreDefaultChinaLocale();
+      setState(res.state);
+      showTimedLocaleFeedback(res.ok, res.message);
+    } catch (err) {
+      notifyError(err, 'locale');
+    }
   };
 
   const handleAddPattern = async () => {
@@ -378,47 +590,18 @@ export const MainDashboard: React.FC = () => {
 
     setPatternSubmitErr(null);
     setPatternInput('');
-    const next = await window.guardAPI.updateConfig({
-      protectedProcessPatterns: [...config.protectedProcessPatterns, check.normalized],
-    });
-    setState(next);
+    await updateConfigSafe(
+      {
+        protectedProcessPatterns: [...config.protectedProcessPatterns, check.normalized],
+      },
+      'global'
+    );
   };
 
   const handleRemovePattern = async (target: string) => {
     const filtered = config.protectedProcessPatterns.filter((p) => p !== target);
-    const next = await window.guardAPI.updateConfig({
-      protectedProcessPatterns: filtered,
-    });
-    setState(next);
+    await updateConfigSafe({ protectedProcessPatterns: filtered }, 'global');
   };
-
-  const statusMeta = {
-    ok: {
-      badge: '状态正常 · 代理与时区一致',
-      cls: 'status-ok',
-      icon: <ShieldCheck size={18} />,
-    },
-    mismatch: {
-      badge: '警告 · 代理与时区/地区不一致！',
-      cls: 'status-mismatch',
-      icon: <ShieldAlert size={18} />,
-    },
-    error: {
-      badge: '异常 · 代理连接失败',
-      cls: 'status-error',
-      icon: <WifiOff size={18} />,
-    },
-    unset: {
-      badge: '待选择节点或保护地区',
-      cls: 'status-unset',
-      icon: <Shield size={18} />,
-    },
-    checking: {
-      badge: '正在检测出口地区...',
-      cls: 'status-checking',
-      icon: <RefreshCw className="spin" size={18} />,
-    },
-  }[status];
 
   const canLockCurrentProbe = Boolean(lastProbe && isValidIsoCountryCode(lastProbe.countryCode));
 
@@ -448,6 +631,48 @@ export const MainDashboard: React.FC = () => {
       )
     : true;
 
+  const isLocaleOnlyMismatch =
+    status === 'mismatch' &&
+    (!config.defaultCountryCode ||
+      lastProbe?.countryCode?.toUpperCase() === config.defaultCountryCode.toUpperCase()) &&
+    !isWinLocaleMatched;
+
+  const statusMeta = {
+    ok: {
+      badge: isWinLocaleMatched
+        ? '状态正常 · 代理与时区一致'
+        : '代理通道正常 · 未锁定保护地区',
+      cls: 'status-ok',
+      icon: <ShieldCheck size={18} />,
+    },
+    mismatch: isLocaleOnlyMismatch
+      ? {
+          badge: '提醒 · 代理地区正常，系统时区尚未同步',
+          cls: 'status-locale-warn',
+          icon: <AlertTriangle size={18} />,
+        }
+      : {
+          badge: '警告 · 代理出口偏离默认保护地区！',
+          cls: 'status-mismatch',
+          icon: <ShieldAlert size={18} />,
+        },
+    error: {
+      badge: '异常 · 代理连接失败',
+      cls: 'status-error',
+      icon: <WifiOff size={18} />,
+    },
+    unset: {
+      badge: '待选择节点或保护地区',
+      cls: 'status-unset',
+      icon: <Shield size={18} />,
+    },
+    checking: {
+      badge: '正在检测出口地区...',
+      cls: 'status-checking',
+      icon: <RefreshCw className="spin" size={18} />,
+    },
+  }[status];
+
   const isAlreadyChinaDefaultLocale =
     winLocale.regionCode.toUpperCase() === DEFAULT_CHINA_REGION_CODE &&
     winLocale.timeZoneId.toLowerCase() === DEFAULT_CHINA_TIMEZONE_ID.toLowerCase();
@@ -468,12 +693,40 @@ export const MainDashboard: React.FC = () => {
     'not-found': '未找到安装路径',
   }[antigravityState.installType];
 
+  const isAgSettingsExpanded =
+    agSettingsOpen || antigravityState.installType === 'not-found';
+  const isClaudeSettingsExpanded =
+    claudeSettingsOpen || claudeState.installType === 'not-found';
+
   const launcherTabDotClass =
     (antigravityState.running && antigravityState.proxiedSession) || claudeState.running
       ? 'running'
       : antigravityState.canLaunch || claudeState.canLaunch
       ? 'ready'
       : 'locked';
+
+  const monitorTabDotClass =
+    status === 'ok'
+      ? 'running'
+      : status === 'error' || (status === 'mismatch' && !isLocaleOnlyMismatch)
+      ? 'locked'
+      : isLocaleOnlyMismatch
+      ? 'external'
+      : status === 'checking'
+      ? 'checking'
+      : 'ready';
+
+  const titlebarDotClass =
+    activeTab === 'launcher'
+      ? launcherSubTab === 'antigravity'
+        ? (antigravityState.running && antigravityState.proxiedSession) ||
+          antigravityState.canLaunch
+          ? 'status-ok'
+          : statusMeta.cls
+        : claudeState.running || claudeState.canLaunch
+        ? 'status-ok'
+        : statusMeta.cls
+      : statusMeta.cls;
 
   const clashHeaderBadgeText = clashInfo.connected
     ? `${
@@ -483,12 +736,18 @@ export const MainDashboard: React.FC = () => {
       } · ${clashInfo.mode.toUpperCase()}`
     : '未连接 Clash Verge';
 
+  const closeButtonTitle = config.closeToTray
+    ? '隐藏到系统托盘'
+    : claudeState.running
+    ? '退出程序（将同时安全终止受控运行中的 Claude，保持 Antigravity 运行）'
+    : '退出程序（保持 Antigravity 运行）';
+
   return (
     <div className="dashboard-window">
       {/* 自绘无边框标题栏 */}
       <header className="titlebar drag-region">
         <div className="titlebar-brand">
-          <span className={`brand-dot ${statusMeta.cls}`} />
+          <span className={`brand-dot ${titlebarDotClass}`} />
           <span className="brand-name">代理地区卫士</span>
           <span className="brand-sub">Proxy Region Guard</span>
         </div>
@@ -503,7 +762,7 @@ export const MainDashboard: React.FC = () => {
           <button
             className="win-btn win-close"
             onClick={() => window.guardAPI.closeMain()}
-            title={config.closeToTray ? '隐藏到系统托盘' : '退出程序'}
+            title={closeButtonTitle}
           >
             <X size={15} />
           </button>
@@ -549,6 +808,13 @@ export const MainDashboard: React.FC = () => {
 
       {/* 内容主体 */}
       <main className="dashboard-content">
+        {globalNotice && activeTab !== 'launcher' && (
+          <div className={`locale-feedback global-top-notice ${globalNotice.ok ? 'ok' : 'err'}`}>
+            {globalNotice.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
+            <span>{globalNotice.text}</span>
+          </div>
+        )}
+
         {activeTab === 'launcher' && (
           <div className="tab-pane">
             {/* 启动器内部二级切换器：Antigravity 启动器 vs Claude 专栏 */}
@@ -600,7 +866,43 @@ export const MainDashboard: React.FC = () => {
 
             {launcherSubTab === 'antigravity' ? (
               <>
-                {/* 1. Antigravity 纯代理启动主控卡 */}
+                {/* 1. Antigravity 专属 Clash 节点选择卡（置顶首位，展开下拉列表空间充足） */}
+                <section className="panel-card">
+                  <div className="panel-card-header">
+                    <div className="panel-title">
+                      <Radio
+                        size={15}
+                        className={clashInfo.connected ? 'pulse-green' : ''}
+                      />
+                      <span>1. 指定 Clash 专属代理节点（支持跨订阅组）</span>
+                    </div>
+                    <span
+                      className={`mini-badge ${
+                        clashInfo.connected ? 'connected' : 'warn-badge'
+                      }`}
+                    >
+                      {clashHeaderBadgeText}
+                    </span>
+                  </div>
+
+                  <ClashNodeSelector
+                    appLabel="Antigravity"
+                    clashInfo={clashInfo}
+                    selectedNode={config.antigravityClashNode}
+                    selectedProfileUid={config.antigravityClashProfileUid}
+                    selectedProfileName={config.antigravityClashProfileName}
+                    boundProfileUid={clashInfo.antigravityBoundProfileUid}
+                    boundProfileName={clashInfo.antigravityBoundProfileName}
+                    dedicatedPort={config.antigravityDedicatedPort}
+                    portListening={clashInfo.antigravityPortListening}
+                    isSwitching={isSwitchingAgNode}
+                    onSelectNode={(node, profUid) =>
+                      void handleSelectAntigravityNode(node, profUid)
+                    }
+                  />
+                </section>
+
+                {/* 2. Antigravity 纯代理启动主控卡 */}
                 <section
                   className={`hero-card ag-hero-card ${
                     antigravityState.running && antigravityState.proxiedSession
@@ -657,7 +959,10 @@ export const MainDashboard: React.FC = () => {
                         isSwitchingAgNode
                       }
                       onClick={() =>
-                        void window.guardAPI.probeAntigravityNode().then(setState)
+                        void window.guardAPI
+                          .probeAntigravityNode()
+                          .then(setState)
+                          .catch((err) => notifyError(err, 'ag'))
                       }
                       title="仅测试所选节点的出口 IP 与国家，不触发任何报警或拦截"
                     >
@@ -750,7 +1055,7 @@ export const MainDashboard: React.FC = () => {
                       <div className="ag-exit-placeholder">
                         <Radio size={15} />
                         <span>
-                          请在下方下拉框选择要为 Antigravity 绑定的 Clash 代理节点
+                          请先在上方下拉框选择要为 Antigravity 绑定的 Clash 代理节点
                         </span>
                       </div>
                     )}
@@ -825,6 +1130,41 @@ export const MainDashboard: React.FC = () => {
                     </div>
                   )}
 
+                  {/* 运行中重启/强杀二次确认栏 */}
+                  {pendingAgConfirm && (
+                    <div className="inline-confirm-bar">
+                      <div className="confirm-bar-text">
+                        <AlertTriangle size={15} />
+                        <span>
+                          {pendingAgConfirm === 'restart'
+                            ? '重启将强制终止当前 Antigravity.exe 与 language_server.exe 进程树并重新拉起，请确认已保存代码更改。'
+                            : '将强制终止全部 Antigravity.exe 与 language_server.exe 进程，请确认已保存工作内容。'}
+                        </span>
+                      </div>
+                      <div className="confirm-bar-actions">
+                        <button
+                          type="button"
+                          className="btn-confirm-danger"
+                          disabled={isLaunchingAg}
+                          onClick={() =>
+                            void (pendingAgConfirm === 'restart'
+                              ? executeLaunchAntigravity()
+                              : executeTerminateAntigravity())
+                          }
+                        >
+                          {pendingAgConfirm === 'restart' ? '确认重启' : '确认关闭'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-confirm-cancel"
+                          onClick={() => setPendingAgConfirm(null)}
+                        >
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   {/* 启动 / 重启 / 停止按钮行 */}
                   <div className="claude-launch-actions">
                     <button
@@ -834,7 +1174,7 @@ export const MainDashboard: React.FC = () => {
                       disabled={
                         !antigravityState.canLaunch || isLaunchingAg || isSwitchingAgNode
                       }
-                      onClick={() => void handleLaunchAntigravity()}
+                      onClick={handleLaunchAntigravity}
                     >
                       {isLaunchingAg ? (
                         <>
@@ -858,7 +1198,7 @@ export const MainDashboard: React.FC = () => {
                     {antigravityState.running && (
                       <button
                         className="btn-kill-claude"
-                        onClick={() => void handleTerminateAntigravity()}
+                        onClick={handleTerminateAntigravity}
                         title="关闭 Antigravity.exe 及 language_server.exe 进程"
                       >
                         <Square size={14} />
@@ -875,7 +1215,108 @@ export const MainDashboard: React.FC = () => {
                   )}
                 </section>
 
-                {/* 2. Antigravity 专属 Clash 节点选择卡（与 Claude 共用一套跨订阅选择组件） */}
+                {/* 3. Antigravity 客户端路径与专属端口设置卡（默认折叠，节省首屏纵向空间） */}
+                <section className={`panel-card collapsible-card ${isAgSettingsExpanded ? 'expanded' : 'collapsed'}`}>
+                  <div
+                    className="panel-card-header collapsible-header"
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setAgSettingsOpen((prev) => !prev)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setAgSettingsOpen((prev) => !prev);
+                      }
+                    }}
+                  >
+                    <div className="panel-title">
+                      <Cpu size={15} />
+                      <span>客户端路径与专属端口设置</span>
+                    </div>
+                    <div className="collapsible-header-right">
+                      <span className="mini-badge neutral">
+                        127.0.0.1:{config.antigravityDedicatedPort} · {agInstallTypeLabel}
+                      </span>
+                      <span className="collapse-chevron">
+                        {isAgSettingsExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
+                      </span>
+                    </div>
+                  </div>
+
+                  {isAgSettingsExpanded && (
+                    <div className="collapsible-body">
+                      <div className="claude-exe-path-box">
+                        <div className="exe-path-header">
+                          <span>Antigravity 专属代理监听端口（与 Claude 端口独立）：</span>
+                        </div>
+                        <div className="exe-path-row">
+                          <code className="exe-path-code">127.0.0.1 :</code>
+                          <input
+                            type="number"
+                            className="dedicated-port-input"
+                            min={1024}
+                            max={65535}
+                            value={agDedicatedPortInput}
+                            onChange={(e) => setAgDedicatedPortInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') void handleSaveAgDedicatedPort();
+                            }}
+                          />
+                          <button
+                            className="btn-save-inline"
+                            disabled={isSwitchingAgNode}
+                            onClick={() => void handleSaveAgDedicatedPort()}
+                          >
+                            <span>保存端口</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="claude-exe-path-box">
+                        <div className="exe-path-header">
+                          <span>Antigravity.exe 路径：</span>
+                          {config.antigravityExePath && (
+                            <button
+                              className="btn-link-clear"
+                              onClick={() =>
+                                void updateConfigSafe({ antigravityExePath: '' }, 'ag')
+                              }
+                            >
+                              恢复自动探测
+                            </button>
+                          )}
+                        </div>
+                        <div className="exe-path-row">
+                          <code
+                            className="exe-path-code ellipsis"
+                            title={
+                              antigravityState.detectedExePath || '未检测到 Antigravity.exe'
+                            }
+                          >
+                            {antigravityState.detectedExePath ||
+                              '未检测到 Antigravity.exe，请点击右侧手动浏览选择'}
+                          </code>
+                          <button
+                            className="btn-save-inline"
+                            onClick={() =>
+                              void window.guardAPI
+                                .browseAntigravityExe()
+                                .then(setState)
+                                .catch((err) => notifyError(err, 'ag'))
+                            }
+                          >
+                            <FolderOpen size={13} />
+                            <span>浏览...</span>
+                          </button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
+                </section>
+              </>
+            ) : (
+              <>
+                {/* 1. Clash Verge Rev 全订阅组专属节点选择卡片（置顶首位，展开下拉列表空间充足） */}
                 <section className="panel-card">
                   <div className="panel-card-header">
                     <div className="panel-title">
@@ -883,7 +1324,7 @@ export const MainDashboard: React.FC = () => {
                         size={15}
                         className={clashInfo.connected ? 'pulse-green' : ''}
                       />
-                      <span>指定 Clash 专属代理节点（支持跨订阅组）</span>
+                      <span>1. 指定 Clash 专属代理节点（支持跨订阅组）</span>
                     </div>
                     <span
                       className={`mini-badge ${
@@ -895,101 +1336,23 @@ export const MainDashboard: React.FC = () => {
                   </div>
 
                   <ClashNodeSelector
-                    appLabel="Antigravity"
+                    appLabel="Claude"
                     clashInfo={clashInfo}
-                    selectedNode={config.antigravityClashNode}
-                    selectedProfileUid={config.antigravityClashProfileUid}
-                    selectedProfileName={config.antigravityClashProfileName}
-                    boundProfileUid={clashInfo.antigravityBoundProfileUid}
-                    boundProfileName={clashInfo.antigravityBoundProfileName}
-                    dedicatedPort={config.antigravityDedicatedPort}
-                    portListening={clashInfo.antigravityPortListening}
-                    isSwitching={isSwitchingAgNode}
+                    selectedNode={config.selectedClashNode}
+                    selectedProfileUid={config.selectedClashProfileUid}
+                    selectedProfileName={config.selectedClashProfileName}
+                    boundProfileUid={clashInfo.boundProfileUid}
+                    boundProfileName={clashInfo.boundProfileName}
+                    dedicatedPort={config.dedicatedProxyPort}
+                    portListening={clashInfo.dedicatedPortListening}
+                    isSwitching={isSwitchingNode}
                     onSelectNode={(node, profUid) =>
-                      void handleSelectAntigravityNode(node, profUid)
+                      void handleSelectClaudeNode(node, profUid)
                     }
                   />
                 </section>
 
-                {/* 3. Antigravity 客户端路径与专属端口设置卡 */}
-                <section className="panel-card">
-                  <div className="panel-card-header">
-                    <div className="panel-title">
-                      <Cpu size={15} />
-                      <span>客户端路径与专属端口设置</span>
-                    </div>
-                    <span className="mini-badge neutral">{agInstallTypeLabel}</span>
-                  </div>
-
-                  <div className="claude-exe-path-box">
-                    <div className="exe-path-header">
-                      <span>Antigravity 专属代理监听端口（与 Claude 端口独立）：</span>
-                    </div>
-                    <div className="exe-path-row">
-                      <code className="exe-path-code">127.0.0.1 :</code>
-                      <input
-                        type="number"
-                        className="dedicated-port-input"
-                        min={1024}
-                        max={65535}
-                        value={agDedicatedPortInput}
-                        onChange={(e) => setAgDedicatedPortInput(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') void handleSaveAgDedicatedPort();
-                        }}
-                      />
-                      <button
-                        className="btn-save-inline"
-                        disabled={isSwitchingAgNode}
-                        onClick={() => void handleSaveAgDedicatedPort()}
-                      >
-                        <span>保存端口</span>
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="claude-exe-path-box">
-                    <div className="exe-path-header">
-                      <span>Antigravity.exe 路径：</span>
-                      {config.antigravityExePath && (
-                        <button
-                          className="btn-link-clear"
-                          onClick={() =>
-                            void window.guardAPI
-                              .updateConfig({ antigravityExePath: '' })
-                              .then(setState)
-                          }
-                        >
-                          恢复自动探测
-                        </button>
-                      )}
-                    </div>
-                    <div className="exe-path-row">
-                      <code
-                        className="exe-path-code ellipsis"
-                        title={
-                          antigravityState.detectedExePath || '未检测到 Antigravity.exe'
-                        }
-                      >
-                        {antigravityState.detectedExePath ||
-                          '未检测到 Antigravity.exe，请点击右侧手动浏览选择'}
-                      </code>
-                      <button
-                        className="btn-save-inline"
-                        onClick={() =>
-                          void window.guardAPI.browseAntigravityExe().then(setState)
-                        }
-                      >
-                        <FolderOpen size={13} />
-                        <span>浏览...</span>
-                      </button>
-                    </div>
-                  </div>
-                </section>
-              </>
-            ) : (
-              <>
-                {/* 1. Claude 唯一启动入口 & 三重一致性校验主控卡 */}
+                {/* 2. Claude 唯一启动入口 & 三重一致性校验主控卡 */}
                 <section
                   className={`hero-card claude-hero-card ${
                     claudeState.running || claudeState.canLaunch
@@ -1047,6 +1410,7 @@ export const MainDashboard: React.FC = () => {
                         void window.guardAPI
                           .probeClaudeNode('Claude 专栏手动重测')
                           .then(setState)
+                          .catch((err) => notifyError(err, 'claude'))
                       }
                     >
                       <RefreshCw
@@ -1133,7 +1497,7 @@ export const MainDashboard: React.FC = () => {
                             <small>
                               {config.selectedClashNode
                                 ? claudeState.nodeProbeError || '请检查节点连通性'
-                                : '请在下方下拉框选择节点'}
+                                : '请先在上方下拉框选择节点'}
                             </small>
                           </>
                         )}
@@ -1227,6 +1591,61 @@ export const MainDashboard: React.FC = () => {
                     </div>
                   )}
 
+                  {/* 运行中切换节点 / 修改端口 / 强杀二次确认栏 */}
+                  {pendingClaudeConfirm && (
+                    <div className="inline-confirm-bar">
+                      <div className="confirm-bar-text">
+                        <AlertTriangle size={15} />
+                        <span>
+                          {pendingClaudeConfirm.type === 'switch-node'
+                            ? `Claude 正在运行中，切换节点至 [${
+                                pendingClaudeConfirm.nodeName || '未绑定'
+                              }] 将先安全终止当前 Claude 会话，待新节点通过三重校验后可重新启动。`
+                            : pendingClaudeConfirm.type === 'change-port'
+                            ? `Claude 正在运行中，修改专属端口为 ${pendingClaudeConfirm.port} 将先终止当前 Claude 会话。`
+                            : '确定要立即终止全部 Claude 关联进程并回收启动授权锁吗？'}
+                        </span>
+                      </div>
+                      <div className="confirm-bar-actions">
+                        <button
+                          type="button"
+                          className="btn-confirm-danger"
+                          disabled={isSwitchingNode}
+                          onClick={() => {
+                            if (pendingClaudeConfirm.type === 'switch-node') {
+                              void executeSelectClaudeNode(
+                                pendingClaudeConfirm.nodeName,
+                                pendingClaudeConfirm.profileUid
+                              );
+                            } else if (pendingClaudeConfirm.type === 'change-port') {
+                              void executeSaveDedicatedPort(pendingClaudeConfirm.port);
+                            } else {
+                              void executeTerminateClaude();
+                            }
+                          }}
+                        >
+                          {pendingClaudeConfirm.type === 'switch-node'
+                            ? '确认切换并终止 Claude'
+                            : pendingClaudeConfirm.type === 'change-port'
+                            ? '确认修改端口'
+                            : '确认终止'}
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-confirm-cancel"
+                          onClick={() => {
+                            if (pendingClaudeConfirm.type === 'change-port') {
+                              setDedicatedPortInput(String(config.dedicatedProxyPort));
+                            }
+                            setPendingClaudeConfirm(null);
+                          }}
+                        >
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
                   {/* 唯一启动入口主按钮与强杀按钮 */}
                   <div className="claude-launch-actions">
                     <button
@@ -1258,7 +1677,7 @@ export const MainDashboard: React.FC = () => {
                     {claudeState.running && (
                       <button
                         className="btn-kill-claude"
-                        onClick={() => void handleTerminateClaude()}
+                        onClick={handleTerminateClaude}
                         title="立即强杀全部 Claude 关联进程并回收启动锁"
                       >
                         <Square size={14} />
@@ -1290,146 +1709,144 @@ export const MainDashboard: React.FC = () => {
                   )}
                 </section>
 
-                {/* 2. Clash Verge Rev 全订阅组专属节点选择卡片 */}
-                <section className="panel-card">
-                  <div className="panel-card-header">
-                    <div className="panel-title">
-                      <Radio
-                        size={15}
-                        className={clashInfo.connected ? 'pulse-green' : ''}
-                      />
-                      <span>指定 Clash 专属代理节点（支持跨订阅组）</span>
-                    </div>
-                    <span
-                      className={`mini-badge ${
-                        clashInfo.connected ? 'connected' : 'warn-badge'
-                      }`}
-                    >
-                      {clashHeaderBadgeText}
-                    </span>
-                  </div>
-
-                  <ClashNodeSelector
-                    appLabel="Claude"
-                    clashInfo={clashInfo}
-                    selectedNode={config.selectedClashNode}
-                    selectedProfileUid={config.selectedClashProfileUid}
-                    selectedProfileName={config.selectedClashProfileName}
-                    boundProfileUid={clashInfo.boundProfileUid}
-                    boundProfileName={clashInfo.boundProfileName}
-                    dedicatedPort={config.dedicatedProxyPort}
-                    portListening={clashInfo.dedicatedPortListening}
-                    isSwitching={isSwitchingNode}
-                    onSelectNode={(node, profUid) =>
-                      void handleSelectClaudeNode(node, profUid)
-                    }
-                  />
-                </section>
-
-                {/* 3. 启动保护与客户端设置 */}
-                <section className="panel-card">
-                  <div className="panel-card-header">
+                {/* 3. 启动保护与客户端设置（默认折叠，节省首屏纵向空间） */}
+                <section className={`panel-card collapsible-card ${isClaudeSettingsExpanded ? 'expanded' : 'collapsed'}`}>
+                  <div
+                    className="panel-card-header collapsible-header"
+                    role="button"
+                    tabIndex={0}
+                    onClick={() => setClaudeSettingsOpen((prev) => !prev)}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') {
+                        e.preventDefault();
+                        setClaudeSettingsOpen((prev) => !prev);
+                      }
+                    }}
+                  >
                     <div className="panel-title">
                       <Ban size={15} />
                       <span>启动保护与客户端设置</span>
                     </div>
-                    <span className="mini-badge neutral">{installTypeLabel}</span>
-                  </div>
-
-                  <div className="setting-row">
-                    <div>
-                      <strong>仅允许从本面板启动 Claude</strong>
-                      <p>拦截桌面、开始菜单等外部直接启动，防止未校验环境裸奔</p>
-                    </div>
-                    <input
-                      type="checkbox"
-                      className="toggle-switch"
-                      checked={config.claudeExclusiveGuard}
-                      onChange={(e) =>
-                        void window.guardAPI
-                          .updateConfig({ claudeExclusiveGuard: e.target.checked })
-                          .then(setState)
-                      }
-                    />
-                  </div>
-
-                  <div className="setting-row">
-                    <div>
-                      <strong>Claude 异常拦截弹窗提醒</strong>
-                      <p>外部启动被拦截或运行期环境异常触发强杀时，在屏幕右下角弹出置顶提醒</p>
-                    </div>
-                    <input
-                      type="checkbox"
-                      className="toggle-switch"
-                      checked={config.alertPopupEnabled}
-                      onChange={(e) =>
-                        void window.guardAPI.updateConfig({ alertPopupEnabled: e.target.checked })
-                      }
-                    />
-                  </div>
-
-                  <div className="claude-exe-path-box">
-                    <div className="exe-path-header">
-                      <span>专属代理监听端口：</span>
-                    </div>
-                    <div className="exe-path-row">
-                      <code className="exe-path-code">127.0.0.1 :</code>
-                      <input
-                        type="number"
-                        className="dedicated-port-input"
-                        min={1024}
-                        max={65535}
-                        value={dedicatedPortInput}
-                        onChange={(e) => setDedicatedPortInput(e.target.value)}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') void handleSaveDedicatedPort();
-                        }}
-                      />
-                      <button
-                        className="btn-save-inline"
-                        disabled={isSwitchingNode}
-                        onClick={() => void handleSaveDedicatedPort()}
-                      >
-                        <span>保存端口</span>
-                      </button>
+                    <div className="collapsible-header-right">
+                      <span className="mini-badge neutral">
+                        {config.claudeExclusiveGuard ? '唯一入口拦截' : '拦截已关'} · 127.0.0.1:
+                        {config.dedicatedProxyPort} · {installTypeLabel}
+                      </span>
+                      <span className="collapse-chevron">
+                        {isClaudeSettingsExpanded ? (
+                          <ChevronUp size={15} />
+                        ) : (
+                          <ChevronDown size={15} />
+                        )}
+                      </span>
                     </div>
                   </div>
 
-                  <div className="claude-exe-path-box">
-                    <div className="exe-path-header">
-                      <span>客户端路径：</span>
-                      {config.claudeExePath && (
-                        <button
-                          className="btn-link-clear"
-                          onClick={() =>
-                            void window.guardAPI
-                              .updateConfig({ claudeExePath: '' })
-                              .then(setState)
+                  {isClaudeSettingsExpanded && (
+                    <div className="collapsible-body">
+                      <div className="setting-row">
+                        <div>
+                          <strong>仅允许从本面板启动 Claude</strong>
+                          <p>拦截桌面、开始菜单等外部直接启动，防止未校验环境裸奔</p>
+                        </div>
+                        <input
+                          type="checkbox"
+                          className="toggle-switch"
+                          checked={config.claudeExclusiveGuard}
+                          onChange={(e) =>
+                            void updateConfigSafe(
+                              { claudeExclusiveGuard: e.target.checked },
+                              'claude'
+                            )
                           }
-                        >
-                          恢复自动探测
-                        </button>
-                      )}
+                        />
+                      </div>
+
+                      <div className="setting-row">
+                        <div>
+                          <strong>Claude 异常拦截弹窗提醒</strong>
+                          <p>
+                            外部启动被拦截或运行期环境异常触发强杀时，在屏幕右下角弹出置顶提醒
+                          </p>
+                        </div>
+                        <input
+                          type="checkbox"
+                          className="toggle-switch"
+                          checked={config.alertPopupEnabled}
+                          onChange={(e) =>
+                            void updateConfigSafe(
+                              { alertPopupEnabled: e.target.checked },
+                              'claude'
+                            )
+                          }
+                        />
+                      </div>
+
+                      <div className="claude-exe-path-box">
+                        <div className="exe-path-header">
+                          <span>专属代理监听端口：</span>
+                        </div>
+                        <div className="exe-path-row">
+                          <code className="exe-path-code">127.0.0.1 :</code>
+                          <input
+                            type="number"
+                            className="dedicated-port-input"
+                            min={1024}
+                            max={65535}
+                            value={dedicatedPortInput}
+                            onChange={(e) => setDedicatedPortInput(e.target.value)}
+                            onKeyDown={(e) => {
+                              if (e.key === 'Enter') void handleSaveDedicatedPort();
+                            }}
+                          />
+                          <button
+                            className="btn-save-inline"
+                            disabled={isSwitchingNode}
+                            onClick={() => void handleSaveDedicatedPort()}
+                          >
+                            <span>保存端口</span>
+                          </button>
+                        </div>
+                      </div>
+
+                      <div className="claude-exe-path-box">
+                        <div className="exe-path-header">
+                          <span>客户端路径：</span>
+                          {config.claudeExePath && (
+                            <button
+                              className="btn-link-clear"
+                              onClick={() =>
+                                void updateConfigSafe({ claudeExePath: '' }, 'claude')
+                              }
+                            >
+                              恢复自动探测
+                            </button>
+                          )}
+                        </div>
+                        <div className="exe-path-row">
+                          <code
+                            className="exe-path-code ellipsis"
+                            title={claudeState.detectedExePath || '未检测到 Claude.exe'}
+                          >
+                            {claudeState.detectedExePath ||
+                              '未检测到 Claude Desktop，请点击右侧手动选择'}
+                          </code>
+                          <button
+                            className="btn-save-inline"
+                            onClick={() =>
+                              void window.guardAPI
+                                .browseClaudeExe()
+                                .then(setState)
+                                .catch((err) => notifyError(err, 'claude'))
+                            }
+                          >
+                            <FolderOpen size={13} />
+                            <span>浏览...</span>
+                          </button>
+                        </div>
+                      </div>
                     </div>
-                    <div className="exe-path-row">
-                      <code
-                        className="exe-path-code ellipsis"
-                        title={claudeState.detectedExePath || '未检测到 Claude.exe'}
-                      >
-                        {claudeState.detectedExePath ||
-                          '未检测到 Claude Desktop，请点击右侧手动选择'}
-                      </code>
-                      <button
-                        className="btn-save-inline"
-                        onClick={() =>
-                          void window.guardAPI.browseClaudeExe().then(setState)
-                        }
-                      >
-                        <FolderOpen size={13} />
-                        <span>浏览...</span>
-                      </button>
-                    </div>
-                  </div>
+                  )}
                 </section>
               </>
             )}
@@ -1446,17 +1863,7 @@ export const MainDashboard: React.FC = () => {
               >
                 <Activity size={14} />
                 <span>状态与时区</span>
-                <span
-                  className={`tab-status-dot ${
-                    status === 'ok'
-                      ? 'running'
-                      : status === 'mismatch' || status === 'error'
-                      ? 'locked'
-                      : status === 'checking'
-                      ? 'checking'
-                      : 'ready'
-                  }`}
-                />
+                <span className={`tab-status-dot ${monitorTabDotClass}`} />
               </button>
 
               <button
@@ -1493,7 +1900,12 @@ export const MainDashboard: React.FC = () => {
                     <button
                       className="btn-refresh"
                       disabled={isChecking}
-                      onClick={() => void window.guardAPI.checkNow('手动立即刷新')}
+                      onClick={() =>
+                        void window.guardAPI
+                          .checkNow('手动立即刷新')
+                          .then(setState)
+                          .catch((err) => notifyError(err, 'global'))
+                      }
                     >
                       <RefreshCw className={isChecking ? 'spin' : ''} size={14} />
                       <span>{isChecking ? '检测中...' : '立即检测'}</span>
@@ -1573,10 +1985,18 @@ export const MainDashboard: React.FC = () => {
                     {effectiveTargetCode && (
                       <span
                         className={`mini-badge ${
-                          isWinLocaleMatched ? 'connected' : 'warn-badge'
+                          isWinLocaleMatched
+                            ? 'connected'
+                            : config.defaultCountryCode
+                            ? 'warn-badge'
+                            : 'neutral'
                         }`}
                       >
-                        {isWinLocaleMatched ? '已与保护地区一致' : '与保护地区不一致'}
+                        {isWinLocaleMatched
+                          ? '已与目标地区一致'
+                          : config.defaultCountryCode
+                          ? '与保护地区不一致'
+                          : '与当前出口不同 (可选同步)'}
                       </span>
                     )}
                   </div>
@@ -1664,7 +2084,12 @@ export const MainDashboard: React.FC = () => {
                     {config.defaultCountryCode && (
                       <button
                         className="btn-link-clear"
-                        onClick={() => void window.guardAPI.setDefaultRegion(null)}
+                        onClick={() =>
+                          void window.guardAPI
+                            .setDefaultRegion(null)
+                            .then(setState)
+                            .catch((err) => notifyError(err, 'global'))
+                        }
                         title="取消固定默认地区限制"
                       >
                         <Unlock size={13} />
@@ -1687,7 +2112,7 @@ export const MainDashboard: React.FC = () => {
                         </>
                       ) : (
                         <div className="default-unset-hint">
-                          <span>未锁定固定地区，当前自动以实时出口地区作为时区对比基准</span>
+                          <span>未锁定固定地区，仅展示实时出口信息（不触发地区偏离红灯）</span>
                         </div>
                       )}
                     </div>
@@ -1698,7 +2123,12 @@ export const MainDashboard: React.FC = () => {
                           isCurrentAlreadyDefault ? 'btn-already' : ''
                         }`}
                         disabled={!canLockCurrentProbe || isCurrentAlreadyDefault}
-                        onClick={() => void window.guardAPI.setDefaultCurrent()}
+                        onClick={() =>
+                          void window.guardAPI
+                            .setDefaultCurrent()
+                            .then(setState)
+                            .catch((err) => notifyError(err, 'global'))
+                        }
                       >
                         <Sparkles size={15} />
                         <span>
@@ -1715,7 +2145,10 @@ export const MainDashboard: React.FC = () => {
                         value={config.defaultCountryCode || ''}
                         onChange={(e) => {
                           const val = e.target.value || null;
-                          void window.guardAPI.setDefaultRegion(val);
+                          void window.guardAPI
+                            .setDefaultRegion(val)
+                            .then(setState)
+                            .catch((err) => notifyError(err, 'global'));
                         }}
                         title="也可直接手动指定期望的国家/地区"
                       >
@@ -1758,9 +2191,10 @@ export const MainDashboard: React.FC = () => {
                       className="toggle-switch"
                       checked={config.killProcessesEnabled}
                       onChange={(e) =>
-                        void window.guardAPI.updateConfig({
-                          killProcessesEnabled: e.target.checked,
-                        })
+                        void updateConfigSafe(
+                          { killProcessesEnabled: e.target.checked },
+                          'global'
+                        )
                       }
                     />
                   </div>
@@ -1776,9 +2210,10 @@ export const MainDashboard: React.FC = () => {
                       disabled={!config.killProcessesEnabled}
                       checked={config.killOnDisconnect}
                       onChange={(e) =>
-                        void window.guardAPI.updateConfig({
-                          killOnDisconnect: e.target.checked,
-                        })
+                        void updateConfigSafe(
+                          { killOnDisconnect: e.target.checked },
+                          'global'
+                        )
                       }
                     />
                   </div>
@@ -1794,9 +2229,10 @@ export const MainDashboard: React.FC = () => {
                       disabled={!config.killProcessesEnabled}
                       checked={config.killOnLocaleMismatch}
                       onChange={(e) =>
-                        void window.guardAPI.updateConfig({
-                          killOnLocaleMismatch: e.target.checked,
-                        })
+                        void updateConfigSafe(
+                          { killOnLocaleMismatch: e.target.checked },
+                          'global'
+                        )
                       }
                     />
                   </div>
@@ -2016,7 +2452,10 @@ export const MainDashboard: React.FC = () => {
                   className="toggle-switch"
                   checked={config.monitorAlertEnabled}
                   onChange={(e) =>
-                    void window.guardAPI.updateConfig({ monitorAlertEnabled: e.target.checked })
+                    void updateConfigSafe(
+                      { monitorAlertEnabled: e.target.checked },
+                      'global'
+                    )
                   }
                 />
               </div>
@@ -2032,7 +2471,10 @@ export const MainDashboard: React.FC = () => {
                   disabled={!config.monitorAlertEnabled}
                   checked={config.alertOnDisconnect}
                   onChange={(e) =>
-                    void window.guardAPI.updateConfig({ alertOnDisconnect: e.target.checked })
+                    void updateConfigSafe(
+                      { alertOnDisconnect: e.target.checked },
+                      'global'
+                    )
                   }
                 />
               </div>
@@ -2056,9 +2498,10 @@ export const MainDashboard: React.FC = () => {
                   className="compact-select"
                   value={config.heartbeatIntervalSec}
                   onChange={(e) =>
-                    void window.guardAPI.updateConfig({
-                      heartbeatIntervalSec: Number(e.target.value),
-                    })
+                    void updateConfigSafe(
+                      { heartbeatIntervalSec: Number(e.target.value) },
+                      'global'
+                    )
                   }
                 >
                   <option value={0}>仅本地事件触发</option>
@@ -2080,7 +2523,10 @@ export const MainDashboard: React.FC = () => {
                   className="toggle-switch"
                   checked={config.alertSoundEnabled}
                   onChange={(e) =>
-                    void window.guardAPI.updateConfig({ alertSoundEnabled: e.target.checked })
+                    void updateConfigSafe(
+                      { alertSoundEnabled: e.target.checked },
+                      'global'
+                    )
                   }
                 />
               </div>
@@ -2095,7 +2541,10 @@ export const MainDashboard: React.FC = () => {
                   className="toggle-switch"
                   checked={config.closeToTray}
                   onChange={(e) =>
-                    void window.guardAPI.updateConfig({ closeToTray: e.target.checked })
+                    void updateConfigSafe(
+                      { closeToTray: e.target.checked },
+                      'global'
+                    )
                   }
                 />
               </div>
@@ -2110,7 +2559,10 @@ export const MainDashboard: React.FC = () => {
                   className="toggle-switch"
                   checked={config.autoLaunch}
                   onChange={(e) =>
-                    void window.guardAPI.updateConfig({ autoLaunch: e.target.checked })
+                    void updateConfigSafe(
+                      { autoLaunch: e.target.checked },
+                      'global'
+                    )
                   }
                 />
               </div>
@@ -2161,7 +2613,12 @@ export const MainDashboard: React.FC = () => {
                 {logs.length > 0 && (
                   <button
                     className="btn-link-clear"
-                    onClick={() => void window.guardAPI.clearLogs()}
+                    onClick={() =>
+                      void window.guardAPI
+                        .clearLogs()
+                        .then(setState)
+                        .catch((err) => notifyError(err, 'global'))
+                    }
                   >
                     <Trash2 size={13} />
                     <span>清空记录</span>

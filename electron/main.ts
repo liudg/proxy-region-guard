@@ -11,6 +11,7 @@ import { execFileSync } from 'node:child_process';
 import * as path from 'node:path';
 import { AlertPayload, AppConfig, AppStateSnapshot } from '../src/shared/types';
 import { isValidIsoCountryCode } from '../src/shared/countries';
+import { isWindowsLocaleMatchingCountry } from '../src/shared/timezones';
 import { ConfigStore } from './configStore';
 import { GeoIpService } from './geoipService';
 import { ClashMonitor } from './clashMonitor';
@@ -474,8 +475,18 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     ? 'Antigravity: 就绪可启动'
     : 'Antigravity: 待选择节点';
 
+  const isMonitorLocaleMatched = state.lastProbe
+    ? isWindowsLocaleMatchingCountry(
+        state.winLocale.timeZoneId,
+        state.winLocale.regionCode,
+        state.lastProbe.countryCode
+      )
+    : false;
+
   const statusLabelMap: Record<AppStateSnapshot['status'], string> = {
-    ok: '🟢 代理与时区一致 (正常)',
+    ok: isMonitorLocaleMatched
+      ? '🟢 代理与时区一致 (正常)'
+      : '🟢 代理通道正常 (未锁定保护地区)',
     mismatch: '🔴 代理或时区不一致！',
     error: '🔴 代理连接异常！',
     unset: '🔵 待选择节点或保护地区',
@@ -657,7 +668,9 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       click: () => showMainWindow(),
     },
     {
-      label: '完全退出程序 (保持 Antigravity 运行)',
+      label: state.claudeState.running
+        ? '完全退出程序 (将终止 Claude，保持 Antigravity 运行)'
+        : '完全退出程序 (保持 Antigravity 运行)',
       click: () => {
         isQuitting = true;
         probeEngine?.stop();

@@ -157,12 +157,26 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
     return out;
   }, [visibleGroups]);
 
-  // 展开下拉面板时自动聚焦搜索输入框
+  // 展开下拉面板时自动定位到已选节点并聚焦搜索输入框
   useEffect(() => {
     if (isOpen) {
-      setHighlightIndex(0);
+      const selectedIdx = selectedNode
+        ? flatItems.findIndex(
+            (item) =>
+              item.node.name === selectedNode &&
+              (!effectiveProfileUid || item.groupUid === effectiveProfileUid)
+          )
+        : -1;
+      const initialIdx = selectedIdx >= 0 ? selectedIdx : 0;
+      setHighlightIndex(initialIdx);
       requestAnimationFrame(() => {
         searchInputRef.current?.focus();
+        if (selectedIdx >= 0 && listContainerRef.current) {
+          const el = listContainerRef.current.querySelector(
+            `[data-flat-idx="${selectedIdx}"]`
+          ) as HTMLElement | null;
+          el?.scrollIntoView({ block: 'center' });
+        }
       });
     }
   }, [isOpen]);
