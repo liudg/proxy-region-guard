@@ -323,13 +323,32 @@ export const MainDashboard: React.FC = () => {
   ) => {
     const wasRunning = antigravityState.running && antigravityState.proxiedSession;
     setIsSwitchingAgNode(true);
+    setAgFeedback(null);
     try {
       const next = await window.guardAPI.selectAntigravityClashNode(nodeName, profileUid);
       setState(next);
-      if (wasRunning && nodeName) {
+      if (!nodeName) return;
+
+      const selectedNode = nodeName.trim();
+      const selectedProfileUid = profileUid?.trim() || next.config.antigravityClashProfileUid;
+      const bindingMatched =
+        next.clashInfo.connected &&
+        next.clashInfo.antigravityPortListening &&
+        next.clashInfo.antigravityBoundNode === selectedNode &&
+        next.clashInfo.antigravityBoundProfileUid === selectedProfileUid &&
+        next.clashInfo.antigravityDedicatedPort === next.config.antigravityDedicatedPort;
+      if (!bindingMatched || next.antigravityState.nodeProbeError) {
+        showTimedAgFeedback(
+          false,
+          next.antigravityState.nodeProbeError || `节点 [${selectedNode}] 的专属代理绑定未就绪`
+        );
+        return;
+      }
+
+      if (wasRunning) {
         showTimedAgFeedback(
           true,
-          `专属端口已热切换至节点 [${nodeName}]，当前运行中的 Antigravity 即刻生效（无需重启 IDE）`
+          `专属端口已绑定至节点 [${selectedNode}]`
         );
       }
     } catch (err) {
