@@ -404,10 +404,12 @@ export class ClashMonitor extends EventEmitter {
       slot.boundProfileName = null;
       slot.boundInternalProxyName = null;
       slot.boundPort = null;
+      slot.boundDefinition = null;
       if (channelId === 'claude') {
         this.rebindGraceUntil = 0;
       }
-      this.syncSlotInfoFields(false, false, '未检测到运行中的 Clash Verge / Mihomo 控制接口');
+      const error = '未检测到运行中的 Clash Verge / Mihomo 控制接口';
+      this.syncSlotInfoFields(false, false, error);
       this.emit('clash-status-updated');
       if (!slot.desiredNodeName) {
         return { ok: true, listening: false };
@@ -417,11 +419,12 @@ export class ClashMonitor extends EventEmitter {
         listening: false,
         profileUid: slot.desiredProfileUid,
         profileName: slot.desiredProfileName,
-        error: '未检测到运行中的 Clash Verge / Mihomo 控制接口',
+        error,
       };
     }
 
     const res = await this.applySyncDedicatedListeners(forceRebind);
+    this.info.bindingVerificationError = res.generalError || null;
     this.emit('clash-status-updated');
 
     if (!slot.desiredNodeName) {
@@ -662,6 +665,19 @@ export class ClashMonitor extends EventEmitter {
           }
         }
 
+        const prevConnected = this.info.connected;
+        const prevBindingError = this.info.bindingVerificationError;
+        const prevMode = this.info.mode;
+        const prevNode = this.info.activeNode;
+        const prevChainKey = this.info.nodeChain.join(' > ');
+        const nextChainKey = resolved.chain.join(' > ');
+        const prevGroupsSig = this.lastGroupsSignature;
+        const prevProfilesSig = this.lastProfilesSignature;
+        const prevClaudeListening = this.info.dedicatedPortListening;
+        const prevAgListening = this.info.antigravityPortListening;
+        const prevAvailCount = this.info.availableNodes.length;
+        const prevActiveProfileUid = this.info.activeProfileUid;
+
         let claudeBoundChanged = false;
         let agBoundChanged = false;
 
@@ -678,7 +694,7 @@ export class ClashMonitor extends EventEmitter {
             now >= this.rebindGraceUntil;
 
           if (!inCooldown) {
-            if (this.info.dedicatedPortListening) {
+            if (prevClaudeListening) {
               this.rebindGraceUntil = Math.max(
                 this.rebindGraceUntil,
                 Date.now() + RELOAD_GRACE_WINDOW_MS
@@ -715,7 +731,7 @@ export class ClashMonitor extends EventEmitter {
               prevBoundClaudeNode !== claudeSlot.boundNodeName ||
               prevBoundProfile !== claudeSlot.boundProfileUid ||
               prevBoundClaudePort !== claudeSlot.boundPort ||
-              this.info.dedicatedPortListening !== claudeListening
+              prevClaudeListening !== claudeListening
             ) {
               claudeBoundChanged = true;
             }
@@ -723,7 +739,7 @@ export class ClashMonitor extends EventEmitter {
               prevBoundAgNode !== agSlot.boundNodeName ||
               prevBoundAgProfile !== agSlot.boundProfileUid ||
               prevBoundAgPort !== agSlot.boundPort ||
-              this.info.antigravityPortListening !== antigravityListening
+              prevAgListening !== antigravityListening
             ) {
               agBoundChanged = true;
             }
@@ -735,21 +751,8 @@ export class ClashMonitor extends EventEmitter {
             claudeListening = true;
             fastRetryMs = 450;
           }
-          if (inCooldown) bindingVerificationError = this.info.bindingVerificationError;
+          if (inCooldown) bindingVerificationError = prevBindingError;
         }
-
-        const prevConnected = this.info.connected;
-        const prevBindingError = this.info.bindingVerificationError;
-        const prevMode = this.info.mode;
-        const prevNode = this.info.activeNode;
-        const prevChainKey = this.info.nodeChain.join(' > ');
-        const nextChainKey = resolved.chain.join(' > ');
-        const prevGroupsSig = this.lastGroupsSignature;
-        const prevProfilesSig = this.lastProfilesSignature;
-        const prevClaudeListening = this.info.dedicatedPortListening;
-        const prevAgListening = this.info.antigravityPortListening;
-        const prevAvailCount = this.info.availableNodes.length;
-        const prevActiveProfileUid = this.info.activeProfileUid;
 
         this.lastGroupsSignature = nextGroupsSig;
         this.lastProfilesSignature = nextProfilesSig;
@@ -909,16 +912,9 @@ export class ClashMonitor extends EventEmitter {
     const agSlot = this.slots.antigravity;
 
     if (!this.currentEndpoint) {
-      this.info.bindingVerificationError = '尚未连接到 Clash 控制接口，无法确认专属节点绑定状态';
-      const claudeAlive = claudeSlot.desiredNodeName
-        ? await isLocalPortListening(claudeSlot.desiredPort)
-        : false;
-      const agAlive = agSlot.desiredNodeName
-        ? await isLocalPortListening(agSlot.desiredPort)
-        : false;
       return {
-        claudeListening: claudeAlive,
-        antigravityListening: agAlive,
+        claudeListening: false,
+        antigravityListening: false,
         generalError: '尚未连接到 Clash Verge Rev 控制接口，无法确认专属节点绑定状态',
       };
     }
@@ -932,7 +928,6 @@ export class ClashMonitor extends EventEmitter {
     try {
       const yamlPath = this.findActiveClashYamlFile();
       if (!yamlPath) {
-        this.info.bindingVerificationError = '未找到 Clash 运行时配置文件，无法确认专属节点绑定状态';
         return {
           claudeListening: false,
           antigravityListening: false,
@@ -1001,7 +996,6 @@ export class ClashMonitor extends EventEmitter {
 
       const doc = this.loadAndPrepareCoreYaml(yamlPath, portsToStrip);
       if (!doc) {
-        this.info.bindingVerificationError = `配置文件无效，无法确认专属节点绑定状态：${path.basename(yamlPath)}`;
         return {
           claudeListening: false,
           antigravityListening: false,
@@ -1018,6 +1012,12 @@ export class ClashMonitor extends EventEmitter {
       const prependedRules: string[] = [];
       const mergedExtraHosts: Record<string, string> = {};
       const mergedNameserverPolicies: Record<string, string[]> = {};
+      const ruleProviders =
+        doc['rule-providers'] &&
+        typeof doc['rule-providers'] === 'object' &&
+        !Array.isArray(doc['rule-providers'])
+          ? (doc['rule-providers'] as Record<string, unknown>)
+          : {};
 
       const slotOutcome: Record<
         DedicatedChannelId,
@@ -1047,7 +1047,18 @@ export class ClashMonitor extends EventEmitter {
         const profNsPolicy = resolved?.nameserverPolicy || {};
         Object.assign(mergedExtraHosts, profHosts);
         for (const [pat, servers] of Object.entries(profNsPolicy)) {
-          mergedNameserverPolicies[pat] = servers;
+          const validSubPats = pat
+            .split(',')
+            .map((s) => s.trim())
+            .filter((sub) => {
+              if (!sub) return false;
+              const m = sub.match(/^rule-set:(.+)$/i);
+              return !m || Object.prototype.hasOwnProperty.call(ruleProviders, m[1].trim());
+            });
+          if (validSubPats.length === 0) continue;
+          const effectivePat =
+            validSubPats.length === 1 && !pat.includes(',') ? pat : validSubPats.join(',');
+          mergedNameserverPolicies[effectivePat] = servers;
         }
 
         let shouldBind = false;
@@ -1215,7 +1226,6 @@ export class ClashMonitor extends EventEmitter {
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
-      this.info.bindingVerificationError = `绑定 Clash 专属节点失败: ${msg}`;
       return {
         claudeListening: false,
         antigravityListening: false,
@@ -2487,7 +2497,7 @@ function formatControllerErrorBody(body: string): string {
   return `: ${detail.replace(/\s+/g, ' ').slice(0, 512)}`;
 }
 
-function isLocalPortListening(port: number, timeoutMs = 220): Promise<boolean> {
+export function isLocalPortListening(port: number, timeoutMs = 220): Promise<boolean> {
   return new Promise((resolve) => {
     const sock = new net.Socket();
     let done = false;

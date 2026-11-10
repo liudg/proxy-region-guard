@@ -19,7 +19,6 @@ export interface AppConfig {
   };
   heartbeatIntervalSec: number; // 0 = 仅事件触发, >0 = 心跳秒数
   customProbeUrl: string;
-  alertPopupEnabled: boolean;   // Claude 弹窗设置，保护终止提醒始终显示
   alertSoundEnabled: boolean;   // 全局警告弹窗提示音开关
   alertOnDisconnect: boolean;   // 实时监控代理断连/超时弹窗报警子开关
   monitorAlertEnabled: boolean; // 实时监控（含联动进程强杀）异常弹窗告警总开关

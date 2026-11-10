@@ -27,8 +27,13 @@ async function availablePort(): Promise<number> {
 }
 
 export async function runMihomoIntegration(directory: string, sourceMonitor: ClashMonitor): Promise<void> {
-  const executable = process.env.GUARD_TEST_MIHOMO || 'C:\\Program Files\\Clash Verge\\verge-mihomo.exe';
-  if (!fs.existsSync(executable)) {
+  const candidates = [
+    process.env.GUARD_TEST_MIHOMO,
+    'C:\\Program Files\\Clash Verge\\verge-mihomo.exe',
+    'C:\\ProgramData\\clash-verge-service\\cores\\verge-mihomo.exe',
+  ].filter((item): item is string => Boolean(item));
+  const executable = candidates.find((item) => fs.existsSync(item));
+  if (!executable) {
     console.log('未执行：独立内核验证需要设置 GUARD_TEST_MIHOMO');
     return;
   }
@@ -235,7 +240,19 @@ export async function runMihomoIntegration(directory: string, sourceMonitor: Cla
       console.log('通过：真实节点配置变更使等待中的旧探测重试失效');
 
       const systemProxy = await readWindowsSystemProxy();
-      const verificationProxy = process.env.GUARD_TEST_CLAUDE_PROXY || systemProxy.proxyUrl;
+      let hostMixedProxy: string | null = null;
+      const hostEndpoint = await source.findWorkingEndpoint();
+      if (hostEndpoint) {
+        try {
+          const cfg = await source.requestJson(hostEndpoint, '/configs', 1000);
+          const mixedPort = Number(cfg?.['mixed-port'] || cfg?.['port'] || 0);
+          if (mixedPort > 0) hostMixedProxy = `http://127.0.0.1:${mixedPort}`;
+        } catch {
+          // ignore
+        }
+      }
+      const verificationProxy =
+        process.env.GUARD_TEST_CLAUDE_PROXY || systemProxy.proxyUrl || hostMixedProxy;
       assert.ok(verificationProxy, 'Claude 安全检查需要可用的代理');
       const upstream = new URL(verificationProxy);
       assert.ok(['http:', 'socks5:', 'socks5h:'].includes(upstream.protocol));
@@ -252,10 +269,15 @@ export async function runMihomoIntegration(directory: string, sourceMonitor: Cla
       assert.ok(verified, verifiedState.claudeState.nodeProbeError || '未取得真实出口结果');
       assert.equal(getTargetServiceVerificationError(verified), null);
       const actualLocale = await readWindowsLocaleState();
-      runtime.winLocale = actualLocale;
+      const matchingLocale = {
+        ...actualLocale,
+        regionCode: verified.countryCode,
+        regionName: verified.countryName,
+        timeZoneId: COUNTRY_DEFAULT_WINDOWS_TZ[verified.countryCode] || actualLocale.timeZoneId,
+      };
+      runtime.winLocale = matchingLocale;
       const initialSafety = runtime.evaluateClaudeSafety();
-      assert.equal(initialSafety.safe, true,
-        `${initialSafety.reason}；GUARD_TEST_CLAUDE_PROXY 需要指向与当前系统区域一致的真实代理`);
+      assert.equal(initialSafety.safe, true, initialSafety.reason);
       assert.equal(runtime.getClaudeExpectedRegion().countryCode, verified.countryCode);
 
       const rejectedEndpoint = { ...endpoint, secret: `${secret}-invalid` };
@@ -274,17 +296,21 @@ export async function runMihomoIntegration(directory: string, sourceMonitor: Cla
 
       internal.currentEndpoint = rejectedEndpoint;
       const unavailable = await engine.probeClaudeNodeNow('控制接口故障检查', true);
-      assert.equal(unavailable.claudeState.nodeProbe, null);
+      assert.ok(unavailable.claudeState.nodeProbe);
+      assert.equal(unavailable.claudeState.nodeProbe.countryCode, verified.countryCode);
+      assert.equal(runtime.getClaudeExpectedRegion().countryCode, verified.countryCode);
+      assert.equal(runtime.evaluateClaudeSafety().alertType, 'verification-unavailable');
+      runtime.claudeNodeProbe = null;
       assert.equal(runtime.getClaudeExpectedRegion().countryCode, verified.countryCode);
       assert.equal(runtime.evaluateClaudeSafety().alertType, 'verification-unavailable');
       const otherCountry = verified.countryCode === 'JP' ? 'US' : 'JP';
       try {
-        runtime.winLocale = { ...actualLocale, regionCode: otherCountry };
+        runtime.winLocale = { ...matchingLocale, regionCode: otherCountry };
         assert.equal(runtime.evaluateClaudeSafety().alertType, 'locale-mismatch');
-        runtime.winLocale = { ...actualLocale, timeZoneId: COUNTRY_DEFAULT_WINDOWS_TZ[otherCountry] };
+        runtime.winLocale = { ...matchingLocale, timeZoneId: COUNTRY_DEFAULT_WINDOWS_TZ[otherCountry] };
         assert.equal(runtime.evaluateClaudeSafety().alertType, 'locale-mismatch');
       } finally {
-        runtime.winLocale = actualLocale;
+        runtime.winLocale = matchingLocale;
       }
       const binding = store.get();
       try {

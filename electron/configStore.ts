@@ -16,7 +16,6 @@ export const DEFAULT_CONFIG: AppConfig = {
   },
   heartbeatIntervalSec: 15,
   customProbeUrl: '',
-  alertPopupEnabled: true,
   alertSoundEnabled: true,
   alertOnDisconnect: true,
   monitorAlertEnabled: false,
@@ -155,10 +154,6 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     manualProxy: { protocol, host, port },
     heartbeatIntervalSec,
     customProbeUrl: typeof raw.customProbeUrl === 'string' ? raw.customProbeUrl.trim() : '',
-    alertPopupEnabled:
-      typeof raw.alertPopupEnabled === 'boolean'
-        ? raw.alertPopupEnabled
-        : DEFAULT_CONFIG.alertPopupEnabled,
     alertSoundEnabled:
       typeof raw.alertSoundEnabled === 'boolean'
         ? raw.alertSoundEnabled

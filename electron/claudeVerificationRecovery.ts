@@ -11,7 +11,9 @@ export class ClaudeVerificationRecovery {
 
   constructor(
     private readonly retry: () => Promise<void>,
-    private readonly expire: (failure: ClaudeVerificationFailure) => Promise<void>
+    private readonly expire: (failure: ClaudeVerificationFailure) => Promise<void>,
+    private readonly retryMs = CLAUDE_VERIFICATION_RETRY_MS,
+    private readonly deadlineMs = CLAUDE_VERIFICATION_DEADLINE_MS
   ) {}
 
   get snapshot(): ClaudeVerificationFailure | null {
@@ -26,21 +28,21 @@ export class ClaudeVerificationRecovery {
     }
 
     const startedAt = Date.now();
-    const failure = { startedAt, deadlineAt: startedAt + CLAUDE_VERIFICATION_DEADLINE_MS, reason };
+    const failure = { startedAt, deadlineAt: startedAt + this.deadlineMs, reason };
     this.failure = failure;
     this.deadlineTimer = setTimeout(() => {
       if (this.failure !== failure) return;
       const expired = { ...failure };
       this.clear();
       void this.expire(expired);
-    }, CLAUDE_VERIFICATION_DEADLINE_MS);
+    }, this.deadlineMs);
     this.retryTimer = setInterval(() => {
       if (this.failure !== failure || this.retryInProgress) return;
       this.retryInProgress = true;
       void this.retry().finally(() => {
         this.retryInProgress = false;
       });
-    }, CLAUDE_VERIFICATION_RETRY_MS);
+    }, this.retryMs);
     return true;
   }
 

@@ -321,8 +321,8 @@ async function run(): Promise<void> {
     assert.ok(ip, '真实 DoH 查询未返回 IPv4 地址');
   });
   await runMihomoIntegration(dataDirectory, monitor);
+  let verifiedClaudeProbe: ProbeResult = probe;
   await check('Claude 真实服务请求、地区判定及心跳缓存', async () => {
-    assert.ok(systemProxy.proxyUrl, '真实服务验证需要本机代理');
     const requests: string[] = [];
     const requestChannel = channel('http.client.request.start');
     const recordRequest = (message: unknown) => {
@@ -340,6 +340,11 @@ async function run(): Promise<void> {
       assert.equal(actual.googleCountryName, undefined);
       assert.equal(getTargetServiceVerificationError(actual) === null,
         actual.claudeTraceLoc === actual.countryCode);
+      verifiedClaudeProbe = {
+        ...actual,
+        countryCode: actual.claudeTraceLoc,
+        regionMismatchDetail: null,
+      };
       const cached = { ...probe };
       requests.length = 0;
       await engineInternal.verifyTargetServiceRegion(systemProxy.proxyUrl, cached, 'claude');
@@ -385,8 +390,7 @@ async function run(): Promise<void> {
       ...probe, googleCountryCode: country === 'JP' ? 'US' : 'JP',
     }, 'antigravity'));
   });
-  assert.ok(systemProxy.proxyUrl);
-  await runClaudeVerificationRecoveryTests(dataDirectory, engine, store, systemProxy.proxyUrl, probe);
+  await runClaudeVerificationRecoveryTests(dataDirectory, engine, store, verifiedClaudeProbe, probe);
   await sleep(100);
 }
 

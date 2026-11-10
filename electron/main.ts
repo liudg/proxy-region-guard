@@ -812,11 +812,7 @@ function registerIpcHandlers(): void {
     const prevCfg = configStore.get();
     let nextCfg = await probeEngine.updateConfig(partial);
 
-    if (
-      (!nextCfg.alertPopupEnabled && latestAlertPayload?.source === 'claude' &&
-        !latestAlertPayload.killedProcesses?.length && !latestAlertPayload.killError) ||
-      (!nextCfg.monitorAlertEnabled && latestAlertPayload?.source !== 'claude')
-    ) {
+    if (!nextCfg.monitorAlertEnabled && latestAlertPayload?.source !== 'claude') {
       hideAlertWindow();
     }
 
