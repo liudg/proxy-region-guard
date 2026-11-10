@@ -412,6 +412,10 @@ export function resolveWindowsTimeZoneForCountry(
   ianaZone?: string | null
 ): { windowsTimeZoneId: string; fromExactIp: boolean } {
   const upper = countryCode.trim().toUpperCase();
+  const defaultTimeZone = COUNTRY_DEFAULT_WINDOWS_TZ[upper];
+  if (!isValidIsoCountryCode(upper) || !defaultTimeZone) {
+    throw new Error(`尚未收录国家 ${upper} 的 Windows 时区映射，无法安全同步`);
+  }
   const mappedFromIana = mapIanaToWindowsTimeZone(ianaZone);
 
   if (mappedFromIana) {
@@ -426,17 +430,10 @@ export function resolveWindowsTimeZoneForCountry(
         return { windowsTimeZoneId: mappedFromIana, fromExactIp: true };
       }
       // 单一时区国家严格使用权威标准时区，确保与 isWindowsLocaleMatchingCountry 100% 一致
-    } else if (
-      upper === DEFAULT_CHINA_REGION_CODE
-        ? mappedFromIana === DEFAULT_CHINA_TIMEZONE_ID
-        : mappedFromIana !== DEFAULT_CHINA_TIMEZONE_ID
-    ) {
-      return { windowsTimeZoneId: mappedFromIana, fromExactIp: true };
     }
   }
 
-  const fallback = COUNTRY_DEFAULT_WINDOWS_TZ[upper] || 'UTC';
-  return { windowsTimeZoneId: fallback, fromExactIp: false };
+  return { windowsTimeZoneId: defaultTimeZone, fromExactIp: false };
 }
 
 export function isWindowsLocaleMatchingCountry(
@@ -445,7 +442,7 @@ export function isWindowsLocaleMatchingCountry(
   targetCountryCode: string | null | undefined
 ): boolean {
   if (!isValidIsoCountryCode(targetCountryCode)) {
-    return true;
+    return false;
   }
   const target = targetCountryCode.trim().toUpperCase();
   const curRegion = (winRegionCode || '').trim().toUpperCase();
@@ -469,10 +466,7 @@ export function isWindowsLocaleMatchingCountry(
     return curTz.toLowerCase() === expectedTz.toLowerCase();
   }
 
-  // 未在静态表中的冷门小国：只要系统区域匹配，且非中国大陆时区（避免未改时区漏网）即视为匹配
-  return target === DEFAULT_CHINA_REGION_CODE
-    ? curTz.toLowerCase() === DEFAULT_CHINA_TIMEZONE_ID.toLowerCase()
-    : curTz.toLowerCase() !== DEFAULT_CHINA_TIMEZONE_ID.toLowerCase();
+  return false;
 }
 
 export function getWindowsRegionDisplayNameZh(code: string | null | undefined): string {

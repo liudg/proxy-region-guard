@@ -231,7 +231,13 @@ export class ConfigStore {
   }
 
   public update(partial: Partial<AppConfig>): AppConfig {
-    this.config = normalizeConfig({
+    this.config = this.preview(partial);
+    this.save();
+    return this.get();
+  }
+
+  public preview(partial: Partial<AppConfig>): AppConfig {
+    return normalizeConfig({
       ...this.config,
       ...partial,
       manualProxy: {
@@ -243,9 +249,6 @@ export class ConfigStore {
           ? partial.protectedProcessPatterns
           : this.config.protectedProcessPatterns,
     });
-
-    this.save();
-    return this.get();
   }
 
   private save(): void {

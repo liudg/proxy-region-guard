@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "node scripts/dev.mjs",
     "build": "node scripts/build-electron.mjs && vite build",
+    "test": "node scripts/test.mjs",
     "start": "npm run build && node scripts/launch.mjs",
     "launch": "node scripts/launch.mjs",
     "package": "node scripts/package-release.mjs"

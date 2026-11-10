@@ -99,17 +99,21 @@ export function listRunningProcesses(forceFresh = false): Promise<RunningProcEnt
     return inflightProcListPromise;
   }
 
-  const promise = new Promise<RunningProcEntry[]>((resolve) => {
+  const promise = new Promise<RunningProcEntry[]>((resolve, reject) => {
     execFile(
       'tasklist.exe',
       ['/FO', 'CSV', '/NH'],
       { encoding: 'buffer', windowsHide: true, timeout: 3500, maxBuffer: 512 * 1024 },
       (err, stdout) => {
-        if (err && (!stdout || stdout.length === 0)) {
-          resolve([]);
+        if (err) {
+          reject(new Error(`无法枚举运行进程：${err.message}`));
           return;
         }
         const list = parseTasklistCsvOutput(stdout);
+        if (!list.some((entry) => entry.pid === process.pid)) {
+          reject(new Error('进程枚举结果不完整，无法确认关联进程已退出'));
+          return;
+        }
         cachedProcList = { entries: list, readAt: Date.now() };
         resolve(list);
       }
@@ -185,7 +189,7 @@ export async function terminateProtectedProcesses(patterns: string[]): Promise<P
     return emptyReport;
   }
 
-  const running = await listRunningProcesses();
+  const running = await listRunningProcesses(true);
   if (running.length === 0) {
     return emptyReport;
   }
@@ -222,24 +226,19 @@ export async function terminateProtectedProcesses(patterns: string[]): Promise<P
   }
 
   const targetPids = matchedEntries.map((p) => p.pid);
-  let anyError = false;
   let anyAccessDenied = false;
   const chunkSize = 40;
 
   for (let i = 0; i < targetPids.length; i += chunkSize) {
     const batch = targetPids.slice(i, i + chunkSize);
     const res = await runTaskkillTreeBatch(batch);
-    if (res.hadError) anyError = true;
     if (res.accessDenied) anyAccessDenied = true;
   }
 
-  // 若 taskkill 报错（特别是权限拒绝），二次扫描存活进程以区分“真正已杀”与“因权限存活”
-  let survivingPidSet = new Set<number>();
-  if (anyError) {
-    await sleep(60);
-    const afterRunning = await listRunningProcesses(true);
-    survivingPidSet = new Set(afterRunning.map((p) => p.pid));
-  }
+  // 每次终止后重新枚举，确认实际退出结果。
+  await sleep(60);
+  const afterRunning = await listRunningProcesses(true);
+  const survivingPidSet = new Set(afterRunning.map((p) => p.pid));
 
   const killedByName = new Map<string, number>();
   const failedByName = new Map<string, number>();
@@ -274,6 +273,22 @@ export async function terminateProtectedProcesses(patterns: string[]): Promise<P
     accessDenied: anyAccessDenied && stillAlive,
     errorDetail,
   };
+}
+
+export async function assertProcessesStopped(
+  patterns: string[],
+  report: ProcessKillReport
+): Promise<void> {
+  if (report.failedPids.length > 0) {
+    throw new Error(report.errorDetail || '关联进程未能终止，操作已取消');
+  }
+  const compiled = compileValidPatterns(patterns);
+  const remaining = (await listRunningProcesses(true)).filter((entry) =>
+    compiled.some((pattern) => pattern.regex.test(entry.imageName))
+  );
+  if (remaining.length > 0) {
+    throw new Error(`关联进程仍在运行，操作已取消：${remaining.map((p) => `${p.imageName} (${p.pid})`).join(', ')}`);
+  }
 }
 
 /**

@@ -1,0 +1,13 @@
+mixed-port: 17890
+proxies: []
+proxy-groups:
+  - name: UserProxy
+    type: select
+    proxies: [DIRECT]
+rules:
+  - PROCESS-NAME,Claude.exe,UserProxy
+  - PROCESS-NAME,Antigravity.exe,DIRECT
+  - PROCESS-NAME,language_server.exe,REJECT
+  - PROCESS-NAME,claude.exe,__guard_claude_dedicated_proxy__
+  - PROCESS-NAME,Antigravity.exe,__guard_ag_dedicated_proxy__
+  - MATCH,DIRECT

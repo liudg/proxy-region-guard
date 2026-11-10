@@ -769,7 +769,7 @@ function registerIpcHandlers(): void {
 
   ipcMain.handle('guard:update-config', async (_e, partial: Partial<AppConfig>) => {
     const prevCfg = configStore.get();
-    let nextCfg = configStore.update(partial);
+    let nextCfg = await probeEngine.updateConfig(partial);
 
     if (
       (!nextCfg.alertPopupEnabled && latestAlertPayload?.source === 'claude') ||
@@ -806,20 +806,6 @@ function registerIpcHandlers(): void {
       prevCfg.selectedClashNode !== nextCfg.selectedClashNode ||
       prevCfg.selectedClashProfileUid !== nextCfg.selectedClashProfileUid ||
       prevCfg.dedicatedProxyPort !== nextCfg.dedicatedProxyPort;
-
-    if (agChanged) {
-      await probeEngine.selectAntigravityClashNode(
-        nextCfg.antigravityClashNode,
-        nextCfg.antigravityClashProfileUid
-      );
-    }
-
-    if (claudeChanged) {
-      await probeEngine.selectClashNode(
-        nextCfg.selectedClashNode,
-        nextCfg.selectedClashProfileUid
-      );
-    }
 
     if (agChanged || claudeChanged) {
       return probeEngine.getSnapshot();

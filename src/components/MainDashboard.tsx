@@ -36,6 +36,7 @@ import {
 import { AppConfig, AppStateSnapshot } from '../shared/types';
 import { COMMON_COUNTRIES, isValidIsoCountryCode } from '../shared/countries';
 import { inspectProcessPattern } from '../shared/processPattern';
+import { getTargetServiceVerificationError } from '../shared/probeValidation';
 import {
   DEFAULT_CHINA_REGION_CODE,
   DEFAULT_CHINA_TIMEZONE_ID,
@@ -137,6 +138,7 @@ export const MainDashboard: React.FC = () => {
     antigravityState,
     logs,
   } = state;
+  const claudeVerificationError = getTargetServiceVerificationError(claudeState.nodeProbe);
 
   const displayedProxyMode = pendingManualMode ? 'manual' : config.proxyMode;
 
@@ -1061,7 +1063,7 @@ export const MainDashboard: React.FC = () => {
                       className={`check-step-card ${
                         claudeState.proxyCountryCode &&
                         config.selectedClashNode &&
-                        !claudeState.nodeProbe?.regionMismatchDetail
+                        !claudeVerificationError
                           ? 'matched'
                           : 'unmatched'
                       }`}
@@ -1070,7 +1072,7 @@ export const MainDashboard: React.FC = () => {
                         <span className="step-num">1. 指定代理出口</span>
                         {claudeState.proxyCountryCode &&
                         config.selectedClashNode &&
-                        !claudeState.nodeProbe?.regionMismatchDetail ? (
+                        !claudeVerificationError ? (
                           <CheckCircle2 size={14} className="step-icon-ok" />
                         ) : (
                           <XCircle size={14} className="step-icon-err" />
@@ -1106,6 +1108,8 @@ export const MainDashboard: React.FC = () => {
                                   .filter(Boolean)
                                   .join(' · ')}
                               </small>
+                            ) : claudeVerificationError ? (
+                              <small className="text-danger">{claudeVerificationError}</small>
                             ) : (
                               <small
                                 className="ellipsis"
@@ -1113,10 +1117,7 @@ export const MainDashboard: React.FC = () => {
                               >
                                 IP: {claudeState.nodeProbe.ip} · {claudeState.nodeProbe.latencyMs}{' '}
                                 ms
-                                {claudeState.nodeProbe.googleCountryCode ||
-                                claudeState.nodeProbe.claudeTraceLoc
-                                  ? ' · 已验真'
-                                  : ''}
+                                {' · 目标服务地区校验通过'}
                               </small>
                             )}
                           </>
@@ -1204,7 +1205,7 @@ export const MainDashboard: React.FC = () => {
                         <span>{claudeState.launchBlockReason}</span>
                       </div>
                       {claudeState.proxyCountryCode &&
-                        !claudeState.nodeProbe?.regionMismatchDetail &&
+                        !claudeVerificationError &&
                         (!claudeState.winRegionMatched ||
                           !claudeState.winTimeZoneMatched) && (
                           <button

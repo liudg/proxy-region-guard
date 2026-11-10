@@ -87,12 +87,14 @@ const GUARD_INTERNAL_PROXY_PREFIX = '__guard_';
 const AUTO_REBIND_RETRY_COOLDOWN_MS = 2500;
 const RELOAD_GRACE_WINDOW_MS = 6500;
 
-const MANAGED_PROCESS_RULE_PREFIXES = Array.from(
-  new Set([
-    ...CLAUDE_DESKTOP_PROCESS_PATTERNS.map((p) => `process-name,${p.toLowerCase()},`),
-    ...ANTIGRAVITY_PROCESS_PATTERNS.map((p) => `process-name,${p.toLowerCase()},`),
-  ])
-);
+const MANAGED_PROCESS_RULES = new Set([
+  ...CLAUDE_DESKTOP_PROCESS_PATTERNS.map(
+    (p) => `process-name,${p.toLowerCase()},${DEDICATED_PROXY_INTERNAL_NAME}`
+  ),
+  ...ANTIGRAVITY_PROCESS_PATTERNS.map(
+    (p) => `process-name,${p.toLowerCase()},${ANTIGRAVITY_PROXY_INTERNAL_NAME}`
+  ),
+]);
 
 function isVergeUiSettingsYaml(filePath: string): boolean {
   return path.basename(filePath).toLowerCase() === 'verge.yaml';
@@ -358,6 +360,9 @@ export class ClashMonitor extends EventEmitter {
         slot.desiredProfileName = resolvedMeta.profileName;
         slot.desiredNodeRaw = structuredClone(resolvedMeta.rawProxy);
         slot.desiredDialerRaw = structuredClone(resolvedMeta.dialerChain);
+      } else {
+        slot.desiredNodeRaw = null;
+        slot.desiredDialerRaw = null;
       }
     }
 
@@ -883,6 +888,7 @@ export class ClashMonitor extends EventEmitter {
         '/proxies'
       );
       const proxiesMap = proxiesRes?.proxies || {};
+      this.scanAllClashVergeProfiles(proxiesMap);
 
       const recentlyReloadedSameSig =
         this.lastConfigReloadSig === desiredSig && Date.now() - this.lastConfigReloadAt < 1800;
@@ -892,6 +898,14 @@ export class ClashMonitor extends EventEmitter {
           return !slot.boundNodeName && !proxiesMap[slot.internalProxyName];
         }
         if (forceRebind && !recentlyReloadedSameSig) return false;
+        if (
+          slot.desiredProfileUid &&
+          (slot.desiredProfileUid === '__api_active__'
+            ? !this.profileRawLookup.get('__api_active__')?.nodes.some(
+                (node) => node.name === slot.desiredNodeName
+              )
+            : !this.resolveSlotTargetNodeDefinition(slot))
+        ) return false;
         const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
         const nodeAliveInKernel = Boolean(proxiesMap[expectedInternal]);
         if (!nodeAliveInKernel) return false;
@@ -913,10 +927,6 @@ export class ClashMonitor extends EventEmitter {
         const antigravityListening = Boolean(agSlot.desiredNodeName);
         this.syncSlotInfoFields(claudeListening, antigravityListening);
         return { claudeListening, antigravityListening };
-      }
-
-      if (this.profileRawLookup.size === 0) {
-        this.scanAllClashVergeProfiles(proxiesMap);
       }
 
       const savedSelections = this.mergeSelectorSelections(
@@ -968,6 +978,9 @@ export class ClashMonitor extends EventEmitter {
           slot.desiredProfileName = resolved.profileName;
           slot.desiredNodeRaw = structuredClone(resolved.rawProxy);
           slot.desiredDialerRaw = structuredClone(resolved.dialerChain);
+        } else {
+          slot.desiredNodeRaw = null;
+          slot.desiredDialerRaw = null;
         }
 
         const profHosts = resolved?.hosts || {};
@@ -1014,11 +1027,18 @@ export class ClashMonitor extends EventEmitter {
           }
           existingProxies.push(injectedNode);
           targetProxy = slot.internalProxyName;
-        } else if (proxiesMap[slot.desiredNodeName]) {
+        } else if (
+          (!slot.desiredProfileUid ||
+            (slot.desiredProfileUid === '__api_active__' &&
+              this.profileRawLookup.get('__api_active__')?.nodes.some(
+                (node) => node.name === slot.desiredNodeName
+              ))) &&
+          proxiesMap[slot.desiredNodeName]
+        ) {
           shouldBind = true;
           targetProxy = slot.desiredNodeName;
         } else {
-          slotOutcome[slot.id].error = `在所有 Clash 订阅组中均未找到节点 "${slot.desiredNodeName}"，请重新选择`;
+          slotOutcome[slot.id].error = `指定订阅或节点 "${slot.desiredNodeName}" 不存在，请重新选择`;
         }
 
         if (shouldBind) {
@@ -1168,9 +1188,10 @@ export class ClashMonitor extends EventEmitter {
     if (!nodeName) return null;
     const preferredProfileUid = slot.desiredProfileUid;
 
-    // 1. 优先从用户指定的订阅组 UID 中精确匹配
-    if (preferredProfileUid && this.profileRawLookup.has(preferredProfileUid)) {
-      const targetProf = this.profileRawLookup.get(preferredProfileUid)!;
+    // 指定订阅时仅允许使用该订阅内的节点定义。
+    if (preferredProfileUid) {
+      const targetProf = this.profileRawLookup.get(preferredProfileUid);
+      if (!targetProf) return null;
       const raw = targetProf.rawMap.get(nodeName);
       if (raw) {
         return {
@@ -1182,6 +1203,7 @@ export class ClashMonitor extends EventEmitter {
           nameserverPolicy: structuredClone(targetProf.nameserverPolicy),
         };
       }
+      return null;
     }
 
     // 2. 其次在当前激活的订阅组中查找同名节点
@@ -1212,21 +1234,6 @@ export class ClashMonitor extends EventEmitter {
           nameserverPolicy: structuredClone(prof.nameserverPolicy),
         };
       }
-    }
-
-    // 4. 兜底使用该通道槽位已持久化的缓存节点定义
-    if (slot.desiredNodeRaw) {
-      const fallbackProf = preferredProfileUid
-        ? this.profileRawLookup.get(preferredProfileUid)
-        : undefined;
-      return {
-        profileUid: slot.desiredProfileUid,
-        profileName: slot.desiredProfileName,
-        rawProxy: structuredClone(slot.desiredNodeRaw),
-        dialerChain: slot.desiredDialerRaw ? structuredClone(slot.desiredDialerRaw) : [],
-        hosts: fallbackProf ? { ...fallbackProf.hosts } : {},
-        nameserverPolicy: fallbackProf ? structuredClone(fallbackProf.nameserverPolicy) : {},
-      };
     }
 
     return null;
@@ -1403,7 +1410,7 @@ export class ClashMonitor extends EventEmitter {
       doc['rules'] = (doc['rules'] as unknown[]).filter((r) => {
         if (typeof r !== 'string') return false;
         const lower = r.toLowerCase();
-        return !MANAGED_PROCESS_RULE_PREFIXES.some((prefix) => lower.startsWith(prefix));
+        return !MANAGED_PROCESS_RULES.has(lower);
       });
     }
 
