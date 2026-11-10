@@ -19,7 +19,7 @@ export interface AppConfig {
   };
   heartbeatIntervalSec: number; // 0 = 仅事件触发, >0 = 心跳秒数
   customProbeUrl: string;
-  alertPopupEnabled: boolean;   // Claude 专栏异常拦截/强杀置顶弹窗开关
+  alertPopupEnabled: boolean;   // Claude 弹窗设置，保护终止提醒始终显示
   alertSoundEnabled: boolean;   // 全局警告弹窗提示音开关
   alertOnDisconnect: boolean;   // 实时监控代理断连/超时弹窗报警子开关
   monitorAlertEnabled: boolean; // 实时监控（含联动进程强杀）异常弹窗告警总开关
@@ -80,6 +80,7 @@ export interface ClashProfileGroupOption {
 
 export interface ClashRuntimeInfo {
   connected: boolean;
+  bindingVerificationError: string | null; // 非空表示尚无法确认专属绑定，不能据此判定绑定失效
   source: string;         // 例如: "Clash Verge (Pipe)" 或 "Clash (127.0.0.1:9097)"
   mode: string;           // rule / global / direct
   mixedPort: number | null;
@@ -109,12 +110,20 @@ export interface ProbeResult {
   viaChannel: string;     // 本次检测实际使用的通道说明
   latencyMs: number;
   checkedAt: number;
-  // 目标服务真实地区校验（仅在切换代理、手动校验或启动前低频触发）
+  // 目标服务地区校验，包含启动检查、心跳和运行期复核
   googleCountryCode?: string;     // Google GFE 内部识别的国家/地区代码，如 "JP" / "CN" / "HK"
   googleCountryName?: string;     // Google 识别地区中文名
   claudeTraceLoc?: string;        // claude.ai/cdn-cgi/trace 边缘识别的国家代码
   claudeTraceIp?: string;         // claude.ai 看到的实际出口 IP
+  claudeTraceError?: string;      // Claude 请求或地区解析失败的具体原因
+  claudeTraceCheckedAt?: number;  // 实际取得 Claude 地区结果的时间
   regionMismatchDetail?: string | null; // 当发现送中/假地区或分流不一致时的详细告警说明
+}
+
+export interface ClaudeVerificationFailure {
+  startedAt: number;
+  deadlineAt: number;
+  reason: string;
 }
 
 export interface ClaudeRuntimeState {
@@ -133,6 +142,8 @@ export interface ClaudeRuntimeState {
   isProbingNode: boolean;         // 是否正在独立探测所选节点的出口信息
   nodeProbe: ProbeResult | null;  // 所选节点的独立出口 IP 与国家（与实时监控解耦）
   nodeProbeError: string | null;  // 节点独立探测失败提示
+  verificationFailure: ClaudeVerificationFailure | null;
+  lastVerificationSuccessAt: number | null;
 }
 
 export interface AntigravityRuntimeState {
@@ -159,7 +170,7 @@ export interface GuardEventLog {
 
 export interface AlertPayload {
   source?: 'claude' | 'monitor';
-  alertType: 'mismatch' | 'disconnect' | 'locale-mismatch' | 'unauthorized-launch' | 'recovered';
+  alertType: 'mismatch' | 'disconnect' | 'locale-mismatch' | 'unauthorized-launch' | 'verification-unavailable' | 'recovered';
   expectedCode: string | null;
   expectedName: string | null;
   actualCode: string | null;

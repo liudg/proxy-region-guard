@@ -11,6 +11,9 @@ import { GeoIpService } from '../electron/geoipService';
 import { ProbeEngine } from '../electron/probeEngine';
 import { AppStateSnapshot } from '../src/shared/types';
 import { readWindowsLocaleState } from '../electron/winSystemLocale';
+import { readWindowsSystemProxy } from '../electron/systemProxy';
+import { getTargetServiceVerificationError } from '../src/shared/probeValidation';
+import { COUNTRY_DEFAULT_WINDOWS_TZ } from '../src/shared/timezones';
 
 const yaml = require('js-yaml');
 
@@ -230,6 +233,89 @@ export async function runMihomoIntegration(directory: string, sourceMonitor: Cla
       assert.equal(monitor.getRuntimeInfo().antigravityPortListening, false);
       assert.equal(store.get().antigravityClashNode, null);
       console.log('通过：真实节点配置变更使等待中的旧探测重试失效');
+
+      const systemProxy = await readWindowsSystemProxy();
+      const verificationProxy = process.env.GUARD_TEST_CLAUDE_PROXY || systemProxy.proxyUrl;
+      assert.ok(verificationProxy, 'Claude 安全检查需要可用的代理');
+      const upstream = new URL(verificationProxy);
+      assert.ok(['http:', 'socks5:', 'socks5h:'].includes(upstream.protocol));
+      const upstreamName = '运行期检查专用通道';
+      const upstreamProxy = {
+        name: upstreamName, type: upstream.protocol === 'http:' ? 'http' : 'socks5',
+        server: upstream.hostname, port: Number(upstream.port),
+        ...(upstream.username ? { username: decodeURIComponent(upstream.username) } : {}),
+        ...(upstream.password ? { password: decodeURIComponent(upstream.password) } : {}),
+      };
+      writeProvider([...proxies, upstreamProxy]);
+      const verifiedState = await engine.selectClashNode(upstreamName, node.profileUid);
+      const verified = verifiedState.claudeState.nodeProbe;
+      assert.ok(verified, verifiedState.claudeState.nodeProbeError || '未取得真实出口结果');
+      assert.equal(getTargetServiceVerificationError(verified), null);
+      const actualLocale = await readWindowsLocaleState();
+      runtime.winLocale = actualLocale;
+      const initialSafety = runtime.evaluateClaudeSafety();
+      assert.equal(initialSafety.safe, true,
+        `${initialSafety.reason}；GUARD_TEST_CLAUDE_PROXY 需要指向与当前系统区域一致的真实代理`);
+      assert.equal(runtime.getClaudeExpectedRegion().countryCode, verified.countryCode);
+
+      const rejectedEndpoint = { ...endpoint, secret: `${secret}-invalid` };
+      internal.currentEndpoint = rejectedEndpoint;
+      internal.rebindGraceUntil = 0;
+      await internal.tick();
+      monitor.stop();
+      assert.equal(monitor.getRuntimeInfo().connected, false);
+      assert.match(monitor.getRuntimeInfo().bindingVerificationError || '', /401/);
+      const stillReachable = await runtime.probeOnceViaChannel(
+        `http://127.0.0.1:${firstPort}`, '控制接口故障期间出口检查', 5800
+      );
+      assert.ok(stillReachable.result, stillReachable.errMsg);
+      assert.equal(runtime.evaluateClaudeSafety().alertType, 'verification-unavailable');
+      console.log('通过：真实控制接口返回 401 且代理出口仍可达时，ProbeEngine 判定为等待复核');
+
+      internal.currentEndpoint = rejectedEndpoint;
+      const unavailable = await engine.probeClaudeNodeNow('控制接口故障检查', true);
+      assert.equal(unavailable.claudeState.nodeProbe, null);
+      assert.equal(runtime.getClaudeExpectedRegion().countryCode, verified.countryCode);
+      assert.equal(runtime.evaluateClaudeSafety().alertType, 'verification-unavailable');
+      const otherCountry = verified.countryCode === 'JP' ? 'US' : 'JP';
+      try {
+        runtime.winLocale = { ...actualLocale, regionCode: otherCountry };
+        assert.equal(runtime.evaluateClaudeSafety().alertType, 'locale-mismatch');
+        runtime.winLocale = { ...actualLocale, timeZoneId: COUNTRY_DEFAULT_WINDOWS_TZ[otherCountry] };
+        assert.equal(runtime.evaluateClaudeSafety().alertType, 'locale-mismatch');
+      } finally {
+        runtime.winLocale = actualLocale;
+      }
+      const binding = store.get();
+      try {
+        for (const change of [
+          { selectedClashNode: `${upstreamName}-changed` },
+          { selectedClashProfileUid: `${node.profileUid}-changed` },
+          { dedicatedProxyPort: secondPort },
+        ]) {
+          store.update(change);
+          assert.equal(runtime.getClaudeExpectedRegion(), null);
+          store.update(binding);
+        }
+      } finally {
+        store.update(binding);
+      }
+      console.log('通过：真实检测失败保留同一绑定的地区基准，冲突区域及时区输入均立即判定为冲突');
+
+      internal.currentEndpoint = endpoint;
+      const restored = await engine.probeClaudeNodeNow('控制接口恢复后的手动检查', true);
+      assert.equal(monitor.getRuntimeInfo().bindingVerificationError, null);
+      assert.ok(restored.claudeState.nodeProbe);
+      assert.equal(getTargetServiceVerificationError(restored.claudeState.nodeProbe), null);
+      assert.equal(runtime.evaluateClaudeSafety().safe, true);
+      writeProvider(proxies);
+      const removedBinding = await monitor.configureDedicatedNode(upstreamName, firstPort, node.profileUid, true);
+      assert.equal(removedBinding.listening, false);
+      assert.equal(monitor.getRuntimeInfo().bindingVerificationError, null);
+      assert.equal(runtime.evaluateClaudeSafety().alertType, 'disconnect');
+      await engine.selectClashNode(null);
+      assert.equal(runtime.getClaudeExpectedRegion(), null);
+      console.log('通过：实际恢复绑定后校验通过，确认节点缺失时判定绑定失效，取消绑定后清除地区基准');
     } finally {
       engine.stop();
       store.update(previous);

@@ -1374,7 +1374,9 @@ export const MainDashboard: React.FC = () => {
                 {/* 2. Claude 唯一启动入口 & 三重一致性校验主控卡 */}
                 <section
                   className={`hero-card claude-hero-card ${
-                    claudeState.running || claudeState.canLaunch
+                    claudeState.verificationFailure
+                      ? 'status-checking'
+                      : claudeState.running || claudeState.canLaunch
                       ? 'status-ok'
                       : claudeState.isProbingNode &&
                         !claudeState.nodeProbe &&
@@ -1386,7 +1388,9 @@ export const MainDashboard: React.FC = () => {
                   <div className="hero-top-row">
                     <div
                       className={`status-pill ${
-                        claudeState.running || claudeState.canLaunch
+                        claudeState.verificationFailure
+                          ? 'status-checking'
+                          : claudeState.running || claudeState.canLaunch
                           ? 'status-ok'
                           : claudeState.isProbingNode &&
                             !claudeState.nodeProbe &&
@@ -1395,7 +1399,12 @@ export const MainDashboard: React.FC = () => {
                           : 'status-mismatch'
                       }`}
                     >
-                      {claudeState.running ? (
+                      {claudeState.verificationFailure ? (
+                        <>
+                          <Clock size={17} />
+                          <span>地区校验暂时不可用 · 后台复核中</span>
+                        </>
+                      ) : claudeState.running ? (
                         <>
                           <ShieldCheck size={17} />
                           <span>
@@ -1440,6 +1449,20 @@ export const MainDashboard: React.FC = () => {
                     </button>
                   </div>
 
+                  {claudeState.verificationFailure && (
+                    <div className="claude-verification-notice">
+                      <p>{claudeState.verificationFailure.reason}</p>
+                      <p>
+                        首次失败 {formatTime(claudeState.verificationFailure.startedAt)} ·
+                        持续至 {formatTime(claudeState.verificationFailure.deadlineAt)} 仍未恢复将终止 Claude 并提醒。
+                      </p>
+                      <p>
+                        最后成功校验：{claudeState.lastVerificationSuccessAt
+                          ? formatTime(claudeState.lastVerificationSuccessAt) : '暂无成功记录'}
+                      </p>
+                    </div>
+                  )}
+
                   {/* 三重一致性对比矩阵：指定代理出口 vs 系统区域 vs 系统时区 */}
                   <div className="three-way-check-grid">
                     <div
@@ -1476,20 +1499,7 @@ export const MainDashboard: React.FC = () => {
                                 title={claudeState.nodeProbe.regionMismatchDetail}
                               >
                                 ⚠️ 实际识别:{' '}
-                                {[
-                                  claudeState.nodeProbe.googleCountryCode &&
-                                  claudeState.nodeProbe.googleCountryCode !==
-                                    claudeState.proxyCountryCode
-                                    ? `Google=${claudeState.nodeProbe.googleCountryName}(${claudeState.nodeProbe.googleCountryCode})`
-                                    : null,
-                                  claudeState.nodeProbe.claudeTraceLoc &&
-                                  claudeState.nodeProbe.claudeTraceLoc !==
-                                    claudeState.proxyCountryCode
-                                    ? `Claude=${claudeState.nodeProbe.claudeTraceLoc}`
-                                    : null,
-                                ]
-                                  .filter(Boolean)
-                                  .join(' · ')}
+                                Claude={claudeState.nodeProbe.claudeTraceLoc}
                               </small>
                             ) : claudeVerificationError ? (
                               <small className="text-danger">{claudeVerificationError}</small>
@@ -1783,22 +1793,11 @@ export const MainDashboard: React.FC = () => {
 
                       <div className="setting-row">
                         <div>
-                          <strong>Claude 异常拦截弹窗提醒</strong>
+                          <strong>Claude 保护终止提醒</strong>
                           <p>
-                            外部启动被拦截或运行期环境异常触发强杀时，在屏幕右下角弹出置顶提醒
+                            保护措施终止 Claude 时始终弹窗。请求暂时失败期间静默复核，持续 30 秒未恢复时终止并提醒。
                           </p>
                         </div>
-                        <input
-                          type="checkbox"
-                          className="toggle-switch"
-                          checked={config.alertPopupEnabled}
-                          onChange={(e) =>
-                            void updateConfigSafe(
-                              { alertPopupEnabled: e.target.checked },
-                              'claude'
-                            )
-                          }
-                        />
                       </div>
 
                       <div className="claude-exe-path-box">

@@ -239,6 +239,7 @@ export class ClashMonitor extends EventEmitter {
 
   private info: ClashRuntimeInfo = {
     connected: false,
+    bindingVerificationError: '尚未连接到 Clash 控制接口',
     source: '未连接',
     mode: 'unknown',
     mixedPort: null,
@@ -406,7 +407,7 @@ export class ClashMonitor extends EventEmitter {
       if (channelId === 'claude') {
         this.rebindGraceUntil = 0;
       }
-      this.syncSlotInfoFields(false, false);
+      this.syncSlotInfoFields(false, false, '未检测到运行中的 Clash Verge / Mihomo 控制接口');
       this.emit('clash-status-updated');
       if (!slot.desiredNodeName) {
         return { ok: true, listening: false };
@@ -475,9 +476,14 @@ export class ClashMonitor extends EventEmitter {
     );
   }
 
-  private syncSlotInfoFields(claudeListening: boolean, antigravityListening: boolean): void {
+  private syncSlotInfoFields(
+    claudeListening: boolean,
+    antigravityListening: boolean,
+    bindingVerificationError: string | null = null
+  ): void {
     const claude = this.slots.claude;
     const ag = this.slots.antigravity;
+    this.info.bindingVerificationError = bindingVerificationError;
 
     if (this.currentEndpoint && (claudeListening || antigravityListening)) {
       this.info.connected = true;
@@ -620,6 +626,7 @@ export class ClashMonitor extends EventEmitter {
         let claudeListening = false;
         let antigravityListening = false;
         let needsSync = false;
+        let bindingVerificationError: string | null = null;
 
         for (const slot of [claudeSlot, agSlot]) {
           if (!slot.desiredNodeName) {
@@ -678,6 +685,7 @@ export class ClashMonitor extends EventEmitter {
               );
             }
             const syncRes = await this.queueSyncDedicatedListeners(false);
+            bindingVerificationError = syncRes.generalError || null;
             claudeListening = syncRes.claudeListening;
             antigravityListening = syncRes.antigravityListening;
 
@@ -727,9 +735,11 @@ export class ClashMonitor extends EventEmitter {
             claudeListening = true;
             fastRetryMs = 450;
           }
+          if (inCooldown) bindingVerificationError = this.info.bindingVerificationError;
         }
 
         const prevConnected = this.info.connected;
+        const prevBindingError = this.info.bindingVerificationError;
         const prevMode = this.info.mode;
         const prevNode = this.info.activeNode;
         const prevChainKey = this.info.nodeChain.join(' > ');
@@ -745,6 +755,7 @@ export class ClashMonitor extends EventEmitter {
         this.lastProfilesSignature = nextProfilesSig;
         this.info = {
           connected: true,
+          bindingVerificationError,
           source: this.currentEndpoint.label,
           mode,
           mixedPort,
@@ -810,6 +821,7 @@ export class ClashMonitor extends EventEmitter {
           }
           this.emit('clash-change', 'Clash 策略组节点切换');
         } else if (
+          prevBindingError !== bindingVerificationError ||
           prevAvailCount !== profilesScan.availableNodes.length ||
           prevProfilesSig !== nextProfilesSig ||
           prevActiveProfileUid !== profilesScan.activeProfileUid ||
@@ -820,7 +832,8 @@ export class ClashMonitor extends EventEmitter {
         ) {
           this.emit('clash-status-updated');
         }
-      } catch {
+      } catch (error) {
+        this.info.bindingVerificationError = `Clash 控制接口请求失败：${error instanceof Error ? error.message : String(error)}`;
         this.currentEndpoint = null;
         this.refreshOfflineProfilesState({});
         if (this.info.connected) {
@@ -833,8 +846,8 @@ export class ClashMonitor extends EventEmitter {
             fastRetryMs = 400;
             return;
           }
-          this.resetDisconnectedState();
-          this.emit('clash-change', 'Clash 内核已关闭或重启');
+          this.resetDisconnectedState(this.info.bindingVerificationError);
+          this.emit('clash-change', 'Clash 控制接口暂时不可用');
         }
       }
     } finally {
@@ -896,6 +909,7 @@ export class ClashMonitor extends EventEmitter {
     const agSlot = this.slots.antigravity;
 
     if (!this.currentEndpoint) {
+      this.info.bindingVerificationError = '尚未连接到 Clash 控制接口，无法确认专属节点绑定状态';
       const claudeAlive = claudeSlot.desiredNodeName
         ? await isLocalPortListening(claudeSlot.desiredPort)
         : false;
@@ -918,6 +932,7 @@ export class ClashMonitor extends EventEmitter {
     try {
       const yamlPath = this.findActiveClashYamlFile();
       if (!yamlPath) {
+        this.info.bindingVerificationError = '未找到 Clash 运行时配置文件，无法确认专属节点绑定状态';
         return {
           claudeListening: false,
           antigravityListening: false,
@@ -986,6 +1001,7 @@ export class ClashMonitor extends EventEmitter {
 
       const doc = this.loadAndPrepareCoreYaml(yamlPath, portsToStrip);
       if (!doc) {
+        this.info.bindingVerificationError = `配置文件无效，无法确认专属节点绑定状态：${path.basename(yamlPath)}`;
         return {
           claudeListening: false,
           antigravityListening: false,
@@ -1199,6 +1215,7 @@ export class ClashMonitor extends EventEmitter {
       };
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
+      this.info.bindingVerificationError = `绑定 Clash 专属节点失败: ${msg}`;
       return {
         claudeListening: false,
         antigravityListening: false,
@@ -2096,7 +2113,7 @@ export class ClashMonitor extends EventEmitter {
     return null;
   }
 
-  private resetDisconnectedState(): void {
+  private resetDisconnectedState(reason = 'Clash 控制接口暂时不可用，无法确认专属节点绑定状态'): void {
     this.lastGroupsSignature = '';
     for (const slot of [this.slots.claude, this.slots.antigravity]) {
       slot.boundNodeName = null;
@@ -2105,6 +2122,7 @@ export class ClashMonitor extends EventEmitter {
     }
     this.info = {
       connected: false,
+      bindingVerificationError: reason,
       source: '未连接',
       mode: 'unknown',
       mixedPort: null,

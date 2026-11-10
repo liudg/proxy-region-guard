@@ -4,12 +4,20 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import electron from 'electron';
+import { build as buildRenderer } from 'vite';
 
 const directory = await mkdtemp(path.join(tmpdir(), 'guard-regression-'));
 try {
+  const rendererDirectory = path.join(directory, 'renderer');
+  const preloadFile = path.join(directory, 'preload.js');
+  await build({
+    entryPoints: ['electron/preload.ts'], outfile: preloadFile,
+    bundle: true, platform: 'node', target: 'node20', format: 'cjs', external: ['electron'],
+  });
+  await buildRenderer({ build: { outDir: rendererDirectory, emptyOutDir: true } });
   const output = path.join(directory, 'regression.cjs');
   await build({
-    entryPoints: ['tests/regression.ts'],
+    entryPoints: [process.argv[2] || 'tests/regression.ts'],
     outfile: output,
     bundle: true,
     platform: 'node',
@@ -20,6 +28,8 @@ try {
     ...process.env,
     GUARD_TEST_NODE: process.execPath,
     GUARD_TEST_DATA: path.join(directory, 'user-data'),
+    GUARD_TEST_PRELOAD: preloadFile,
+    GUARD_TEST_RENDERER: path.join(rendererDirectory, 'index.html'),
   };
   delete env.ELECTRON_RUN_AS_NODE;
   const child = spawn(electron, [output], { stdio: 'inherit', env, windowsHide: true });

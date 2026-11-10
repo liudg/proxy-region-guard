@@ -273,6 +273,7 @@ function resizeAlertWindow(win: BrowserWindow, width: number, height: number): v
 }
 
 function computeAlertWindowHeight(payload: AlertPayload): number {
+  if (payload.source === 'claude') return 420;
   const hasKilled = Boolean(payload.killedProcesses && payload.killedProcesses.length > 0);
   const hasErr = Boolean(payload.killError);
   if (hasKilled && hasErr) return 356;
@@ -785,7 +786,8 @@ function registerIpcHandlers(): void {
     let nextCfg = await probeEngine.updateConfig(partial);
 
     if (
-      (!nextCfg.alertPopupEnabled && latestAlertPayload?.source === 'claude') ||
+      (!nextCfg.alertPopupEnabled && latestAlertPayload?.source === 'claude' &&
+        !latestAlertPayload.killedProcesses?.length && !latestAlertPayload.killError) ||
       (!nextCfg.monitorAlertEnabled && latestAlertPayload?.source !== 'claude')
     ) {
       hideAlertWindow();

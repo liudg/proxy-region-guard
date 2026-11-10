@@ -4,6 +4,8 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { channel } from 'node:diagnostics_channel';
+import { ClientRequest } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ConfigStore } from '../electron/configStore';
 import { buildProfilesSignature, ClashMonitor } from '../electron/clashMonitor';
@@ -27,10 +29,11 @@ import {
   inferNodeCountryCode,
   matchesNodeSearchToken,
 } from '../src/shared/countries';
-import { ClashProfileGroupOption, ProbeResult } from '../src/shared/types';
+import { AppStateSnapshot, ClashProfileGroupOption, ProbeResult } from '../src/shared/types';
 import { createStatusTrayIcon, createWindowAppIcon } from '../electron/trayIcon';
 import { countRunningClaudeProcesses } from '../electron/claudeController';
 import { runMihomoIntegration } from './mihomoIntegration';
+import { runClaudeVerificationRecoveryTests } from './claudeVerificationRecovery';
 
 assert.ok(process.env.GUARD_TEST_DATA);
 const dataDirectory = process.env.GUARD_TEST_DATA;
@@ -281,14 +284,31 @@ async function run(): Promise<void> {
   await geo.init(process.cwd());
   const systemProxy = await readWindowsSystemProxy();
   const detected = await engineInternal.probeOnceViaChannel(systemProxy.proxyUrl, '回归验证', 2500);
-  assert.ok(detected.result, '真实出口检测失败，无法继续网络集成验证');
+  assert.ok(detected.result, `真实出口检测失败：${detected.errMsg}`);
   const probe: ProbeResult = detected.result;
   await check('真实出口状态在手动重算和网络检测入口保持一致', async () => {
     const previous = store.get();
     const actualLocale = await readWindowsLocaleState();
     engineInternal.winLocale = actualLocale;
     store.update({ defaultCountryCode: probe.countryCode, protectedProcessPatterns: [] });
-    const networkState = await engine.checkNow('回归验证');
+    let networkState = await engine.checkNow('回归验证');
+    if (networkState.isChecking) {
+      networkState = await new Promise<AppStateSnapshot>((resolve, reject) => {
+        const timeout = setTimeout(() => {
+          engine.off('state-changed', onState);
+          reject(new Error('真实出口检测在 90 秒内未完成'));
+        }, 90000);
+        const onState = (state: AppStateSnapshot) => {
+          if (state.isChecking) return;
+          clearTimeout(timeout);
+          engine.off('state-changed', onState);
+          resolve(state);
+        };
+        engine.on('state-changed', onState);
+        onState(engine.getSnapshot());
+      });
+    }
+    assert.ok(networkState.lastProbe, networkState.lastError || '真实出口检测未返回结果');
     const recalculated = engine.evaluateStatusOnly('回归验证');
     assert.equal(recalculated.status, networkState.status);
     store.update({ defaultCountryCode: networkState.lastProbe!.countryCode === 'JP' ? 'US' : 'JP' });
@@ -301,9 +321,40 @@ async function run(): Promise<void> {
     assert.ok(ip, '真实 DoH 查询未返回 IPv4 地址');
   });
   await runMihomoIntegration(dataDirectory, monitor);
+  await check('Claude 真实服务请求、地区判定及心跳缓存', async () => {
+    assert.ok(systemProxy.proxyUrl, '真实服务验证需要本机代理');
+    const requests: string[] = [];
+    const requestChannel = channel('http.client.request.start');
+    const recordRequest = (message: unknown) => {
+      const request = (message as { request: ClientRequest }).request;
+      requests.push(`${request.getHeader('host')}${request.path}`);
+    };
+    requestChannel.subscribe(recordRequest);
+    try {
+      const actual = { ...probe };
+      await engineInternal.verifyTargetServiceRegion(systemProxy.proxyUrl, actual, 'claude', true);
+      assert.ok(actual.claudeTraceLoc, 'Claude 真实服务未返回有效地区');
+      assert.ok(requests.some((url) => url === 'claude.ai/cdn-cgi/trace'));
+      assert.ok(requests.every((url) => url.startsWith('claude.ai/')), requests.join(', '));
+      assert.equal(actual.googleCountryCode, undefined);
+      assert.equal(actual.googleCountryName, undefined);
+      assert.equal(getTargetServiceVerificationError(actual) === null,
+        actual.claudeTraceLoc === actual.countryCode);
+      const cached = { ...probe };
+      requests.length = 0;
+      await engineInternal.verifyTargetServiceRegion(systemProxy.proxyUrl, cached, 'claude');
+      assert.equal(requests.length, 0);
+      assert.equal(cached.claudeTraceLoc, actual.claudeTraceLoc);
+      assert.equal(cached.regionMismatchDetail, actual.regionMismatchDetail);
+    } finally {
+      requestChannel.unsubscribe(recordRequest);
+      engineInternal.targetVerifyCache.clear();
+    }
+  });
   await check('真实连接失败阻止目标服务验证通过', async () => {
     await engineInternal.verifyTargetServiceRegion('http://127.0.0.1:1', probe, 'claude', true);
-    assert.match(getTargetServiceVerificationError(probe) || '', /Google、Claude/);
+    assert.match(getTargetServiceVerificationError(probe) || '', /claude\.ai\/cdn-cgi\/trace/);
+    assert.ok(probe.claudeTraceError);
     assert.equal(engineInternal.targetVerifyCache.size, 0);
   });
   await check('重新验证失败清除已有的目标服务结果', async () => {
@@ -313,19 +364,29 @@ async function run(): Promise<void> {
     await engineInternal.verifyTargetServiceRegion('http://127.0.0.1:1', previous, 'claude', true);
     assert.equal(previous.googleCountryCode, undefined);
     assert.equal(previous.claudeTraceLoc, undefined);
-    assert.match(getTargetServiceVerificationError(previous) || '', /Google、Claude/);
+    assert.match(getTargetServiceVerificationError(previous) || '', /claude\.ai\/cdn-cgi\/trace/);
   });
-  await check('缺失任意目标服务结果均阻止验证通过', () => {
+  await check('各应用按对应目标服务判定缺失和地区冲突', () => {
     const country = probe.countryCode;
     assert.ok(getTargetServiceVerificationError({ ...probe, googleCountryCode: country }));
-    assert.ok(getTargetServiceVerificationError({ ...probe, claudeTraceLoc: country }));
+    assert.equal(getTargetServiceVerificationError({ ...probe, claudeTraceLoc: country }), null);
     assert.equal(getTargetServiceVerificationError({
       ...probe, googleCountryCode: country, claudeTraceLoc: country,
     }), null);
     assert.ok(getTargetServiceVerificationError({
       ...probe, googleCountryCode: country, claudeTraceLoc: country === 'JP' ? 'US' : 'JP',
     }));
+    assert.equal(getTargetServiceVerificationError({
+      ...probe, googleCountryCode: country === 'JP' ? 'US' : 'JP', claudeTraceLoc: country,
+    }), null);
+    assert.equal(getTargetServiceVerificationError({ ...probe, googleCountryCode: country }, 'antigravity'), null);
+    assert.ok(getTargetServiceVerificationError({ ...probe, claudeTraceLoc: country }, 'antigravity'));
+    assert.ok(getTargetServiceVerificationError({
+      ...probe, googleCountryCode: country === 'JP' ? 'US' : 'JP',
+    }, 'antigravity'));
   });
+  assert.ok(systemProxy.proxyUrl);
+  await runClaudeVerificationRecoveryTests(dataDirectory, engine, store, systemProxy.proxyUrl, probe);
   await sleep(100);
 }
 

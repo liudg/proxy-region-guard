@@ -104,12 +104,13 @@ export const AlertPopup: React.FC = () => {
 
   const isRecovered = payload.alertType === 'recovered';
   const isDisconnect = payload.alertType === 'disconnect';
+  const isVerificationUnavailable = payload.alertType === 'verification-unavailable';
   const isLocaleMismatch = payload.alertType === 'locale-mismatch';
   const isUnauthorizedLaunch = payload.alertType === 'unauthorized-launch';
 
   const cardClass = isRecovered
     ? 'alert-recovered'
-    : isDisconnect
+    : isDisconnect || isVerificationUnavailable
     ? 'alert-disconnect'
     : 'alert-mismatch';
 
@@ -117,6 +118,8 @@ export const AlertPopup: React.FC = () => {
     ? '代理与时区已恢复正常'
     : isUnauthorizedLaunch
     ? '已拦截外部启动 Claude！'
+    : isVerificationUnavailable
+    ? 'Claude 地区校验持续失败'
     : isDisconnect
     ? '代理连接异常断开警告'
     : isLocaleMismatch
@@ -154,7 +157,12 @@ export const AlertPopup: React.FC = () => {
 
       {/* 核心地区对比区 */}
       <div className="alert-body">
-        {isUnauthorizedLaunch ? (
+        {isVerificationUnavailable ? (
+          <div className="alert-disconnect-box">
+            <strong>持续 30 秒无法完成地区校验</strong>
+            <div className="disconnect-err-msg">已执行 Claude 保护终止，处理结果如下。</div>
+          </div>
+        ) : isUnauthorizedLaunch ? (
           <div className="alert-disconnect-box">
             <div className="disconnect-expect-line">
               <span>安全规则：</span>
@@ -243,7 +251,7 @@ export const AlertPopup: React.FC = () => {
         {payload.killedProcesses && payload.killedProcesses.length > 0 && (
           <div className="alert-killed-banner">
             <Skull size={14} />
-            <span className="ellipsis" title={payload.killedProcesses.join(', ')}>
+            <span className="alert-detail" title={payload.killedProcesses.join(', ')}>
               已强杀进程树：{payload.killedProcesses.join(', ')}
             </span>
           </div>
@@ -252,7 +260,7 @@ export const AlertPopup: React.FC = () => {
         {payload.killError && (
           <div className="alert-kill-error">
             <AlertTriangle size={13} />
-            <span className="ellipsis" title={payload.killError}>
+            <span className="alert-detail" title={payload.killError}>
               {payload.killError}
             </span>
           </div>
@@ -272,7 +280,7 @@ export const AlertPopup: React.FC = () => {
           )}
           <div className="alert-meta-item">
             <span className="meta-k">触发原因：</span>
-            <span className="meta-v ellipsis" title={payload.triggerReason}>
+            <span className="meta-v alert-detail" title={payload.triggerReason}>
               {payload.activeNode ? `[${payload.activeNode}] · ` : ''}
               {payload.triggerReason}
             </span>
