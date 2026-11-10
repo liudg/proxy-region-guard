@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { ConfigStore } from '../electron/configStore';
-import { ClashMonitor } from '../electron/clashMonitor';
+import { buildProfilesSignature, ClashMonitor } from '../electron/clashMonitor';
 import { GeoIpService } from '../electron/geoipService';
 import { ProbeEngine } from '../electron/probeEngine';
 import {
@@ -25,8 +25,9 @@ import {
 import {
   buildNodeSearchText,
   inferNodeCountryCode,
+  matchesNodeSearchToken,
 } from '../src/shared/countries';
-import { ProbeResult } from '../src/shared/types';
+import { ClashProfileGroupOption, ProbeResult } from '../src/shared/types';
 import { createStatusTrayIcon, createWindowAppIcon } from '../electron/trayIcon';
 import { countRunningClaudeProcesses } from '../electron/claudeController';
 import { runMihomoIntegration } from './mihomoIntegration';
@@ -74,6 +75,44 @@ async function run(): Promise<void> {
     assert.ok(jpSearch.includes('jp'));
     assert.ok(jpSearch.includes('japan'));
     assert.ok(jpSearch.includes('日本'));
+  });
+
+  await check('国家缩写精确匹配并保留协议和多词搜索', () => {
+    for (const code of ['US', 'KR', 'RU', 'AU', 'AT']) {
+      const text = buildNodeSearchText(`${code}01`, 'vless', 'SubA', code);
+      for (const token of ['us', 'usa']) {
+        assert.equal(matchesNodeSearchToken(text, code, token), code === 'US');
+      }
+      assert.ok(matchesNodeSearchToken(text, code, 'vless'));
+      assert.ok(matchesNodeSearchToken(text, code, '01'));
+    }
+    const text = buildNodeSearchText('英国01', 'ss', 'SubA', 'GB');
+    for (const token of ['gb', 'uk', 'gbr', '英国', 'ss']) {
+      assert.ok(matchesNodeSearchToken(text, 'GB', token));
+    }
+  });
+
+  await check('节点状态签名区分存活状态、测速归属和节点名称', () => {
+    const group: ClashProfileGroupOption = {
+      uid: 'subscription', name: '订阅', type: 'remote', isActive: true, nodeCount: 2,
+      nodes: [
+        { name: 'A', type: 'ss', isGroup: false, alive: false },
+        { name: 'B', type: 'ss', isGroup: false, alive: true },
+      ],
+    };
+    const signature = buildProfilesSignature([group]);
+    group.nodes[0].alive = true;
+    group.nodes[1].alive = false;
+    assert.notEqual(buildProfilesSignature([group]), signature);
+    group.nodes[1].alive = true;
+    group.nodes[0].delay = 100;
+    const measured = buildProfilesSignature([group]);
+    group.nodes[0].delay = undefined;
+    group.nodes[1].delay = 100;
+    assert.notEqual(buildProfilesSignature([group]), measured);
+    const named = buildProfilesSignature([group]);
+    group.nodes[1].name = 'C';
+    assert.notEqual(buildProfilesSignature([group]), named);
   });
 
   const store = new ConfigStore();

@@ -595,3 +595,14 @@ export function buildNodeSearchText(
   return parts.join(' ');
 }
 
+export function matchesNodeSearchToken(
+  searchText: string,
+  countryCode: string | null,
+  token: string
+): boolean {
+  const queryCountry = normalizeIsoCountryCode(token);
+  if (queryCountry && (COUNTRY_NAME_MAP[queryCountry] || EXTRA_NAMES[queryCountry])) {
+    return countryCode === queryCountry;
+  }
+  return searchText.includes(token);
+}

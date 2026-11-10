@@ -2612,16 +2612,13 @@ function buildAllGroupsSignature(proxies: Record<string, ClashProxyItem>): strin
   return parts.join('|');
 }
 
-function buildProfilesSignature(groups: ClashProfileGroupOption[]): string {
-  return groups
-    .map((g) => {
-      const delaySig = g.nodes
-        .map((n) => (n.delay || n.alive === false ? `${n.delay || 0}:${n.alive === false ? 0 : 1}` : ''))
-        .filter(Boolean)
-        .join(',');
-      return `${g.uid}:${g.isActive ? 1 : 0}:${g.nodeCount}:${delaySig}`;
-    })
-    .join('|');
+export function buildProfilesSignature(groups: ClashProfileGroupOption[]): string {
+  return JSON.stringify(groups.map((g) => [
+    g.uid,
+    g.isActive,
+    g.nodeCount,
+    g.nodes.map((n) => [n.name, n.delay || 0, n.alive !== false]),
+  ]));
 }
 
 function resolveActiveProxyChain(

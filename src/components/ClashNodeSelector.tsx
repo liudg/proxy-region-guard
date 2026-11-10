@@ -18,6 +18,7 @@ import {
   buildNodeSearchText,
   getShortCountryNameZh,
   inferNodeCountryCode,
+  matchesNodeSearchToken,
 } from '../shared/countries';
 
 export interface ClashNodeSelectorProps {
@@ -47,10 +48,7 @@ interface EnrichedProfileGroup extends Omit<ClashProfileGroupOption, 'nodes'> {
 
 interface FlatNodeItem {
   groupUid: string;
-  groupName: string;
-  groupIsActive: boolean;
   node: ClashProxyNodeOption;
-  countryCode: string | null;
 }
 
 const REGION_PRIORITY_ORDER: Record<string, number> = {
@@ -167,14 +165,11 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
 
   const matchedNodeObj = useMemo(() => {
     if (!selectedNode) return undefined;
-    return (
-      clashInfo.availableNodes.find(
-        (n) =>
-          n.name === selectedNode &&
-          (!selectedProfileUid || n.profileUid === selectedProfileUid)
-      ) || clashInfo.availableNodes.find((n) => n.name === selectedNode)
+    const profileUid = selectedProfileUid || boundProfileUid;
+    return clashInfo.availableNodes.find(
+      (n) => n.name === selectedNode && (!profileUid || n.profileUid === profileUid)
     );
-  }, [clashInfo.availableNodes, selectedNode, selectedProfileUid]);
+  }, [clashInfo.availableNodes, selectedNode, selectedProfileUid, boundProfileUid]);
 
   const effectiveProfileUid =
     selectedProfileUid || matchedNodeObj?.profileUid || boundProfileUid || null;
@@ -204,18 +199,24 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
     [searchQuery]
   );
 
+  const queryFilteredGroups = useMemo(
+    () => enrichedGroups.map((g) => ({
+      ...g,
+      filteredNodes: g.nodes.filter((item) =>
+        searchTokens.every((token) =>
+          matchesNodeSearchToken(item.searchText, item.countryCode, token)
+        )
+      ),
+    })),
+    [enrichedGroups, searchTokens]
+  );
+
   // 统计当前订阅范围内（结合搜索词）各国家/地区的节点分布，用于生成地区快捷筛选胶囊
   const regionOptions = useMemo(() => {
     const counts = new Map<string, number>();
-    for (const g of enrichedGroups) {
+    for (const g of queryFilteredGroups) {
       if (activeFilterUid !== '__all__' && g.uid !== activeFilterUid) continue;
-      for (const item of g.nodes) {
-        if (
-          searchTokens.length > 0 &&
-          !searchTokens.every((tok) => item.searchText.includes(tok))
-        ) {
-          continue;
-        }
+      for (const item of g.filteredNodes) {
         if (item.countryCode) {
           counts.set(item.countryCode, (counts.get(item.countryCode) || 0) + 1);
         }
@@ -234,7 +235,7 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
         if (pa !== pb) return pa - pb;
         return a.code.localeCompare(b.code);
       });
-  }, [enrichedGroups, activeFilterUid, searchTokens]);
+  }, [queryFilteredGroups, activeFilterUid]);
 
   const activeRegionFilter =
     regionFilter === '__all__' || regionOptions.some((r) => r.code === regionFilter)
@@ -245,58 +246,39 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
   const isFilteringByQueryOrRegion =
     searchTokens.length > 0 || activeRegionFilter !== '__all__';
 
+  const filteredGroups = useMemo(
+    () => queryFilteredGroups.map((g) => ({
+      ...g,
+      filteredNodes: activeRegionFilter === '__all__'
+        ? g.filteredNodes
+        : g.filteredNodes.filter((item) => item.countryCode === activeRegionFilter),
+    })),
+    [queryFilteredGroups, activeRegionFilter]
+  );
+
   const matchedCountByGroupUid = useMemo(() => {
     const map = new Map<string, number>();
     let totalMatched = 0;
-    for (const g of enrichedGroups) {
-      let count = 0;
-      for (const item of g.nodes) {
-        if (activeRegionFilter !== '__all__' && item.countryCode !== activeRegionFilter) {
-          continue;
-        }
-        if (
-          searchTokens.length > 0 &&
-          !searchTokens.every((tok) => item.searchText.includes(tok))
-        ) {
-          continue;
-        }
-        count++;
-      }
+    for (const g of filteredGroups) {
+      const count = g.filteredNodes.length;
       map.set(g.uid, count);
       totalMatched += count;
     }
     map.set('__all__', totalMatched);
     return map;
-  }, [enrichedGroups, activeRegionFilter, searchTokens]);
+  }, [filteredGroups]);
 
   const visibleGroups = useMemo(() => {
-    return enrichedGroups
-      .filter((g) => activeFilterUid === '__all__' || g.uid === activeFilterUid)
-      .map((g) => {
-        const filtered = g.nodes.filter((item) => {
-          if (activeRegionFilter !== '__all__' && item.countryCode !== activeRegionFilter) {
-            return false;
-          }
-          if (
-            searchTokens.length > 0 &&
-            !searchTokens.every((tok) => item.searchText.includes(tok))
-          ) {
-            return false;
-          }
-          return true;
-        });
-
-        const ordered = sortByDelay
-          ? [...filtered].sort(compareEnrichedNodesByDelay)
-          : filtered;
-
-        return {
-          ...g,
-          filteredNodes: ordered,
-        };
-      })
-      .filter((g) => g.filteredNodes.length > 0);
-  }, [enrichedGroups, activeFilterUid, activeRegionFilter, searchTokens, sortByDelay]);
+    return filteredGroups
+      .filter((g) =>
+        (activeFilterUid === '__all__' || g.uid === activeFilterUid) &&
+        g.filteredNodes.length > 0
+      )
+      .map((g) => sortByDelay ? {
+        ...g,
+        filteredNodes: [...g.filteredNodes].sort(compareEnrichedNodesByDelay),
+      } : g);
+  }, [filteredGroups, activeFilterUid, sortByDelay]);
 
   const flatItems: FlatNodeItem[] = useMemo(() => {
     const out: FlatNodeItem[] = [];
@@ -304,10 +286,7 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
       for (const item of g.filteredNodes) {
         out.push({
           groupUid: g.uid,
-          groupName: g.name,
-          groupIsActive: g.isActive,
           node: item.node,
-          countryCode: item.countryCode,
         });
       }
     }
@@ -316,13 +295,11 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
 
   const findSelectedFlatIndex = (items: FlatNodeItem[]): number => {
     if (!selectedNode) return -1;
-    const exactIdx = items.findIndex(
+    return items.findIndex(
       (item) =>
         item.node.name === selectedNode &&
         (!effectiveProfileUid || item.groupUid === effectiveProfileUid)
     );
-    if (exactIdx >= 0) return exactIdx;
-    return items.findIndex((item) => item.node.name === selectedNode);
   };
 
   // 展开下拉面板或点击「定位已选」时自动滚动定位到已选节点及对应订阅胶囊
@@ -802,7 +779,7 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
               </div>
             )}
 
-            {regionOptions.length > 1 && (
+            {regionOptions.length > 0 && (
               <div ref={regionBarRef} className="region-pills-bar">
                 <button
                   type="button"
