@@ -6,6 +6,8 @@ import * as https from 'node:https';
 import * as net from 'node:net';
 import * as os from 'node:os';
 import * as path from 'node:path';
+import * as dnsPacket from 'dns-packet';
+import * as yaml from 'js-yaml';
 import {
   ClashProfileGroupOption,
   ClashProxyNodeOption,
@@ -14,13 +16,13 @@ import {
 import { ANTIGRAVITY_PROCESS_PATTERNS } from './antigravityController';
 import { CLAUDE_DESKTOP_PROCESS_PATTERNS } from './claudeController';
 
-interface JsYamlModule {
-  load: (str: string, opts?: { json?: boolean }) => unknown;
-  dump: (obj: unknown, opts?: { lineWidth?: number; noRefs?: boolean }) => string;
-}
+const yamlTypes = (yaml as typeof yaml & { types: Record<string, yaml.Type> }).types;
+const CONTROLLER_METADATA_SCHEMA = yaml.FAILSAFE_SCHEMA.extend({
+  implicit: [yamlTypes.merge],
+  explicit: Object.values(yamlTypes),
+});
 
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-const yaml = require('js-yaml') as JsYamlModule;
+type PersistNodeSelection = (profileUid: string | null, profileName: string | null) => void;
 
 interface ControllerEndpoint {
   label: string;
@@ -53,6 +55,7 @@ interface CachedProfileNodesEntry {
   rawMap: Map<string, Record<string, unknown>>;
   hosts: Record<string, string>;
   nameserverPolicy: Record<string, string[]>;
+  dependencies: Map<string, string | null>;
 }
 
 interface CachedProfilesIndexEntry {
@@ -75,7 +78,6 @@ interface ResolvedProfileData {
 
 const CONNECTED_POLL_MS = 3000;
 const DISCONNECTED_POLL_MS = 6000;
-const YAML_HEADER_READ_BYTES = 16 * 1024;
 const MAX_CONTROLLER_RESPONSE_BYTES = 4 * 1024 * 1024;
 const CLAUDE_LISTENER_NAME = 'proxy-region-guard-claude-in';
 const ANTIGRAVITY_LISTENER_NAME = 'proxy-region-guard-antigravity-in';
@@ -162,6 +164,7 @@ interface DedicatedChannelSlot {
   boundProfileName: string | null;
   boundInternalProxyName: string | null;
   boundPort: number | null;
+  boundDefinition: string | null;
 }
 
 export class ClashMonitor extends EventEmitter {
@@ -203,6 +206,7 @@ export class ClashMonitor extends EventEmitter {
       boundProfileName: null,
       boundInternalProxyName: null,
       boundPort: null,
+      boundDefinition: null,
     },
     antigravity: {
       id: 'antigravity',
@@ -222,6 +226,7 @@ export class ClashMonitor extends EventEmitter {
       boundProfileName: null,
       boundInternalProxyName: null,
       boundPort: null,
+      boundDefinition: null,
     },
   };
 
@@ -318,9 +323,24 @@ export class ClashMonitor extends EventEmitter {
     nodeName: string | null,
     dedicatedPort: number,
     profileUid?: string | null,
-    forceRebind = true
+    forceRebind = true,
+    persistSelection?: PersistNodeSelection
+  ): Promise<DedicatedNodeBindResult> {
+    return this.queueListenerChange(() => this.configureChannelNodeInternal(
+      channelId, nodeName, dedicatedPort, profileUid, forceRebind, persistSelection
+    ));
+  }
+
+  private async configureChannelNodeInternal(
+    channelId: DedicatedChannelId,
+    nodeName: string | null,
+    dedicatedPort: number,
+    profileUid?: string | null,
+    forceRebind = true,
+    persistSelection?: PersistNodeSelection
   ): Promise<DedicatedNodeBindResult> {
     const slot = this.slots[channelId];
+    const next = { ...slot };
     const cleanNode = nodeName ? nodeName.trim() : null;
     const cleanProfileUid =
       profileUid !== undefined
@@ -332,17 +352,18 @@ export class ClashMonitor extends EventEmitter {
     const isSameSelection =
       slot.desiredNodeName === cleanNode && slot.desiredProfileUid === cleanProfileUid;
 
-    slot.desiredNodeName = cleanNode;
-    slot.desiredProfileUid = cleanNode ? cleanProfileUid : null;
+    next.desiredNodeName = cleanNode;
+    next.desiredProfileUid = cleanNode ? cleanProfileUid : null;
     if (!cleanNode) {
-      slot.desiredProfileName = null;
-      slot.desiredNodeRaw = null;
-      slot.desiredDialerRaw = null;
+      next.desiredProfileName = null;
+      next.desiredNodeRaw = null;
+      next.desiredDialerRaw = null;
     } else if (!isSameSelection) {
-      slot.desiredNodeRaw = null;
-      slot.desiredDialerRaw = null;
+      next.desiredProfileName = null;
+      next.desiredNodeRaw = null;
+      next.desiredDialerRaw = null;
     }
-    slot.desiredPort = dedicatedPort;
+    next.desiredPort = dedicatedPort;
 
     if (!this.currentEndpoint) {
       const found = await this.findWorkingEndpoint();
@@ -352,19 +373,29 @@ export class ClashMonitor extends EventEmitter {
       }
     }
 
-    if (slot.desiredNodeName) {
+    if (next.desiredNodeName) {
       this.refreshOfflineProfilesState({});
-      const resolvedMeta = this.resolveSlotTargetNodeDefinition(slot);
+      const resolvedMeta = this.resolveSlotTargetNodeDefinition(next);
       if (resolvedMeta) {
-        slot.desiredProfileUid = resolvedMeta.profileUid;
-        slot.desiredProfileName = resolvedMeta.profileName;
-        slot.desiredNodeRaw = structuredClone(resolvedMeta.rawProxy);
-        slot.desiredDialerRaw = structuredClone(resolvedMeta.dialerChain);
+        next.desiredProfileUid = resolvedMeta.profileUid;
+        next.desiredProfileName = resolvedMeta.profileName;
+        next.desiredNodeRaw = structuredClone(resolvedMeta.rawProxy);
+        next.desiredDialerRaw = structuredClone(resolvedMeta.dialerChain);
       } else {
-        slot.desiredNodeRaw = null;
-        slot.desiredDialerRaw = null;
+        next.desiredNodeRaw = null;
+        next.desiredDialerRaw = null;
       }
     }
+
+    persistSelection?.(next.desiredProfileUid, next.desiredProfileName);
+    Object.assign(slot, {
+      desiredNodeName: next.desiredNodeName,
+      desiredProfileUid: next.desiredProfileUid,
+      desiredProfileName: next.desiredProfileName,
+      desiredNodeRaw: next.desiredNodeRaw,
+      desiredDialerRaw: next.desiredDialerRaw,
+      desiredPort: next.desiredPort,
+    });
 
     if (!this.currentEndpoint) {
       slot.boundNodeName = null;
@@ -389,7 +420,7 @@ export class ClashMonitor extends EventEmitter {
       };
     }
 
-    const res = await this.queueSyncDedicatedListeners(forceRebind);
+    const res = await this.applySyncDedicatedListeners(forceRebind);
     this.emit('clash-status-updated');
 
     if (!slot.desiredNodeName) {
@@ -418,9 +449,10 @@ export class ClashMonitor extends EventEmitter {
     nodeName: string | null,
     dedicatedPort: number,
     profileUid?: string | null,
-    forceRebind = true
+    forceRebind = true,
+    persistSelection?: PersistNodeSelection
   ): Promise<DedicatedNodeBindResult> {
-    return this.configureChannelNode('claude', nodeName, dedicatedPort, profileUid, forceRebind);
+    return this.configureChannelNode('claude', nodeName, dedicatedPort, profileUid, forceRebind, persistSelection);
   }
 
   /**
@@ -430,14 +462,16 @@ export class ClashMonitor extends EventEmitter {
     nodeName: string | null,
     dedicatedPort: number,
     profileUid?: string | null,
-    forceRebind = true
+    forceRebind = true,
+    persistSelection?: PersistNodeSelection
   ): Promise<DedicatedNodeBindResult> {
     return this.configureChannelNode(
       'antigravity',
       nodeName,
       dedicatedPort,
       profileUid,
-      forceRebind
+      forceRebind,
+      persistSelection
     );
   }
 
@@ -608,6 +642,7 @@ export class ClashMonitor extends EventEmitter {
             !nodeAliveInKernel ||
             !portAlive ||
             slot.boundNodeName !== slot.desiredNodeName ||
+            slot.boundDefinition !== this.getSlotDefinition(slot) ||
             !desiredProfileMatches ||
             slot.boundPort !== slot.desiredPort
           ) {
@@ -833,14 +868,21 @@ export class ClashMonitor extends EventEmitter {
     antigravityError?: string;
     generalError?: string;
   }> {
-    const operation = this.listenerApplyQueue.then(() =>
-      this.applySyncDedicatedListeners(forceRebind)
-    );
+    return this.queueListenerChange(() => this.applySyncDedicatedListeners(forceRebind));
+  }
+
+  private queueListenerChange<T>(change: () => Promise<T>): Promise<T> {
+    const operation = this.listenerApplyQueue.then(change);
     this.listenerApplyQueue = operation.then(
       () => undefined,
       () => undefined
     );
     return operation;
+  }
+
+  private getSlotDefinition(slot: DedicatedChannelSlot): string | null {
+    const definition = this.resolveSlotTargetNodeDefinition(slot);
+    return definition ? JSON.stringify(definition) : null;
   }
 
   private async applySyncDedicatedListeners(forceRebind: boolean): Promise<{
@@ -911,6 +953,7 @@ export class ClashMonitor extends EventEmitter {
         if (!nodeAliveInKernel) return false;
         return (
           slot.boundNodeName === slot.desiredNodeName &&
+          slot.boundDefinition === this.getSlotDefinition(slot) &&
           (!slot.desiredProfileUid || slot.boundProfileUid === slot.desiredProfileUid) &&
           slot.boundPort === slot.desiredPort &&
           (await isLocalPortListening(slot.desiredPort))
@@ -962,10 +1005,10 @@ export class ClashMonitor extends EventEmitter {
 
       const slotOutcome: Record<
         DedicatedChannelId,
-        { shouldBind: boolean; targetProxy: string; error?: string }
+        { shouldBind: boolean; targetProxy: string; definition: string | null; error?: string }
       > = {
-        claude: { shouldBind: false, targetProxy: '' },
-        antigravity: { shouldBind: false, targetProxy: '' },
+        claude: { shouldBind: false, targetProxy: '', definition: null },
+        antigravity: { shouldBind: false, targetProxy: '', definition: null },
       };
 
       // 统一遍历所有专属通道槽位，执行跨订阅节点提取、链式前置节点注入、独立入站监听及进程规则绑定
@@ -973,6 +1016,7 @@ export class ClashMonitor extends EventEmitter {
         if (!slot.desiredNodeName) continue;
 
         const resolved = this.resolveSlotTargetNodeDefinition(slot);
+        slotOutcome[slot.id].definition = resolved ? JSON.stringify(resolved) : null;
         if (resolved) {
           slot.desiredProfileUid = resolved.profileUid;
           slot.desiredProfileName = resolved.profileName;
@@ -1115,14 +1159,23 @@ export class ClashMonitor extends EventEmitter {
         slot.boundProfileName = listening ? slot.desiredProfileName : null;
         slot.boundInternalProxyName = listening ? slotOutcome[slot.id].targetProxy : null;
         slot.boundPort = listening ? slot.desiredPort : null;
+        slot.boundDefinition = listening ? slotOutcome[slot.id].definition : null;
         if (slotOutcome[slot.id].shouldBind && !listening && !slotOutcome[slot.id].error) {
           slotOutcome[slot.id].error = `${slot.label} 专属代理端口 127.0.0.1:${slot.desiredPort} 未能成功启动监听`;
         }
       };
 
+      const previousClaudeDefinition = claudeSlot.boundDefinition;
+      const previousAgDefinition = agSlot.boundDefinition;
       updateSlotBoundState(claudeSlot, claudeListening);
       updateSlotBoundState(agSlot, antigravityListening);
       this.syncSlotInfoFields(claudeListening, antigravityListening);
+      if (previousClaudeDefinition !== claudeSlot.boundDefinition) {
+        this.emit('claude-clash-ready', true);
+      }
+      if (previousAgDefinition !== agSlot.boundDefinition) {
+        this.emit('antigravity-clash-ready', true);
+      }
 
       if (
         (!claudeSlot.desiredNodeName || claudeListening) &&
@@ -1878,7 +1931,8 @@ export class ClashMonitor extends EventEmitter {
       if (!fs.existsSync(filePath)) return null;
       const stat = fs.statSync(filePath);
       const cached = this.profileNodesCache.get(filePath);
-      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size) {
+      if (cached && cached.mtimeMs === stat.mtimeMs && cached.size === stat.size &&
+          [...cached.dependencies].every(([file, version]) => getFileVersion(file) === version)) {
         return cached;
       }
 
@@ -1889,6 +1943,7 @@ export class ClashMonitor extends EventEmitter {
 
       const nodes: ClashProxyNodeOption[] = [];
       const rawMap = new Map<string, Record<string, unknown>>();
+      const dependencies = new Map<string, string | null>();
 
       const addRawProxyList = (list: unknown) => {
         if (!Array.isArray(list)) return;
@@ -1940,6 +1995,7 @@ export class ClashMonitor extends EventEmitter {
               path.join(vergeDir, 'providers', path.basename(relPath)),
             ];
             for (const cand of providerCandidates) {
+              dependencies.set(cand, getFileVersion(cand));
               if (fs.existsSync(cand)) {
                 try {
                   const provRaw = fs.readFileSync(cand, 'utf-8');
@@ -2010,6 +2066,7 @@ export class ClashMonitor extends EventEmitter {
         rawMap,
         hosts,
         nameserverPolicy,
+        dependencies,
       };
       this.profileNodesCache.set(filePath, entry);
       return entry;
@@ -2213,7 +2270,7 @@ export class ClashMonitor extends EventEmitter {
         primaryYamlFile = item.runtimeYaml;
       }
 
-      const meta = this.readYamlHeaderCached(item.file);
+      const meta = this.readControllerMetadataCached(item.file);
       if (!meta) continue;
 
       if (meta.secret) {
@@ -2245,7 +2302,7 @@ export class ClashMonitor extends EventEmitter {
     return { endpoints: results, secrets: Array.from(secretSet), primaryYamlFile };
   }
 
-  private readYamlHeaderCached(filePath: string): CachedYamlMeta | null {
+  private readControllerMetadataCached(filePath: string): CachedYamlMeta | null {
     try {
       if (!fs.existsSync(filePath)) return null;
       const stat = fs.statSync(filePath);
@@ -2254,24 +2311,18 @@ export class ClashMonitor extends EventEmitter {
         return cached;
       }
 
-      const bytesToRead = Math.min(stat.size, YAML_HEADER_READ_BYTES);
-      if (bytesToRead <= 0) return null;
-
-      const buf = Buffer.alloc(bytesToRead);
-      const fd = fs.openSync(filePath, 'r');
-      let bytesRead = 0;
-      try {
-        bytesRead = fs.readSync(fd, buf, 0, bytesToRead, 0);
-      } finally {
-        fs.closeSync(fd);
-      }
-
-      const headerText = buf.subarray(0, bytesRead).toString('utf-8');
-      const pipeVal = extractYamlTopScalar(headerText, 'external-controller-pipe');
-      const ctrlVal = extractYamlTopScalar(headerText, 'external-controller');
-      const secretVal =
-        extractYamlTopScalar(headerText, 'secret') ||
-        extractYamlTopScalar(headerText, 'verge_clash_core_secret');
+      const doc = yaml.load(fs.readFileSync(filePath, 'utf-8'), {
+        json: true, schema: CONTROLLER_METADATA_SCHEMA,
+      }) as Record<string, unknown>;
+      if (!doc || typeof doc !== 'object' || Array.isArray(doc)) return null;
+      const scalar = (key: string) => {
+        const value = doc[key];
+        return typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean'
+          ? String(value).trim() : '';
+      };
+      const pipeVal = scalar('external-controller-pipe');
+      const ctrlVal = scalar('external-controller');
+      const secretVal = scalar('secret') || scalar('verge_clash_core_secret');
 
       const parsedCtrl = ctrlVal ? parseControllerAddress(ctrlVal) : null;
 
@@ -2442,36 +2493,10 @@ async function waitPortListening(port: number, maxWaitMs: number): Promise<boole
   return isLocalPortListening(port, 200);
 }
 
-function extractYamlTopScalar(text: string, key: string): string | null {
-  const escapedKey = key.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const re = new RegExp(`^${escapedKey}\\s*:\\s*(.+)$`, 'm');
-  const match = text.match(re);
-  if (!match || !match[1]) return null;
-
-  const raw = match[1].trim();
-  if (!raw || raw.startsWith('#')) return null;
-
-  let val: string;
-  if (raw.startsWith('"')) {
-    const dqMatch = raw.match(/^"((?:[^"\\]|\\.)*)"(?:\s+#.*|\s*)$/);
-    if (!dqMatch) return null;
-    val = dqMatch[1].replace(/\\(["\\/bfnrt])/g, (_m, ch: string) => {
-      if (ch === 'n') return '\n';
-      if (ch === 'r') return '\r';
-      if (ch === 't') return '\t';
-      return ch;
-    });
-  } else if (raw.startsWith("'")) {
-    const sqMatch = raw.match(/^'((?:[^']|'')*)'(?:\s+#.*|\s*)$/);
-    if (!sqMatch) return null;
-    val = sqMatch[1].replace(/''/g, "'");
-  } else {
-    val = raw.replace(/\s+#.*$/, '').trim();
-    if (val === 'null' || val === '~') return null;
-  }
-
-  val = val.trim();
-  return val || null;
+function getFileVersion(filePath: string): string | null {
+  if (!fs.existsSync(filePath)) return null;
+  const stat = fs.statSync(filePath);
+  return `${stat.mtimeMs}:${stat.size}`;
 }
 
 function parseControllerAddress(raw: string): { host: string; port: number } | null {
@@ -2699,72 +2724,13 @@ function doesDomainMatchPolicyPattern(host: string, rawPattern: string): boolean
   return false;
 }
 
-function buildDnsWireQuery(domain: string, qtype = 1): Buffer {
-  const parts = domain
-    .trim()
-    .replace(/\.$/, '')
-    .split('.')
-    .filter(Boolean);
-  const labels = parts.map((p) => {
-    const b = Buffer.from(p, 'ascii');
-    return Buffer.concat([Buffer.from([b.length]), b]);
-  });
-  const header = Buffer.from([
-    0x00, 0x00, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-  ]);
-  const footer = Buffer.from([0x00, (qtype >> 8) & 0xff, qtype & 0xff, 0x00, 0x01]);
-  return Buffer.concat([header, ...labels, footer]);
-}
-
-function skipDnsWireName(buf: Buffer, startOffset: number): number {
-  let offset = startOffset;
-  let jumps = 0;
-  while (offset < buf.length && jumps < 32) {
-    const len = buf[offset];
-    if (len === 0) {
-      return offset + 1;
-    }
-    if ((len & 0xc0) === 0xc0) {
-      return offset + 2 <= buf.length ? offset + 2 : -1;
-    }
-    offset += 1 + len;
-    jumps++;
-  }
-  return -1;
-}
-
 function parseDnsWireARecord(buf: Buffer): { ip: string; ttl: number } | null {
-  if (!buf || buf.length < 12) return null;
-  const rcode = buf[3] & 0x0f;
-  if (rcode !== 0) return null;
-
-  const qdcount = buf.readUInt16BE(4);
-  const ancount = buf.readUInt16BE(6);
-  if (ancount === 0) return null;
-
-  let offset = 12;
-  for (let i = 0; i < qdcount; i++) {
-    offset = skipDnsWireName(buf, offset);
-    if (offset < 0 || offset + 4 > buf.length) return null;
-    offset += 4;
-  }
-
-  for (let i = 0; i < ancount; i++) {
-    offset = skipDnsWireName(buf, offset);
-    if (offset < 0 || offset + 10 > buf.length) return null;
-    const atype = buf.readUInt16BE(offset);
-    const aclass = buf.readUInt16BE(offset + 2);
-    const ttl = buf.readUInt32BE(offset + 4);
-    const rdlength = buf.readUInt16BE(offset + 8);
-    offset += 10;
-    if (offset + rdlength > buf.length) return null;
-    if (atype === 1 && aclass === 1 && rdlength === 4) {
-      const ip = `${buf[offset]}.${buf[offset + 1]}.${buf[offset + 2]}.${buf[offset + 3]}`;
-      if (net.isIP(ip) === 4) {
-        return { ip, ttl };
-      }
+  const packet = dnsPacket.decode(buf) as dnsPacket.DecodedPacket & { rcode: string };
+  if (packet.type !== 'response' || packet.rcode !== 'NOERROR') return null;
+  for (const answer of packet.answers || []) {
+    if (answer.type === 'A' && answer.class === 'IN' && net.isIP(answer.data) === 4) {
+      return { ip: answer.data, ttl: answer.ttl ?? 0 };
     }
-    offset += rdlength;
   }
   return null;
 }
@@ -2897,12 +2863,11 @@ async function querySingleDohServer(
     const cleanUrl = dohRaw.split('#')[0].trim();
     if (!/^https?:\/\//i.test(cleanUrl)) return null;
     const urlObj = new URL(cleanUrl);
-    const wire = buildDnsWireQuery(domain, 1);
-    const b64url = wire
-      .toString('base64')
-      .replace(/\+/g, '-')
-      .replace(/\//g, '_')
-      .replace(/=+$/, '');
+    const wire = dnsPacket.encode({
+      type: 'query', id: 0, flags: dnsPacket.RECURSION_DESIRED,
+      questions: [{ type: 'A', name: domain, class: 'IN' }],
+    });
+    const b64url = wire.toString('base64url');
 
     const h2Res = await queryDohOverHttp2(urlObj, b64url, timeoutMs);
     if (h2Res) return h2Res;

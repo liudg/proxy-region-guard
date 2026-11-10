@@ -1,4 +1,4 @@
-import { app } from 'electron';
+import { app, nativeImage } from 'electron';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
@@ -23,6 +23,9 @@ import {
   resolveWindowsTimeZoneForCountry,
 } from '../src/shared/timezones';
 import { ProbeResult } from '../src/shared/types';
+import { createStatusTrayIcon, createWindowAppIcon } from '../electron/trayIcon';
+import { countRunningClaudeProcesses } from '../electron/claudeController';
+import { runMihomoIntegration } from './mihomoIntegration';
 
 assert.ok(process.env.GUARD_TEST_DATA);
 const dataDirectory = process.env.GUARD_TEST_DATA;
@@ -54,6 +57,49 @@ async function run(): Promise<void> {
   // 直接调用真实实现进行检查；不启动守护器、定时器或内核配置写入。
   const monitorInternal = monitor as any;
   const engineInternal = engine as any;
+
+  await check('配置写入失败保留内存状态并释放切换状态，正常保存可重新读取', async () => {
+    store.update({ defaultCountryCode: 'JP' });
+    const previous = store.get();
+    const configPath = path.join(dataDirectory, 'guard-config.json');
+    const backup = `${configPath}.saved`;
+    fs.renameSync(configPath, backup);
+    fs.mkdirSync(configPath);
+    try {
+      assert.throws(() => store.update({ defaultCountryCode: 'US' }));
+      await assert.rejects(engineInternal.selectClashNodeInternal(null));
+      assert.equal(engineInternal.claudeSwitchingCount, 0);
+      await assert.rejects(engine.selectAntigravityClashNode(null));
+      assert.equal(engineInternal.antigravitySwitchingCount, 0);
+      assert.equal(engineInternal.applicationChangeInProgress, false);
+      assert.deepEqual(store.get(), previous);
+      assert.equal(fs.readdirSync(dataDirectory).some((name) => name.endsWith('.tmp')), false);
+    } finally {
+      fs.rmdirSync(configPath);
+      fs.renameSync(backup, configPath);
+    }
+    assert.deepEqual(new ConfigStore().get(), previous);
+    store.update({ defaultCountryCode: null });
+  });
+
+  await check('Electron 原生位图生成全部状态图标及缩放尺寸', () => {
+    for (const status of ['ok', 'mismatch', 'error', 'unset', 'checking'] as const) {
+      const tray = createStatusTrayIcon(status);
+      assert.deepEqual(tray.getScaleFactors(), [1, 1.5, 2]);
+      for (const scale of [1, 1.5, 2]) {
+        const decoded = nativeImage.createFromBuffer(tray.toPNG({ scaleFactor: scale }));
+        assert.deepEqual(decoded.getSize(), { width: 16 * scale, height: 16 * scale });
+        assert.equal(decoded.toBitmap()[3], 0);
+      }
+      const icon = createWindowAppIcon(status);
+      assert.deepEqual(icon.getSize(), { width: 64, height: 64 });
+      const pixels = icon.toBitmap();
+      const ring = (9 * 64 + 32) * 4;
+      assert.equal(pixels[ring + 3], 255);
+      if (status === 'ok') assert.ok(pixels[ring + 1] > pixels[ring + 2]);
+      if (status === 'mismatch') assert.ok(pixels[ring + 2] > pixels[ring + 1]);
+    }
+  });
 
   await check('YAML 处理保留用户进程规则并移除卫士内部规则', () => {
     const prepared = monitorInternal.loadAndPrepareCoreYaml(
@@ -90,7 +136,23 @@ async function run(): Promise<void> {
       await assert.rejects(
         assertProcessesStopped([path.basename(process.execPath)], selfReport), /仍在运行/
       );
-      const report = await terminateProtectedProcesses([executableName]);
+      assert.equal((await countRunningClaudeProcesses(true)).running, false,
+        '时区前置检查需要 Claude 未运行，防止影响用户会话');
+      const currentLocale = await readWindowsLocaleState();
+      const previousConfig = store.get();
+      store.update({ defaultCountryCode: currentLocale.regionCode === 'JP' ? 'US' : 'JP',
+        protectedProcessPatterns: [executableName], killProcessesEnabled: true, killOnLocaleMismatch: true });
+      let report;
+      try {
+        report = await engineInternal.stopProcessesBeforeLocaleChange(currentLocale.regionCode, currentLocale.timeZoneId);
+        store.update({ protectedProcessPatterns: [path.basename(process.execPath)] });
+        await assert.rejects(
+          engineInternal.stopProcessesBeforeLocaleChange(currentLocale.regionCode, currentLocale.timeZoneId), /仍在运行/
+        );
+        assert.deepEqual(await readWindowsLocaleState(), currentLocale);
+      } finally {
+        store.update(previousConfig);
+      }
       assert.equal(report.failedPids.length, 0);
       assert.equal(report.killedCount, 2);
       await assertProcessesStopped([executableName], report);
@@ -156,6 +218,24 @@ async function run(): Promise<void> {
   const detected = await engineInternal.probeOnceViaChannel(systemProxy.proxyUrl, '回归验证', 2500);
   assert.ok(detected.result, '真实出口检测失败，无法继续网络集成验证');
   const probe: ProbeResult = detected.result;
+  await check('真实出口状态在手动重算和网络检测入口保持一致', async () => {
+    const previous = store.get();
+    const actualLocale = await readWindowsLocaleState();
+    engineInternal.winLocale = actualLocale;
+    store.update({ defaultCountryCode: probe.countryCode, protectedProcessPatterns: [] });
+    const networkState = await engine.checkNow('回归验证');
+    const recalculated = engine.evaluateStatusOnly('回归验证');
+    assert.equal(recalculated.status, networkState.status);
+    store.update({ defaultCountryCode: networkState.lastProbe!.countryCode === 'JP' ? 'US' : 'JP' });
+    assert.equal(engine.evaluateStatusOnly('回归验证').status, 'mismatch');
+    store.update(previous);
+    await sleep(100);
+  });
+  await check('真实 DoH 返回由 DNS 库解析的 IPv4 地址', async () => {
+    const ip = await monitorInternal.resolveHostViaCustomDnsServers('example.com', ['https://dns.alidns.com/dns-query'], true);
+    assert.ok(ip, '真实 DoH 查询未返回 IPv4 地址');
+  });
+  await runMihomoIntegration(dataDirectory, monitor);
   await check('真实连接失败阻止目标服务验证通过', async () => {
     await engineInternal.verifyTargetServiceRegion('http://127.0.0.1:1', probe, 'claude', true);
     assert.match(getTargetServiceVerificationError(probe) || '', /Google、Claude/);

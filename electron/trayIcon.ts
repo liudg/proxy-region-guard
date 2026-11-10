@@ -1,5 +1,4 @@
 import { nativeImage, NativeImage } from 'electron';
-import * as zlib from 'node:zlib';
 import { GuardStatus } from '../src/shared/types';
 
 interface RgbaColor {
@@ -43,19 +42,19 @@ export function createStatusTrayIcon(status: GuardStatus): NativeImage {
     scaleFactor: 1.0,
     width: 16,
     height: 16,
-    buffer: renderStatusPngBuffer(status, 16),
+    buffer: renderStatusBitmap(status, 16),
   });
   img.addRepresentation({
     scaleFactor: 1.5,
     width: 24,
     height: 24,
-    buffer: renderStatusPngBuffer(status, 24),
+    buffer: renderStatusBitmap(status, 24),
   });
   img.addRepresentation({
     scaleFactor: 2.0,
     width: 32,
     height: 32,
-    buffer: renderStatusPngBuffer(status, 32),
+    buffer: renderStatusBitmap(status, 32),
   });
 
   iconCache.set(key, img);
@@ -67,13 +66,13 @@ export function createWindowAppIcon(status: GuardStatus): NativeImage {
   const cached = iconCache.get(key);
   if (cached) return cached;
 
-  const img = nativeImage.createFromBuffer(renderStatusPngBuffer(status, 64));
+  const img = nativeImage.createFromBitmap(renderStatusBitmap(status, 64), { width: 64, height: 64 });
   iconCache.set(key, img);
   return img;
 }
 
-export function renderStatusPngBuffer(status: GuardStatus, size: number): Buffer {
-  const rgba = new Uint8Array(size * size * 4);
+function renderStatusBitmap(status: GuardStatus, size: number): Buffer {
+  const bitmap = Buffer.alloc(size * size * 4);
   const palette = STATUS_PALETTE[status];
   const cx = (size - 1) / 2;
   const cy = (size - 1) / 2;
@@ -88,7 +87,6 @@ export function renderStatusPngBuffer(status: GuardStatus, size: number): Buffer
       const dist = Math.sqrt(dx * dx + dy * dy);
 
       if (dist > maxR + 0.8) {
-        rgba[idx + 3] = 0;
         continue;
       }
 
@@ -122,14 +120,16 @@ export function renderStatusPngBuffer(status: GuardStatus, size: number): Buffer
         b = Math.round(b * (1 - symbolCov) + 255 * symbolCov);
       }
 
-      rgba[idx] = r;
-      rgba[idx + 1] = g;
-      rgba[idx + 2] = b;
-      rgba[idx + 3] = Math.round(alpha * 255);
+      // Windows NativeImage 使用预乘透明度的 BGRA 像素。
+      const alphaByte = Math.round(alpha * 255);
+      bitmap[idx] = Math.round(b * alphaByte / 255);
+      bitmap[idx + 1] = Math.round(g * alphaByte / 255);
+      bitmap[idx + 2] = Math.round(r * alphaByte / 255);
+      bitmap[idx + 3] = alphaByte;
     }
   }
 
-  return encodeRgbaToPng(size, size, rgba);
+  return bitmap;
 }
 
 function blendColor(a: RgbaColor, b: RgbaColor, t: number): RgbaColor {
@@ -181,66 +181,4 @@ function smoothCoverage(dist: number, radius: number, feather: number): number {
   if (dist <= radius - feather) return 1;
   if (dist >= radius + feather) return 0;
   return (radius + feather - dist) / (2 * feather);
-}
-
-const CRC_TABLE = (() => {
-  const table = new Uint32Array(256);
-  for (let n = 0; n < 256; n++) {
-    let c = n;
-    for (let k = 0; k < 8; k++) {
-      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
-    }
-    table[n] = c >>> 0;
-  }
-  return table;
-})();
-
-function crc32(buf: Buffer): number {
-  let c = 0xffffffff;
-  for (let i = 0; i < buf.length; i++) {
-    c = CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
-  }
-  return (c ^ 0xffffffff) >>> 0;
-}
-
-function makePngChunk(type: string, data: Buffer): Buffer {
-  const typeBuf = Buffer.from(type, 'ascii');
-  const lenBuf = Buffer.alloc(4);
-  lenBuf.writeUInt32BE(data.length, 0);
-  const crcInput = Buffer.concat([typeBuf, data]);
-  const crcBuf = Buffer.alloc(4);
-  crcBuf.writeUInt32BE(crc32(crcInput), 0);
-  return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
-}
-
-function encodeRgbaToPng(width: number, height: number, rgba: Uint8Array): Buffer {
-  const signature = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
-
-  const ihdr = Buffer.alloc(13);
-  ihdr.writeUInt32BE(width, 0);
-  ihdr.writeUInt32BE(height, 4);
-  ihdr[8] = 8;
-  ihdr[9] = 6;
-  ihdr[10] = 0;
-  ihdr[11] = 0;
-  ihdr[12] = 0;
-
-  const stride = width * 4 + 1;
-  const rawData = Buffer.alloc(stride * height);
-  for (let y = 0; y < height; y++) {
-    rawData[y * stride] = 0;
-    Buffer.from(rgba.buffer, rgba.byteOffset + y * width * 4, width * 4).copy(
-      rawData,
-      y * stride + 1
-    );
-  }
-
-  const compressed = zlib.deflateSync(rawData);
-
-  return Buffer.concat([
-    signature,
-    makePngChunk('IHDR', ihdr),
-    makePngChunk('IDAT', compressed),
-    makePngChunk('IEND', Buffer.alloc(0)),
-  ]);
 }

@@ -1,6 +1,7 @@
 import { app } from 'electron';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { AppConfig, ManualProxyProtocol, ProxyMode } from '../src/shared/types';
 import { getCountryNameZh, isValidIsoCountryCode } from '../src/shared/countries';
 
@@ -212,18 +213,12 @@ export class ConfigStore {
   }
 
   private load(): AppConfig {
-    try {
-      if (fs.existsSync(this.filePath)) {
-        const raw = fs.readFileSync(this.filePath, 'utf-8');
-        const parsed = JSON.parse(raw) as Partial<AppConfig>;
-        if (parsed && typeof parsed === 'object') {
-          return normalizeConfig(parsed);
-        }
-      }
-    } catch (err) {
-      console.error('[ConfigStore] Failed to load config, using defaults:', err);
+    if (!fs.existsSync(this.filePath)) return structuredClone(DEFAULT_CONFIG);
+    const parsed = JSON.parse(fs.readFileSync(this.filePath, 'utf-8'));
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      throw new Error('配置文件必须包含配置对象');
     }
-    return structuredClone(DEFAULT_CONFIG);
+    return normalizeConfig(parsed);
   }
 
   public get(): AppConfig {
@@ -231,8 +226,9 @@ export class ConfigStore {
   }
 
   public update(partial: Partial<AppConfig>): AppConfig {
-    this.config = this.preview(partial);
-    this.save();
+    const next = this.preview(partial);
+    this.save(next);
+    this.config = next;
     return this.get();
   }
 
@@ -251,15 +247,14 @@ export class ConfigStore {
     });
   }
 
-  private save(): void {
+  private save(config: AppConfig): void {
+    fs.mkdirSync(path.dirname(this.filePath), { recursive: true });
+    const temporaryPath = `${this.filePath}.${randomUUID()}.tmp`;
     try {
-      const dir = path.dirname(this.filePath);
-      if (!fs.existsSync(dir)) {
-        fs.mkdirSync(dir, { recursive: true });
-      }
-      fs.writeFileSync(this.filePath, JSON.stringify(this.config, null, 2), 'utf-8');
-    } catch (err) {
-      console.error('[ConfigStore] Failed to save config:', err);
+      fs.writeFileSync(temporaryPath, JSON.stringify(config, null, 2), { encoding: 'utf-8', flag: 'wx' });
+      fs.renameSync(temporaryPath, this.filePath);
+    } finally {
+      fs.rmSync(temporaryPath, { force: true });
     }
   }
 }

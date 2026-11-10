@@ -184,7 +184,7 @@ export async function inspectRunningAntigravityProcesses(
     uiProcessCount,
     languageServerCount,
     totalProcessCount,
-    proxiedSession: cachedCmdlineProxied || inLaunchGrace,
+    proxiedSession: cachedCmdlineProxied,
   };
 }
 

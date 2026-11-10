@@ -69,6 +69,12 @@ interface TraceEndpoint {
   format: 'cf-trace' | 'plain-ip';
 }
 
+interface ClaudeSafetyCheck {
+  safe: boolean;
+  reason: string;
+  alertType: 'mismatch' | 'disconnect' | 'locale-mismatch';
+}
+
 const BUILTIN_TRACE_ENDPOINTS: TraceEndpoint[] = [
   {
     name: 'Cloudflare IPv4 Trace',
@@ -141,6 +147,7 @@ export class ProbeEngine extends EventEmitter {
   private claudePendingProbe: { reason: string; skipSafetyEnforcement: boolean } | null = null;
   private claudeSwitchingCount = 0;
   private isEnforcingClaudeSafety = false;
+  private claudeSafetyKillPromise: Promise<boolean> | null = null;
   private claudeNodeProbe: ProbeResult | null = null;
   private claudeNodeProbeError: string | null = null;
 
@@ -156,6 +163,7 @@ export class ProbeEngine extends EventEmitter {
   private antigravityProbePromise: Promise<AppStateSnapshot> | null = null;
   private antigravityProbeSeq = 0;
   private antigravityPendingReprobe = false;
+  private antigravitySwitchingCount = 0;
   private antigravityNodeProbe: ProbeResult | null = null;
   private antigravityNodeProbeError: string | null = null;
 
@@ -202,11 +210,17 @@ export class ProbeEngine extends EventEmitter {
       }, 250);
     });
 
-    this.clashMonitor.on('claude-clash-ready', () => {
+    this.clashMonitor.on('claude-clash-ready', (definitionChanged = false) => {
+      if (definitionChanged) {
+        this.claudeProbeSeq++;
+        this.claudeNodeProbe = null;
+        this.claudeNodeProbeError = null;
+      }
       this.emitState();
       const cfg = this.configStore.get();
       const info = this.clashMonitor.getRuntimeInfo();
-      if (cfg.selectedClashNode && info.dedicatedPortListening && !this.claudeIsProbing) {
+      if (cfg.selectedClashNode && info.dedicatedPortListening && this.claudeSwitchingCount === 0 &&
+          (!this.claudeIsProbing || definitionChanged)) {
         if (this.claudeDebounceTimer) {
           clearTimeout(this.claudeDebounceTimer);
         }
@@ -217,11 +231,17 @@ export class ProbeEngine extends EventEmitter {
       }
     });
 
-    this.clashMonitor.on('antigravity-clash-ready', () => {
+    this.clashMonitor.on('antigravity-clash-ready', (definitionChanged = false) => {
+      if (definitionChanged) {
+        this.antigravityProbeSeq++;
+        this.antigravityNodeProbe = null;
+        this.antigravityNodeProbeError = null;
+      }
       this.emitState();
       const cfg = this.configStore.get();
       const info = this.clashMonitor.getRuntimeInfo();
-      if (cfg.antigravityClashNode && info.antigravityPortListening && !this.antigravityIsProbing) {
+      if (cfg.antigravityClashNode && info.antigravityPortListening && this.antigravitySwitchingCount === 0 &&
+          (!this.antigravityIsProbing || definitionChanged)) {
         if (this.antigravityDebounceTimer) {
           clearTimeout(this.antigravityDebounceTimer);
         }
@@ -435,6 +455,26 @@ export class ProbeEngine extends EventEmitter {
     nodeName: string | null,
     profileUid?: string | null
   ): Promise<AppStateSnapshot> {
+    this.antigravityProbeSeq++;
+    this.antigravityNodeProbe = null;
+    this.antigravityNodeProbeError = null;
+    this.antigravitySwitchingCount++;
+    try {
+      await this.bindAntigravitySelection(nodeName, profileUid);
+    } finally {
+      this.antigravitySwitchingCount--;
+    }
+    if (this.configStore.get().antigravityClashNode &&
+        this.clashMonitor.getRuntimeInfo().antigravityPortListening) {
+      return this.probeAntigravityNodeNow();
+    }
+    return this.getSnapshot();
+  }
+
+  private async bindAntigravitySelection(
+    nodeName: string | null,
+    profileUid?: string | null
+  ): Promise<AppStateSnapshot> {
     const cleanNode = nodeName && nodeName.trim() ? nodeName.trim() : null;
     const prevCfg = this.configStore.get();
     const effectiveProfileUid =
@@ -444,32 +484,25 @@ export class ProbeEngine extends EventEmitter {
           : null
         : prevCfg.antigravityClashProfileUid;
 
-    if (
-      prevCfg.antigravityClashNode !== cleanNode ||
-      prevCfg.antigravityClashProfileUid !== effectiveProfileUid
-    ) {
-      this.antigravityProbeSeq++;
-      this.antigravityNodeProbe = null;
-      this.antigravityNodeProbeError = null;
-    }
-
     if (cleanNode) {
       this.addLog(
         'info',
         `正在将 Antigravity 专属代理通道切换至节点：[${cleanNode}] (127.0.0.1:${prevCfg.antigravityDedicatedPort})...`
       );
+      let cfg = prevCfg;
       const bindRes = await this.clashMonitor.configureAntigravityNode(
         cleanNode,
         prevCfg.antigravityDedicatedPort,
         effectiveProfileUid,
-        true
+        true,
+        (resolvedUid, resolvedName) => {
+          cfg = this.configStore.update({
+            antigravityClashNode: cleanNode,
+            antigravityClashProfileUid: resolvedUid,
+            antigravityClashProfileName: resolvedName,
+          });
+        }
       );
-
-      const cfg = this.configStore.update({
-        antigravityClashNode: cleanNode,
-        antigravityClashProfileUid: bindRes.profileUid ?? effectiveProfileUid,
-        antigravityClashProfileName: bindRes.profileName ?? prevCfg.antigravityClashProfileName,
-      });
 
       const fullLabel = cfg.antigravityClashProfileName
         ? `${cfg.antigravityClashProfileName} / ${cleanNode}`
@@ -487,20 +520,19 @@ export class ProbeEngine extends EventEmitter {
         'success',
         `Antigravity 专属节点已锁定 [${fullLabel}] → 127.0.0.1:${cfg.antigravityDedicatedPort} (含 Antigravity.exe / language_server.exe 进程规则)`
       );
-      return this.probeAntigravityNodeNow();
+      return this.getSnapshot();
     } else {
-      this.antigravityProbeSeq++;
       this.antigravityPendingReprobe = false;
-      const cfg = this.configStore.update({
-        antigravityClashNode: null,
-        antigravityClashProfileUid: null,
-        antigravityClashProfileName: null,
-      });
       await this.clashMonitor.configureAntigravityNode(
         null,
-        cfg.antigravityDedicatedPort,
+        prevCfg.antigravityDedicatedPort,
         null,
-        true
+        true,
+        () => this.configStore.update({
+          antigravityClashNode: null,
+          antigravityClashProfileUid: null,
+          antigravityClashProfileName: null,
+        })
       );
       this.antigravityNodeProbe = null;
       this.antigravityNodeProbeError = null;
@@ -512,10 +544,17 @@ export class ProbeEngine extends EventEmitter {
     }
   }
 
-  /**
-   * 轻量探测 Antigravity 专属端口的出口 IP 与国家（纯界面展示，绝不触发任何警告或状态拦截）
-   */
+  private isCurrentAntigravityProbe(sequence: number, config: AppConfig): boolean {
+    const current = this.configStore.get();
+    return this.antigravitySwitchingCount === 0 && this.antigravityProbeSeq === sequence &&
+      current.antigravityClashNode === config.antigravityClashNode &&
+      current.antigravityClashProfileUid === config.antigravityClashProfileUid &&
+      current.antigravityDedicatedPort === config.antigravityDedicatedPort;
+  }
+
+  /** 探测 Antigravity 专属端口的出口地区，用于界面展示。 */
   public async probeAntigravityNodeNow(): Promise<AppStateSnapshot> {
+    if (this.antigravitySwitchingCount > 0) return this.getSnapshot();
     const cfg = this.configStore.get();
     if (!cfg.antigravityClashNode) {
       this.antigravityProbeSeq++;
@@ -537,6 +576,7 @@ export class ProbeEngine extends EventEmitter {
 
       try {
         while (!this.stopped) {
+          if (this.antigravitySwitchingCount > 0) break;
           this.antigravityPendingReprobe = false;
           const seqAtStart = ++this.antigravityProbeSeq;
           const curCfg = this.configStore.get();
@@ -589,10 +629,10 @@ export class ProbeEngine extends EventEmitter {
 
           if (
             !probeSuccess &&
-            this.antigravityProbeSeq === seqAtStart &&
-            this.configStore.get().antigravityClashNode === targetNode
+            this.isCurrentAntigravityProbe(seqAtStart, curCfg)
           ) {
             await sleep(320);
+            if (!this.isCurrentAntigravityProbe(seqAtStart, curCfg)) continue;
             const rebindRes = await this.clashMonitor.configureAntigravityNode(
               targetNode,
               curCfg.antigravityDedicatedPort,
@@ -610,18 +650,13 @@ export class ProbeEngine extends EventEmitter {
 
           if (
             probeSuccess &&
-            this.antigravityProbeSeq === seqAtStart &&
-            this.configStore.get().antigravityClashNode === targetNode
+            this.isCurrentAntigravityProbe(seqAtStart, curCfg)
           ) {
             await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'antigravity', true);
           }
 
           const afterCfg = this.configStore.get();
-          if (
-            this.antigravityProbeSeq !== seqAtStart ||
-            afterCfg.antigravityClashNode !== targetNode ||
-            afterCfg.antigravityClashProfileUid !== targetProfileUid
-          ) {
+          if (!this.isCurrentAntigravityProbe(seqAtStart, curCfg)) {
             if (afterCfg.antigravityClashNode) {
               continue;
             }
@@ -741,8 +776,9 @@ export class ProbeEngine extends EventEmitter {
     }
 
     let afterProc = await inspectRunningAntigravityProcesses(cfg.antigravityDedicatedPort, true);
-    for (let i = 0; i < 6; i++) {
-      if (afterProc.running) break;
+    const launchDeadline = Date.now() + 6000;
+    while (Date.now() < launchDeadline) {
+      if (afterProc.uiProcessCount > 0 && afterProc.proxiedSession) break;
       await sleep(250);
       afterProc = await inspectRunningAntigravityProcesses(cfg.antigravityDedicatedPort, true);
     }
@@ -751,7 +787,17 @@ export class ProbeEngine extends EventEmitter {
     this.antigravityUiCount = afterProc.uiProcessCount;
     this.antigravityLsCount = afterProc.languageServerCount;
     this.antigravityTotalCount = afterProc.totalProcessCount;
-    this.antigravityProxiedSession = afterProc.running;
+    this.antigravityProxiedSession = afterProc.proxiedSession;
+
+    if (afterProc.uiProcessCount === 0 || !afterProc.proxiedSession) {
+      markAntigravityLaunchedByGuard(null);
+      const message = afterProc.uiProcessCount === 0
+        ? '启动 Antigravity 失败：未检测到主进程运行'
+        : '启动 Antigravity 失败：未确认主进程绑定指定代理端口';
+      this.addLog('danger', message);
+      this.emitState();
+      return { ok: false, message, state: this.getSnapshot() };
+    }
 
     if (!this.antigravityNodeProbe && !this.antigravityIsProbing) {
       void this.probeAntigravityNodeNow();
@@ -836,30 +882,30 @@ export class ProbeEngine extends EventEmitter {
         `正在将 Claude 专属代理通道切换至 Clash 节点：[${cleanNode}] (127.0.0.1:${prevCfg.dedicatedProxyPort})...`
       );
       let bindRes: Awaited<ReturnType<ClashMonitor['configureDedicatedNode']>>;
+      let cfg = prevCfg;
       try {
         bindRes = await this.clashMonitor.configureDedicatedNode(
           cleanNode,
           prevCfg.dedicatedProxyPort,
           effectiveProfileUid,
-          true
+          true,
+          (resolvedUid, resolvedName) => {
+            cfg = this.configStore.update({
+              selectedClashNode: cleanNode,
+              selectedClashProfileUid: resolvedUid,
+              selectedClashProfileName: resolvedName,
+            });
+          }
         );
-      } catch (err) {
-        this.claudeSwitchingCount = Math.max(0, this.claudeSwitchingCount - 1);
-        throw err;
+      } finally {
+        this.claudeSwitchingCount--;
       }
-
-      const cfg = this.configStore.update({
-        selectedClashNode: cleanNode,
-        selectedClashProfileUid: bindRes.profileUid ?? effectiveProfileUid,
-        selectedClashProfileName: bindRes.profileName ?? prevCfg.selectedClashProfileName,
-      });
 
       const fullLabel = cfg.selectedClashProfileName
         ? `${cfg.selectedClashProfileName} / ${cleanNode}`
         : cleanNode;
 
       if (!bindRes.ok) {
-        this.claudeSwitchingCount = Math.max(0, this.claudeSwitchingCount - 1);
         const errText = bindRes.error || `绑定 Claude 节点 [${fullLabel}] 失败`;
         this.claudeNodeProbeError = errText;
         this.addLog('warn', errText);
@@ -875,21 +921,19 @@ export class ProbeEngine extends EventEmitter {
         `已锁定 Claude 专属节点 [${fullLabel}] → 本地专属端口 127.0.0.1:${cfg.dedicatedProxyPort}`
       );
 
-      this.claudeSwitchingCount = Math.max(0, this.claudeSwitchingCount - 1);
       return this.probeClaudeNodeNow(`切换 Claude 专属节点: ${fullLabel}`);
     } else {
-      this.claudeProbeSeq++;
       this.claudePendingProbe = null;
       this.claudeSwitchingCount++;
-      const cfg = this.configStore.update({
-        selectedClashNode: null,
-        selectedClashProfileUid: null,
-        selectedClashProfileName: null,
-      });
       try {
-        await this.clashMonitor.configureDedicatedNode(null, cfg.dedicatedProxyPort, null, true);
+        await this.clashMonitor.configureDedicatedNode(null, prevCfg.dedicatedProxyPort, null, true,
+          () => this.configStore.update({
+            selectedClashNode: null,
+            selectedClashProfileUid: null,
+            selectedClashProfileName: null,
+          }));
       } finally {
-        this.claudeSwitchingCount = Math.max(0, this.claudeSwitchingCount - 1);
+        this.claudeSwitchingCount--;
       }
       this.claudeNodeProbe = null;
       this.claudeNodeProbeError = null;
@@ -1231,7 +1275,7 @@ export class ProbeEngine extends EventEmitter {
     }
 
     let afterProc = { running: false, count: 0, pids: [] as number[] };
-    for (let i = 0; i < 5; i++) {
+    while (Date.now() < this.claudeLaunchGraceUntil) {
       await sleep(250);
       afterProc = await countRunningClaudeProcesses(true);
       if (afterProc.running) break;
@@ -1241,9 +1285,14 @@ export class ProbeEngine extends EventEmitter {
     this.claudeProcessCount = afterProc.count;
     this.claudeRunningPids = afterProc.pids;
     this.claudeFastCheckTicks = 0;
-    if (afterProc.running) {
-      this.claudeSeenRunningSinceAuth = true;
+    if (!afterProc.running) {
+      this.unsetClaudeAuthLock();
+      const message = '启动 Claude 失败：未检测到主进程运行';
+      this.addLog('danger', message);
+      this.emitState();
+      return { ok: false, message, state: this.getSnapshot() };
     }
+    this.claudeSeenRunningSinceAuth = true;
 
     const fullNodeLabel = cfg.selectedClashProfileName
       ? `${cfg.selectedClashProfileName} / ${cfg.selectedClashNode}`
@@ -1451,7 +1500,7 @@ export class ProbeEngine extends EventEmitter {
           }
 
           // 拦截 2：无论是否开启唯一启动入口，只要 Claude 在运行，一旦出现「Claude 选定节点地区 ↔ 系统时区/区域」不一致或断连，立即剥夺授权并强杀！
-          if (proc.running && !this.claudeIsProbing && this.claudeSwitchingCount === 0) {
+          if (proc.running) {
             const killedOrBlocked = await this.enforceClaudeRunningSafety('Claude 运行期实时监控');
             if (killedOrBlocked) {
               scheduleNext(1500);
@@ -1485,8 +1534,13 @@ export class ProbeEngine extends EventEmitter {
    * 校验正在运行的 Claude 是否满足其独立选定节点的三重安全条件，不满足时尝试自愈复核，仍不满足则立即强杀并弹窗
    */
   private async enforceClaudeRunningSafety(triggerContext: string): Promise<boolean> {
+    if (!this.claudeRunning) return false;
+    const cfg = this.configStore.get();
+    const localCheck = this.evaluateClaudeLocalSafety(
+      this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
+    );
+    if (localCheck) return this.terminateUnsafeClaude(localCheck, triggerContext);
     if (
-      !this.claudeRunning ||
       this.claudeIsProbing ||
       this.claudeSwitchingCount > 0 ||
       this.isEnforcingClaudeSafety
@@ -1495,8 +1549,6 @@ export class ProbeEngine extends EventEmitter {
     }
     this.isEnforcingClaudeSafety = true;
     try {
-      const cfg = this.configStore.get();
-
       let check = this.evaluateClaudeSafety(
         this.claudeAuthorizedSession || cfg.claudeExclusiveGuard
       );
@@ -1528,10 +1580,19 @@ export class ProbeEngine extends EventEmitter {
         }
       }
 
-      if (check.safe) {
+      if (check.safe || !this.claudeRunning) {
         return false;
       }
 
+      return await this.terminateUnsafeClaude(check, triggerContext);
+    } finally {
+      this.isEnforcingClaudeSafety = false;
+    }
+  }
+
+  private terminateUnsafeClaude(check: ClaudeSafetyCheck, triggerContext: string): Promise<boolean> {
+    if (this.claudeSafetyKillPromise) return this.claudeSafetyKillPromise;
+    const operation = async () => {
       this.unsetClaudeAuthLock();
 
       const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
@@ -1564,19 +1625,15 @@ export class ProbeEngine extends EventEmitter {
       }
 
       return true;
-    } finally {
-      this.isEnforcingClaudeSafety = false;
-    }
+    };
+    this.claudeSafetyKillPromise = operation().finally(() => {
+      this.claudeSafetyKillPromise = null;
+    });
+    return this.claudeSafetyKillPromise;
   }
 
-  private evaluateClaudeSafety(requireDedicatedNode = true): {
-    safe: boolean;
-    reason: string;
-    alertType: 'mismatch' | 'disconnect' | 'locale-mismatch';
-  } {
+  private evaluateClaudeLocalSafety(requireDedicatedNode: boolean): ClaudeSafetyCheck | null {
     const cfg = this.configStore.get();
-    const clash = this.clashMonitor.getRuntimeInfo();
-
     const launchedPort = getLaunchedClaudePort();
     if (
       this.claudeAuthorizedSession &&
@@ -1598,6 +1655,24 @@ export class ProbeEngine extends EventEmitter {
       };
     }
 
+    const probe = this.claudeNodeProbe;
+    if (probe && isValidIsoCountryCode(probe.countryCode) &&
+        !isWindowsLocaleMatchingCountry(this.winLocale.timeZoneId, this.winLocale.regionCode, probe.countryCode)) {
+      return {
+        safe: false,
+        reason: `Claude 节点地区 [${probe.countryName} (${probe.countryCode})] 与系统时区/区域 [${this.winLocale.regionName} · ${this.winLocale.timeZoneDisplayName}] 不一致`,
+        alertType: 'locale-mismatch',
+      };
+    }
+    return null;
+  }
+
+  private evaluateClaudeSafety(requireDedicatedNode = true): ClaudeSafetyCheck {
+    const localCheck = this.evaluateClaudeLocalSafety(requireDedicatedNode);
+    if (localCheck) return localCheck;
+    const cfg = this.configStore.get();
+    const clash = this.clashMonitor.getRuntimeInfo();
+
     if (cfg.selectedClashNode && (!clash.connected || !clash.dedicatedPortListening)) {
       return {
         safe: false,
@@ -1615,7 +1690,6 @@ export class ProbeEngine extends EventEmitter {
     }
 
     const proxyCountry = this.claudeNodeProbe.countryCode.toUpperCase();
-    const proxyCountryName = this.claudeNodeProbe.countryName;
 
     if (!isValidIsoCountryCode(proxyCountry)) {
       return {
@@ -1631,19 +1705,6 @@ export class ProbeEngine extends EventEmitter {
         safe: false,
         reason: `目标服务地区校验未通过：${verificationError}`,
         alertType: 'mismatch',
-      };
-    }
-
-    const localeMatched = isWindowsLocaleMatchingCountry(
-      this.winLocale.timeZoneId,
-      this.winLocale.regionCode,
-      proxyCountry
-    );
-    if (!localeMatched) {
-      return {
-        safe: false,
-        reason: `Claude 节点地区 [${proxyCountryName} (${proxyCountry})] 与系统时区/区域 [${this.winLocale.regionName} · ${this.winLocale.timeZoneDisplayName}] 不一致`,
-        alertType: 'locale-mismatch',
       };
     }
 
@@ -1895,66 +1956,61 @@ export class ProbeEngine extends EventEmitter {
   }
 
   public evaluateStatusOnly(reason?: string): AppStateSnapshot {
+    void this.applyMonitorStatus(reason || '状态更新');
+    return this.getSnapshot();
+  }
+
+  private async applyMonitorStatus(reason: string, logResult = false, probeChanged = false): Promise<void> {
     const cfg = this.configStore.get();
-    const effectiveTarget = this.getEffectiveTargetCountryCode();
-
-    if (!cfg.monitorAlertEnabled) {
-      this.lastAlertSignature = null;
-    }
-
+    const previousStatus = this.status;
+    let transition: 'disconnect' | 'mismatch' | 'locale-mismatch' | null = null;
+    if (!cfg.monitorAlertEnabled) this.lastAlertSignature = null;
     if (this.lastError) {
       this.status = 'error';
-      if (!effectiveTarget) {
-        this.lastAlertSignature = null;
-        this.lastGuardFailSignature = null;
-      } else {
-        void this.handleDisconnectTransition(reason || '状态更新', this.lastError);
-      }
-      this.emitState();
-      return this.getSnapshot();
-    }
-
-    if (this.lastProbe) {
+      transition = 'disconnect';
+    } else if (this.lastProbe) {
       const probeCode = this.lastProbe.countryCode.toUpperCase();
-      const localeMatchedWithProbe = isWindowsLocaleMatchingCountry(
-        this.winLocale.timeZoneId,
-        this.winLocale.regionCode,
-        probeCode
-      );
-
       if (!isValidIsoCountryCode(probeCode)) {
         this.status = 'unset';
-        this.lastAlertSignature = null;
-        this.lastGuardFailSignature = null;
       } else if (cfg.defaultCountryCode && probeCode !== cfg.defaultCountryCode.toUpperCase()) {
         this.status = 'mismatch';
-        void this.handleMismatchTransition(reason || '默认地区配置更新');
-        this.emitState();
-        return this.getSnapshot();
-      } else if (!localeMatchedWithProbe) {
+        transition = 'mismatch';
+      } else if (!isWindowsLocaleMatchingCountry(this.winLocale.timeZoneId, this.winLocale.regionCode, probeCode)) {
         this.status = 'mismatch';
-        void this.handleLocaleMismatchTransition(reason || '系统时区或区域变更');
-        this.emitState();
-        return this.getSnapshot();
+        transition = 'locale-mismatch';
       } else {
         this.status = 'ok';
-        if (this.lastAlertSignature !== null) {
-          this.lastAlertSignature = null;
-          if (cfg.monitorAlertEnabled) {
-            this.emitRecoveredAlert();
-          }
-        }
       }
     }
 
-    if (effectiveTarget) {
-      void this.enforceProcessGuardInBackground();
-    } else {
+    if (!this.getEffectiveTargetCountryCode() || this.status === 'unset') {
+      this.lastAlertSignature = null;
       this.lastGuardFailSignature = null;
     }
-
-    this.emitState();
-    return this.getSnapshot();
+    if (logResult && (probeChanged || previousStatus !== this.status || reason !== '轻量心跳巡检')) {
+      const detail = this.lastError || (this.lastProbe
+        ? `${this.lastProbe.countryName} (${this.lastProbe.countryCode}) · IP: ${this.lastProbe.ip}`
+        : '尚未获得出口信息');
+      const label = transition === 'disconnect' ? '代理连接失败'
+        : transition === 'mismatch' ? `出口偏离保护地区 [${cfg.defaultCountryName}]`
+        : transition === 'locale-mismatch' ? '出口与系统时区/区域不一致'
+        : this.status === 'ok' ? '出口与系统时区/区域一致' : '出口地区待确认';
+      this.addLog(this.status === 'ok' ? 'success' : transition ? 'warn' : 'info', `${label}：${detail}`);
+    }
+    try {
+      if (transition === 'disconnect') await this.handleDisconnectTransition(reason, this.lastError!);
+      else if (transition === 'mismatch') await this.handleMismatchTransition(reason);
+      else if (transition === 'locale-mismatch') await this.handleLocaleMismatchTransition(reason);
+      else if (this.status === 'ok') {
+        if (this.lastAlertSignature !== null) {
+          this.lastAlertSignature = null;
+          if (cfg.monitorAlertEnabled) this.emitRecoveredAlert();
+        }
+        await this.enforceProcessGuardInBackground();
+      }
+    } finally {
+      this.emitState();
+    }
   }
 
   public async checkNow(reason = '手动立即检测'): Promise<AppStateSnapshot> {
@@ -2005,87 +2061,17 @@ export class ProbeEngine extends EventEmitter {
         }
       }
 
-      const cfg = this.configStore.get();
-
+      const probeChanged = this.lastProbe?.ip !== probeSuccess?.ip ||
+        this.lastProbe?.countryCode !== probeSuccess?.countryCode;
       if (probeSuccess) {
-        const prevIp = this.lastProbe?.ip;
-        const prevCountry = this.lastProbe?.countryCode;
-
         this.lastProbe = probeSuccess;
         this.lastError = null;
-
-        const probeCode = probeSuccess.countryCode.toUpperCase();
-        const localeMatchedWithProbe = isWindowsLocaleMatchingCountry(
-          this.winLocale.timeZoneId,
-          this.winLocale.regionCode,
-          probeCode
-        );
-
-        if (!isValidIsoCountryCode(probeCode)) {
-          this.status = 'unset';
-          this.lastAlertSignature = null;
-          this.lastGuardFailSignature = null;
-          if (prevIp !== probeSuccess.ip || prevCountry !== probeSuccess.countryCode) {
-            this.addLog(
-              'info',
-              `当前出口: ${probeSuccess.countryName} (${probeSuccess.countryCode}) · ${probeSuccess.ip}`
-            );
-          }
-        } else if (cfg.defaultCountryCode && probeCode !== cfg.defaultCountryCode.toUpperCase()) {
-          this.status = 'mismatch';
-          if (
-            prevIp !== probeSuccess.ip ||
-            prevCountry !== probeSuccess.countryCode ||
-            reason !== '轻量心跳巡检'
-          ) {
-            this.addLog(
-              'danger',
-              `实时监控地区不匹配！期望 [${cfg.defaultCountryName}]，实际为 [${probeSuccess.countryName} (${probeSuccess.countryCode})] · IP: ${probeSuccess.ip}`
-            );
-          }
-          await this.handleMismatchTransition(reason);
-        } else if (!localeMatchedWithProbe) {
-          this.status = 'mismatch';
-          if (
-            prevIp !== probeSuccess.ip ||
-            prevCountry !== probeSuccess.countryCode ||
-            reason !== '轻量心跳巡检'
-          ) {
-            this.addLog(
-              'warn',
-              `实时监控出口 [${probeSuccess.countryName} (${probeCode})] 与系统时区/区域 [${this.winLocale.regionName} (${this.winLocale.regionCode})] 不一致 · IP: ${probeSuccess.ip}`
-            );
-          }
-          await this.handleLocaleMismatchTransition(reason);
-        } else {
-          const wasAbnormal = this.status === 'mismatch' || this.status === 'error';
-          this.status = 'ok';
-          if (
-            wasAbnormal ||
-            prevIp !== probeSuccess.ip ||
-            prevCountry !== probeSuccess.countryCode
-          ) {
-            this.addLog(
-              'success',
-              `实时监控出口与时区一致 [${probeSuccess.countryName}] · IP: ${probeSuccess.ip} (${probeSuccess.latencyMs}ms)`
-            );
-          }
-          if (this.lastAlertSignature !== null) {
-            this.lastAlertSignature = null;
-            if (cfg.monitorAlertEnabled) {
-              this.emitRecoveredAlert();
-            }
-          }
-          await this.enforceProcessGuardInBackground();
-        }
       } else {
         this.lastError = channel.errorHint
           ? channel.errorHint
           : simplifyNetworkError(lastErrMsg, channel.description);
-        this.status = 'error';
-        this.addLog('warn', `实时监控代理检测失败：${this.lastError}`);
-        await this.handleDisconnectTransition(reason, this.lastError);
       }
+      await this.applyMonitorStatus(reason, true, probeChanged);
     } finally {
       this.isChecking = false;
       this.emitState();
@@ -2126,6 +2112,29 @@ export class ProbeEngine extends EventEmitter {
       this.emitState();
     }
     return { ...result, state: this.getSnapshot() };
+  }
+
+  private async stopProcessesBeforeLocaleChange(
+    targetCode: string,
+    targetTimeZone: string
+  ): Promise<ProcessKillReport> {
+    const cfg = this.configStore.get();
+    const stopClaude = !isWindowsLocaleMatchingCountry(
+      targetTimeZone, targetCode, this.claudeNodeProbe?.countryCode
+    );
+    const stopProtected = cfg.killProcessesEnabled && cfg.killOnLocaleMismatch &&
+      !isWindowsLocaleMatchingCountry(targetTimeZone, targetCode, this.getEffectiveTargetCountryCode());
+    const patterns = [...new Set([
+      ...(stopClaude ? CLAUDE_DESKTOP_PROCESS_PATTERNS : []),
+      ...(stopProtected ? cfg.protectedProcessPatterns : []),
+    ])];
+    if (stopClaude) this.unsetClaudeAuthLock();
+    const report = await this.executeProcessKillSafely(patterns);
+    await assertProcessesStopped(patterns, report);
+    if (report.killedCount > 0) {
+      this.addLog('info', `修改系统时区与区域前已终止关联进程：${report.killedSummary.join(', ')}`);
+    }
+    return report;
   }
 
   private async syncSystemLocaleInternal(
@@ -2172,40 +2181,6 @@ export class ProbeEngine extends EventEmitter {
     const killedProcesses: string[] = [];
 
     {
-      // 若 Claude 正在运行，且即将切换的目标时区国家与 Claude 选定节点国家不一致（或 Claude 节点尚未检测出地区），必须先终止 Claude 以防暴露
-      if (this.claudeRunning && claudeCode !== targetCode) {
-        this.unsetClaudeAuthLock();
-        const killReport = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
-        const claudeRegionLabel = claudeCode ? getCountryNameZh(claudeCode) : '未知/未就绪';
-        if (killReport.killedCount > 0) {
-          killedProcesses.push(...killReport.killedSummary);
-          this.addLog(
-            'danger',
-            `同步系统时区至 [${getCountryNameZh(targetCode)}] 前检测到与运行中的 Claude 节点地区 [${claudeRegionLabel}] 不符，已先行终止：${killReport.killedSummary.join(', ')}`
-          );
-        }
-        if (killReport.failedPids.length > 0) {
-          const abortMsg = `${
-            killReport.errorDetail || '运行中的 Claude 进程无法终止'
-          }，已中止同步系统时区以防暴露！`;
-          this.addLog('danger', abortMsg);
-          this.emitAlert({
-            source: 'claude',
-            alertType: 'locale-mismatch',
-            expectedCode: claudeCode || targetCode,
-            expectedName: claudeCode ? getCountryNameZh(claudeCode) : getCountryNameZh(targetCode),
-            triggerReason: '同步系统时区被安全拦截（运行中的 Claude 进程未能终止）',
-            killedProcesses: killedProcesses.length > 0 ? killedProcesses : undefined,
-            killError: killReport.errorDetail,
-          });
-          return {
-            ok: false,
-            message: abortMsg,
-            killedProcesses,
-          };
-        }
-      }
-
       let exactIanaTz: string | null = null;
       const needsCityTzLookup =
         isMultiTimeZoneCountry(targetCode) || !hasOfflineTimeZoneMapping(targetCode);
@@ -2248,6 +2223,11 @@ export class ProbeEngine extends EventEmitter {
       }
 
       const resolved = resolveWindowsTimeZoneForCountry(targetCode, exactIanaTz);
+      const currentLocale = await readWindowsLocaleState();
+      if (currentLocale.regionCode !== targetCode || currentLocale.timeZoneId !== resolved.windowsTimeZoneId) {
+        const report = await this.stopProcessesBeforeLocaleChange(targetCode, resolved.windowsTimeZoneId);
+        killedProcesses.push(...report.killedSummary);
+      }
       const applyRes = await applyWindowsTimeZoneAndRegion(resolved.windowsTimeZoneId, targetCode);
       this.winLocale = applyRes.updated;
 
@@ -2382,9 +2362,7 @@ export class ProbeEngine extends EventEmitter {
           };
         }
 
-        if (killReport.killedCount > 0) {
-          await sleep(80);
-        }
+        await assertProcessesStopped(combinedPatterns, killReport);
       }
 
       const applyRes = await applyWindowsTimeZoneAndRegion(
@@ -2504,29 +2482,8 @@ export class ProbeEngine extends EventEmitter {
       return;
     }
 
-    const report = await this.executeProcessKillSafely(cfg.protectedProcessPatterns);
-    if (report.killedCount === 0 && report.failedPids.length === 0) {
-      this.lastGuardFailSignature = null;
-      return;
-    }
-
-    const failSig =
-      report.failedPids.length > 0 ? `${unsafeType}:${report.failedPids.join(',')}` : null;
-    if (report.killedCount === 0 && failSig && failSig === this.lastGuardFailSignature) {
-      return;
-    }
-    this.lastGuardFailSignature = failSig;
-
-    if (report.killedCount > 0) {
-      this.addLog(
-        'danger',
-        `已自动强杀受保护进程：${report.killedSummary.join(', ')} · 原因：${unsafeReason}`
-      );
-    }
-    if (report.errorDetail) {
-      this.addLog('warn', report.errorDetail);
-    }
-    this.emitState();
+    const result = await this.terminateMonitorProcesses(cfg.protectedProcessPatterns, unsafeType, unsafeReason);
+    if (!result.hasKillEvent) return;
 
     if (unsafeType === 'locale-mismatch') {
       this.lastAlertSignature = `locale-mismatch:${targetCountry}:${this.winLocale.regionCode}:${this.winLocale.timeZoneId}`;
@@ -2539,9 +2496,35 @@ export class ProbeEngine extends EventEmitter {
       expectedName: targetCountryName,
       triggerReason: unsafeReason,
       errorDetail: unsafeType === 'disconnect' ? this.lastError || undefined : undefined,
+      killedProcesses: result.killedProcesses,
+      killError: result.killError,
+    });
+  }
+
+  private async terminateMonitorProcesses(
+    patterns: string[],
+    type: 'mismatch' | 'disconnect' | 'locale-mismatch',
+    reason: string
+  ): Promise<{ killedProcesses?: string[]; killError?: string; hasKillEvent: boolean }> {
+    if (patterns.length === 0) {
+      this.lastGuardFailSignature = null;
+      return { hasKillEvent: false };
+    }
+    const report = await this.executeProcessKillSafely(patterns);
+    const failSig = report.failedPids.length > 0 ? `${type}:${report.failedPids.join(',')}` : null;
+    const newFailure = Boolean(failSig && failSig !== this.lastGuardFailSignature);
+    this.lastGuardFailSignature = failSig;
+    const hasKillEvent = report.killedCount > 0 || newFailure;
+    if (report.killedCount > 0) {
+      this.addLog('danger', `已终止受保护进程：${report.killedSummary.join(', ')} · ${reason}`);
+    }
+    if (newFailure && report.errorDetail) this.addLog('warn', report.errorDetail);
+    if (hasKillEvent) this.emitState();
+    return {
       killedProcesses: report.killedCount > 0 ? report.killedSummary : undefined,
       killError: report.errorDetail,
-    });
+      hasKillEvent,
+    };
   }
 
   private async handleLocaleMismatchTransition(reason: string): Promise<void> {
@@ -2578,41 +2561,14 @@ export class ProbeEngine extends EventEmitter {
     const cfg = this.configStore.get();
     if (!cfg.defaultCountryCode || !this.lastProbe) return;
 
-    let killedProcesses: string[] | undefined;
-    let killError: string | undefined;
-    let addedLogs = false;
-
-    // 注意：实时监控仅管理【进程守护】Tab 中的自定义受保护进程；Claude 由其专属节点独立监控保护，绝不因 Clash 全局通道切换而误杀 Claude
     const patternsToKill = cfg.killProcessesEnabled ? cfg.protectedProcessPatterns : [];
-
-    if (patternsToKill.length > 0) {
-      const report = await this.executeProcessKillSafely(patternsToKill);
-
-      if (report.killedCount > 0) {
-        killedProcesses = report.killedSummary;
-        this.addLog(
-          'danger',
-          `地区变更保护已触发，强杀受保护进程：${report.killedSummary.join(', ')}`
-        );
-        addedLogs = true;
-      }
-      if (report.errorDetail) {
-        killError = report.errorDetail;
-        this.lastGuardFailSignature = `mismatch:${report.failedPids.join(',')}`;
-        this.addLog('warn', report.errorDetail);
-        addedLogs = true;
-      }
-    }
-
-    if (addedLogs) {
-      this.emitState();
-    }
+    const { killedProcesses, killError, hasKillEvent } =
+      await this.terminateMonitorProcesses(patternsToKill, 'mismatch', reason);
 
     if (!cfg.monitorAlertEnabled) {
       return;
     }
 
-    const hasKillEvent = Boolean((killedProcesses && killedProcesses.length > 0) || killError);
     const sig = `mismatch:${cfg.defaultCountryCode}->${this.lastProbe.countryCode}`;
     const isSameSig = this.lastAlertSignature === sig;
     this.lastAlertSignature = sig;
@@ -2637,37 +2593,10 @@ export class ProbeEngine extends EventEmitter {
     const targetCountry = this.getEffectiveTargetCountryCode();
     if (!targetCountry) return;
 
-    let killedProcesses: string[] | undefined;
-    let killError: string | undefined;
-    let addedLogs = false;
-
     const patternsToKill =
       cfg.killProcessesEnabled && cfg.killOnDisconnect ? cfg.protectedProcessPatterns : [];
-
-    if (patternsToKill.length > 0) {
-      const report = await this.executeProcessKillSafely(patternsToKill);
-
-      if (report.killedCount > 0) {
-        killedProcesses = report.killedSummary;
-        this.addLog(
-          'danger',
-          `代理断连保护已触发，强杀受保护进程：${report.killedSummary.join(', ')}`
-        );
-        addedLogs = true;
-      }
-      if (report.errorDetail) {
-        killError = report.errorDetail;
-        this.lastGuardFailSignature = `disconnect:${report.failedPids.join(',')}`;
-        this.addLog('warn', report.errorDetail);
-        addedLogs = true;
-      }
-    }
-
-    if (addedLogs) {
-      this.emitState();
-    }
-
-    const hasKillEvent = Boolean((killedProcesses && killedProcesses.length > 0) || killError);
+    const { killedProcesses, killError, hasKillEvent } =
+      await this.terminateMonitorProcesses(patternsToKill, 'disconnect', reason);
     if (!cfg.monitorAlertEnabled || (!cfg.alertOnDisconnect && !hasKillEvent)) {
       return;
     }
