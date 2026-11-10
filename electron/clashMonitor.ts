@@ -1798,16 +1798,21 @@ export class ClashMonitor extends EventEmitter {
       }
     }
 
-    // 若已绑定专属节点且 Mihomo 内核中存在注入的专属代理，同步其最新测速延迟到对应节点
+    // 若已绑定专属节点且 Mihomo 内核中存在注入的专属代理，同步其最新测速延迟与存活状态到对应节点
     for (const slot of [this.slots.claude, this.slots.antigravity]) {
       const dedicatedLive = activeProxiesMap[slot.internalProxyName];
       const dedicatedDelay = extractProxyDelay(dedicatedLive);
-      if (dedicatedDelay && slot.desiredNodeName) {
+      if (dedicatedLive && slot.desiredNodeName) {
         for (const prof of resolvedProfiles) {
           if (!slot.desiredProfileUid || prof.uid === slot.desiredProfileUid) {
             for (const n of prof.nodes) {
-              if (n.name === slot.desiredNodeName && !n.delay) {
-                n.delay = dedicatedDelay;
+              if (n.name === slot.desiredNodeName) {
+                if (dedicatedDelay && !n.delay) {
+                  n.delay = dedicatedDelay;
+                }
+                if (dedicatedLive.alive === false) {
+                  n.alive = false;
+                }
               }
             }
           }
@@ -2609,7 +2614,13 @@ function buildAllGroupsSignature(proxies: Record<string, ClashProxyItem>): strin
 
 function buildProfilesSignature(groups: ClashProfileGroupOption[]): string {
   return groups
-    .map((g) => `${g.uid}:${g.isActive ? 1 : 0}:${g.nodeCount}`)
+    .map((g) => {
+      const delaySig = g.nodes
+        .map((n) => (n.delay || n.alive === false ? `${n.delay || 0}:${n.alive === false ? 0 : 1}` : ''))
+        .filter(Boolean)
+        .join(',');
+      return `${g.uid}:${g.isActive ? 1 : 0}:${g.nodeCount}:${delaySig}`;
+    })
     .join('|');
 }
 

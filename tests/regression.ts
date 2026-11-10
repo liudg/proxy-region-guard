@@ -22,6 +22,10 @@ import {
   isWindowsLocaleMatchingCountry,
   resolveWindowsTimeZoneForCountry,
 } from '../src/shared/timezones';
+import {
+  buildNodeSearchText,
+  inferNodeCountryCode,
+} from '../src/shared/countries';
 import { ProbeResult } from '../src/shared/types';
 import { createStatusTrayIcon, createWindowAppIcon } from '../electron/trayIcon';
 import { countRunningClaudeProcesses } from '../electron/claudeController';
@@ -48,6 +52,28 @@ async function run(): Promise<void> {
     for (const [country, zone] of Object.entries(COUNTRY_DEFAULT_WINDOWS_TZ)) {
       assert.equal(isWindowsLocaleMatchingCountry(zone, country, country), true, country);
     }
+  });
+
+  await check('节点国家/地区智能识别与中英文同义词索引准确无误', () => {
+    assert.equal(inferNodeCountryCode('🇺🇸 美国 01'), 'US');
+    assert.equal(inferNodeCountryCode('🇺🇲 Silicon Valley BGP'), 'US');
+    assert.equal(inferNodeCountryCode('US-SJC-01'), 'US');
+    assert.equal(inferNodeCountryCode('🇯🇵 Tokyo IEPL 02'), 'JP');
+    assert.equal(inferNodeCountryCode('狮城 BGP 01'), 'SG');
+    assert.equal(inferNodeCountryCode('HK01-深港专线'), 'HK');
+    assert.equal(inferNodeCountryCode('TW-彰化-01'), 'TW');
+    assert.equal(inferNodeCountryCode('No.1 专线'), null);
+    assert.equal(inferNodeCountryCode('No.1 英国伦敦'), 'GB');
+
+    const usSearch = buildNodeSearchText('US-SJC-01', 'vless', 'SubA', 'US');
+    assert.ok(usSearch.includes('美国'));
+    assert.ok(usSearch.includes('united states'));
+    assert.ok(usSearch.includes('vless'));
+
+    const jpSearch = buildNodeSearchText('🇯🇵 东京 01', 'trojan', 'SubB', 'JP');
+    assert.ok(jpSearch.includes('jp'));
+    assert.ok(jpSearch.includes('japan'));
+    assert.ok(jpSearch.includes('日本'));
   });
 
   const store = new ConfigStore();
