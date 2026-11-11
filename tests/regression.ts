@@ -7,8 +7,13 @@ import { once } from 'node:events';
 import { channel } from 'node:diagnostics_channel';
 import { ClientRequest } from 'node:http';
 import { setTimeout as sleep } from 'node:timers/promises';
+import * as yaml from 'js-yaml';
 import { ConfigStore } from '../electron/configStore';
-import { buildProfilesSignature, ClashMonitor } from '../electron/clashMonitor';
+import {
+  buildProfilesSignature,
+  buildSlotDefinitionSignature,
+  ClashMonitor,
+} from '../electron/clashMonitor';
 import { GeoIpService } from '../electron/geoipService';
 import { ProbeEngine } from '../electron/probeEngine';
 import {
@@ -116,6 +121,424 @@ async function run(): Promise<void> {
     const named = buildProfilesSignature([group]);
     group.nodes[1].name = 'C';
     assert.notEqual(buildProfilesSignature([group]), named);
+  });
+
+  await check('专属节点定义签名忽略无关全局域名策略并精确感知目标节点与链路变更', () => {
+    const baseDef = {
+      profileUid: 'prof-1',
+      profileName: '订阅一',
+      rawProxy: { name: 'JP-Hy2', type: 'hysteria2', server: 'jp7.example-node.net', port: 443, udp: true },
+      dialerChain: [{ name: 'Relay-1', type: 'ss', server: 'relay.transit-host.org', port: 8388 }],
+      hosts: {} as Record<string, string>,
+      nameserverPolicy: {} as Record<string, string[]>,
+    };
+    const baseSig = buildSlotDefinitionSignature(baseDef);
+
+    // 无关的运行时全局 hosts / nameserver-policy 与订阅显示名变更不应触发节点定义变化
+    const withUnrelatedPolicies = {
+      ...baseDef,
+      profileName: '订阅一 (重命名)',
+      hosts: { 'router.lan': '192.168.1.1', 'other.example.com': '1.2.3.4' },
+      nameserverPolicy: {
+        '+.quandao.com': ['223.5.5.5'],
+        '+.jiandaoyun.com': ['223.5.5.5'],
+        'geosite:cn': ['https://dns.alidns.com/dns-query'],
+      },
+    };
+    assert.equal(buildSlotDefinitionSignature(withUnrelatedPolicies), baseSig);
+
+    // 命中目标节点或链式前置节点 server 域名的 DNS 规则或 hosts 变更必须更新签名
+    const withMatchingNsPolicy = {
+      ...withUnrelatedPolicies,
+      nameserverPolicy: {
+        ...withUnrelatedPolicies.nameserverPolicy,
+        '+.example-node.net': ['https://dns.alidns.com/dns-query'],
+      },
+    };
+    assert.notEqual(buildSlotDefinitionSignature(withMatchingNsPolicy), baseSig);
+
+    const withMatchingDialerHost = {
+      ...withUnrelatedPolicies,
+      hosts: {
+        ...withUnrelatedPolicies.hosts,
+        'relay.transit-host.org': '203.0.113.10',
+      },
+    };
+    assert.notEqual(buildSlotDefinitionSignature(withMatchingDialerHost), baseSig);
+
+    const withWildcardDialerHost = {
+      ...withUnrelatedPolicies,
+      hosts: {
+        ...withUnrelatedPolicies.hosts,
+        '+.transit-host.org': '203.0.113.11',
+      },
+    };
+    assert.notEqual(buildSlotDefinitionSignature(withWildcardDialerHost), baseSig);
+
+    // 节点自身参数变更必须更新签名
+    const withPortChanged = {
+      ...baseDef,
+      rawProxy: { ...baseDef.rawProxy, port: 8443 },
+    };
+    assert.notEqual(buildSlotDefinitionSignature(withPortChanged), baseSig);
+
+    // 链式代理前置节点属于运行时动态节点时，应继承运行时 hosts 与 nameserver-policy
+    const tempMonitor = new ClashMonitor() as any;
+    const rawLeaf = {
+      name: 'Static-Leaf',
+      type: 'vmess',
+      server: 'leaf.static-domain.org',
+      port: 443,
+      'dialer-proxy': 'Runtime-Relay',
+    };
+    const rawRelay = {
+      name: 'Runtime-Relay',
+      type: 'ss',
+      server: 'relay.runtime-domain.org',
+      port: 8388,
+    };
+    const fakeProf = {
+      uid: 'prof-chain',
+      name: '链式测试订阅',
+      type: 'local',
+      isActive: true,
+      nodes: [],
+      rawMap: new Map([
+        ['Static-Leaf', rawLeaf],
+        ['Runtime-Relay', rawRelay],
+      ]),
+      hosts: {},
+      nameserverPolicy: {},
+      runtimeNodeNames: new Set(['Runtime-Relay']),
+      runtimeHosts: { '+.runtime-domain.org': '198.51.100.8' },
+      runtimeNameserverPolicy: { '+.runtime-domain.org': ['223.5.5.5'] },
+    };
+    const builtChainDef = tempMonitor.buildDefinitionFromProfile(fakeProf, 'Static-Leaf', rawLeaf);
+    assert.equal(builtChainDef.hosts['+.runtime-domain.org'], '198.51.100.8');
+    assert.deepEqual(builtChainDef.nameserverPolicy['+.runtime-domain.org'], ['223.5.5.5']);
+  });
+
+  await check('脚本重命名或改写 server、过滤提示节点与空底板订阅切换均准确归属', async () => {
+    const vergeDir = path.join(dataDirectory, 'verge-script-test');
+    const profilesDir = path.join(vergeDir, 'profiles');
+    fs.mkdirSync(profilesDir, { recursive: true });
+    const runtimeYaml = path.join(vergeDir, 'clash-verge.yaml');
+
+    fs.writeFileSync(
+      path.join(profilesDir, 'sub-a.yaml'),
+      yaml.dump({
+        proxies: [
+          { name: '剩余流量：99GB', type: 'ss', server: 'info.example.com', port: 8388, password: 'info-pass' },
+          { name: 'Tokyo-01', type: 'vless', server: 'origin-jp.example.com', port: 443, uuid: 'uuid-sub-a-jp' },
+          { name: 'US-01', type: 'trojan', server: 'origin-us.example.com', port: 443, password: 'pass-sub-a-us' },
+          { name: 'SG-01', type: 'ss', server: 'origin-sg.example.com', port: 8388, password: 'pass-sub-a-sg' },
+        ],
+      })
+    );
+    fs.writeFileSync(
+      path.join(profilesDir, 'sub-b.yaml'),
+      yaml.dump({
+        proxies: [
+          { name: 'Backup-HK', type: 'ss', server: 'hk-backup.example.com', port: 8388, password: 'pass-sub-b-hk' },
+          { name: 'SelfHosted-VPS', type: 'vless', server: 'vps.self-hosted.org', port: 443, uuid: 'uuid-self-vps' },
+        ],
+      })
+    );
+    fs.writeFileSync(path.join(profilesDir, 'sub-empty.yaml'), yaml.dump({ proxies: [] }));
+
+    const writeProfilesIndex = (currentUid: string) => {
+      fs.writeFileSync(
+        path.join(vergeDir, 'profiles.yaml'),
+        yaml.dump({
+          current: currentUid,
+          items: [
+            { uid: 'sub-a', name: '主力订阅', type: 'local', file: 'sub-a.yaml' },
+            { uid: 'sub-b', name: '备用订阅', type: 'local', file: 'sub-b.yaml' },
+            { uid: 'sub-empty', name: '空底板脚本订阅', type: 'local', file: 'sub-empty.yaml' },
+          ],
+        })
+      );
+    };
+
+    writeProfilesIndex('sub-a');
+    // 模拟全局 Script：剔除提示节点、加国旗前缀、原地改写 US-01 server、同时重命名+改写 SG-01、并追加与备用订阅同名的自建节点
+    fs.writeFileSync(
+      runtimeYaml,
+      yaml.dump({
+        proxies: [
+          { name: '🇯🇵 Tokyo-01', type: 'vless', server: 'origin-jp.example.com', port: 443, uuid: 'uuid-sub-a-jp' },
+          { name: 'US-01', type: 'trojan', server: 'transit-us.example.com', port: 8443, password: 'pass-sub-a-us' },
+          { name: '🇸🇬 SG-01', type: 'ss', server: 'transit-sg.example.com', port: 9388, password: 'pass-sub-a-sg' },
+          { name: 'SelfHosted-VPS', type: 'vless', server: 'vps.self-hosted.org', port: 443, uuid: 'uuid-self-vps' },
+        ],
+      })
+    );
+
+    const m = new ClashMonitor() as any;
+    m.currentEndpoint = { label: 'test', yamlFile: runtimeYaml };
+    const scanA = m.scanAllClashVergeProfiles({});
+    const groupA = scanA.profileGroups.find((g: ClashProfileGroupOption) => g.uid === 'sub-a')!;
+    const namesA = groupA.nodes.map((n) => n.name);
+    assert.ok(namesA.includes('🇯🇵 Tokyo-01'), '应保留脚本重命名节点');
+    assert.ok(namesA.includes('🇸🇬 SG-01'), '应保留脚本同时重命名并改写 server 的节点');
+    assert.ok(namesA.includes('SelfHosted-VPS'), '过滤提示节点后不应误删与未激活订阅同名的动态节点');
+    const usNode = groupA.nodes.find((n) => n.name === 'US-01')!;
+    assert.equal(usNode.server, 'transit-us.example.com');
+    assert.equal(usNode.port, 8443);
+    const usDef = m.resolveSlotTargetNodeDefinition({
+      desiredNodeName: 'US-01',
+      desiredProfileUid: 'sub-a',
+    });
+    assert.equal(usDef.rawProxy.server, 'transit-us.example.com');
+
+    // 切换至空底板订阅瞬间（clash-verge.yaml 尚未更新）：热切换与冷启动均不得混入旧节点
+    await sleep(20);
+    writeProfilesIndex('sub-empty');
+    const scanEmptyLive = m.scanAllClashVergeProfiles({});
+    const emptyGroupLive = scanEmptyLive.profileGroups.find(
+      (g: ClashProfileGroupOption) => g.uid === 'sub-empty'
+    )!;
+    assert.deepEqual(emptyGroupLive.nodes, [], '切换至空底板订阅瞬间不应泄漏旧 clash-verge.yaml 节点');
+
+    const coldMonitor = new ClashMonitor() as any;
+    coldMonitor.currentEndpoint = { label: 'test', yamlFile: runtimeYaml };
+    const scanEmptyCold = coldMonitor.scanAllClashVergeProfiles({});
+    const emptyGroupCold = scanEmptyCold.profileGroups.find(
+      (g: ClashProfileGroupOption) => g.uid === 'sub-empty'
+    )!;
+    assert.deepEqual(emptyGroupCold.nodes, [], '冷启动遇到未更新的旧 clash-verge.yaml 也不应泄漏至空订阅');
+
+    // 当空底板订阅的脚本完成生成并落盘 clash-verge.yaml 后，应正常加载脚本产出的节点
+    await sleep(20);
+    fs.writeFileSync(
+      runtimeYaml,
+      yaml.dump({
+        proxies: [
+          { name: 'Script-Gen-01', type: 'vless', server: 'gen.example.org', port: 443, uuid: 'uuid-gen-01' },
+        ],
+      })
+    );
+    const scanEmptyReady = m.scanAllClashVergeProfiles({});
+    const emptyGroupReady = scanEmptyReady.profileGroups.find(
+      (g: ClashProfileGroupOption) => g.uid === 'sub-empty'
+    )!;
+    assert.deepEqual(
+      emptyGroupReady.nodes.map((n) => n.name),
+      ['Script-Gen-01']
+    );
+  });
+
+  await check('增强管线 DNS 与 hosts 优先级严格遵循 原始订阅 < option.merge < 全局 Merge < dns_config.yaml < 运行时覆写', () => {
+    const vergeDir = path.join(dataDirectory, 'verge-dns-priority-test');
+    const profilesDir = path.join(vergeDir, 'profiles');
+    fs.mkdirSync(profilesDir, { recursive: true });
+    const runtimeYaml = path.join(vergeDir, 'clash-verge.yaml');
+
+    fs.writeFileSync(
+      path.join(profilesDir, 'base-sub.yaml'),
+      yaml.dump({
+        proxies: [{ name: 'Base-Node', type: 'ss', server: 'k4.example.org', port: 443, password: 'pw' }],
+        hosts: {
+          'k1.example.org': '10.0.0.1',
+          'k2.example.org': '10.0.0.1',
+          'k3.example.org': '10.0.0.1',
+          'k4.example.org': '10.0.0.1',
+        },
+        dns: {
+          'nameserver-policy': {
+            '+.k1.example.org': ['1.1.1.1'],
+            '+.k2.example.org': ['1.1.1.1'],
+            '+.k3.example.org': ['1.1.1.1'],
+            '+.k4.example.org': ['1.1.1.1'],
+          },
+        },
+      })
+    );
+    fs.writeFileSync(
+      path.join(profilesDir, 'opt-merge.yaml'),
+      yaml.dump({
+        hosts: {
+          'k2.example.org': '10.0.0.2',
+          'k3.example.org': '10.0.0.2',
+          'k4.example.org': '10.0.0.2',
+        },
+        dns: {
+          'nameserver-policy': {
+            '+.k2.example.org': ['2.2.2.2'],
+            '+.k3.example.org': ['2.2.2.2'],
+            '+.k4.example.org': ['2.2.2.2'],
+          },
+        },
+      })
+    );
+    fs.writeFileSync(
+      path.join(profilesDir, 'Merge.yaml'),
+      yaml.dump({
+        hosts: {
+          'k3.example.org': '10.0.0.3',
+          'k4.example.org': '10.0.0.3',
+        },
+        dns: {
+          'nameserver-policy': {
+            '+.k3.example.org': ['3.3.3.3'],
+            '+.k4.example.org': ['3.3.3.3'],
+          },
+        },
+      })
+    );
+    fs.writeFileSync(path.join(vergeDir, 'verge.yaml'), yaml.dump({ enable_dns_settings: true }));
+    fs.writeFileSync(
+      path.join(vergeDir, 'dns_config.yaml'),
+      yaml.dump({
+        hosts: { 'k4.example.org': '10.0.0.4' },
+        'nameserver-policy': { '+.k4.example.org': ['4.4.4.4'] },
+      })
+    );
+    fs.writeFileSync(
+      path.join(vergeDir, 'profiles.yaml'),
+      yaml.dump({
+        current: 'base-sub',
+        chain: ['Merge'],
+        items: [
+          {
+            uid: 'base-sub',
+            name: '基础订阅',
+            type: 'local',
+            file: 'base-sub.yaml',
+            option: { merge: 'opt-merge' },
+          },
+          { uid: 'opt-merge', type: 'merge', file: 'opt-merge.yaml' },
+          { uid: 'Merge', type: 'merge', file: 'Merge.yaml' },
+        ],
+      })
+    );
+    fs.writeFileSync(
+      runtimeYaml,
+      yaml.dump({
+        proxies: [
+          { name: 'Base-Node', type: 'ss', server: 'k4.example.org', port: 443, password: 'pw' },
+          { name: 'Runtime-Only', type: 'ss', server: 'k4.example.org', port: 8443, password: 'pw2' },
+        ],
+        hosts: { 'k4.example.org': '10.0.0.5' },
+        dns: { 'nameserver-policy': { '+.k4.example.org': ['5.5.5.5'] } },
+      })
+    );
+
+    const m = new ClashMonitor() as any;
+    m.currentEndpoint = { label: 'test', yamlFile: runtimeYaml };
+    m.scanAllClashVergeProfiles({});
+
+    const staticDef = m.resolveSlotTargetNodeDefinition({
+      desiredNodeName: 'Base-Node',
+      desiredProfileUid: 'base-sub',
+    });
+    assert.equal(staticDef.hosts['k1.example.org'], '10.0.0.1');
+    assert.equal(staticDef.hosts['k2.example.org'], '10.0.0.2');
+    assert.equal(staticDef.hosts['k3.example.org'], '10.0.0.3');
+    assert.equal(staticDef.hosts['k4.example.org'], '10.0.0.4');
+    assert.deepEqual(staticDef.nameserverPolicy['+.k1.example.org'], ['1.1.1.1']);
+    assert.deepEqual(staticDef.nameserverPolicy['+.k2.example.org'], ['2.2.2.2']);
+    assert.deepEqual(staticDef.nameserverPolicy['+.k3.example.org'], ['3.3.3.3']);
+    assert.deepEqual(staticDef.nameserverPolicy['+.k4.example.org'], ['4.4.4.4']);
+
+    const runtimeDef = m.resolveSlotTargetNodeDefinition({
+      desiredNodeName: 'Runtime-Only',
+      desiredProfileUid: 'base-sub',
+    });
+    assert.equal(runtimeDef.hosts['k4.example.org'], '10.0.0.5');
+    assert.deepEqual(runtimeDef.nameserverPolicy['+.k4.example.org'], ['5.5.5.5']);
+  });
+
+  await check('Antigravity 宽限态不掩码 Claude 控制面 generalError，避免误触发 disconnect 立即强杀', async () => {
+    const isolatedStore = new ConfigStore();
+    const prevCfg = isolatedStore.get();
+    const isolatedMonitor = new ClashMonitor();
+    const isolatedGeo = new GeoIpService();
+    const isolatedEngine = new ProbeEngine(isolatedStore, isolatedGeo, isolatedMonitor);
+    const m = isolatedMonitor as any;
+    const e = isolatedEngine as any;
+
+    try {
+      const vergeDir = path.join(dataDirectory, 'verge-grace-coupling-test');
+      fs.mkdirSync(path.join(vergeDir, 'profiles'), { recursive: true });
+      const runtimeYaml = path.join(vergeDir, 'clash-verge.yaml');
+      fs.writeFileSync(
+        path.join(vergeDir, 'profiles', 'p1.yaml'),
+        yaml.dump({
+          proxies: [
+            { name: 'Claude-Node', type: 'ss', server: '127.0.0.1', port: 18388, password: 'pw1' },
+            { name: 'Ag-Node', type: 'ss', server: '127.0.0.1', port: 18389, password: 'pw2' },
+          ],
+        })
+      );
+      fs.writeFileSync(
+        path.join(vergeDir, 'profiles.yaml'),
+        yaml.dump({
+          current: 'p1',
+          items: [{ uid: 'p1', name: '测试订阅', type: 'local', file: 'p1.yaml' }],
+        })
+      );
+      fs.writeFileSync(runtimeYaml, yaml.dump({ proxies: [], rules: ['MATCH,DIRECT'] }));
+
+      isolatedStore.update({
+        selectedClashNode: 'Claude-Node',
+        selectedClashProfileUid: 'p1',
+        dedicatedProxyPort: 27897,
+        antigravityClashNode: 'Ag-Node',
+        antigravityClashProfileUid: 'p1',
+        antigravityDedicatedPort: 27898,
+      });
+
+      m.currentEndpoint = { label: 'MockClash', host: '127.0.0.1', port: 9097, yamlFile: runtimeYaml };
+      // Claude 当前不满足宽限条件（prevBoundClaudeNode === null，处于后台复核期），Antigravity 已正常绑定
+      Object.assign(m.slots.claude, {
+        desiredNodeName: 'Claude-Node',
+        desiredProfileUid: 'p1',
+        desiredPort: 27897,
+        boundNodeName: null,
+        boundProfileUid: null,
+        boundPort: null,
+      });
+      Object.assign(m.slots.antigravity, {
+        desiredNodeName: 'Ag-Node',
+        desiredProfileUid: 'p1',
+        desiredPort: 27898,
+        boundNodeName: 'Ag-Node',
+        boundProfileUid: 'p1',
+        boundPort: 27898,
+      });
+      m.info.connected = true;
+      m.info.dedicatedPortListening = false;
+      m.info.antigravityPortListening = true;
+
+      m.requestJson = async (_ep: unknown, urlPath: string) => {
+        if (urlPath === '/configs') return { mode: 'rule', 'mixed-port': 7890 };
+        return { proxies: {} };
+      };
+      m.queueSyncDedicatedListeners = async () => ({
+        claudeListening: false,
+        antigravityListening: false,
+        generalError: '配置文件无效或非内核配置: clash-verge.yaml',
+      });
+
+      await m.tick();
+      isolatedMonitor.stop();
+
+      const info = isolatedMonitor.getRuntimeInfo();
+      assert.equal(info.antigravityPortListening, true, 'Antigravity 自身应保持宽限掩码');
+      assert.equal(info.dedicatedPortListening, false);
+      assert.equal(
+        info.bindingVerificationError,
+        '配置文件无效或非内核配置: clash-verge.yaml',
+        'agInGrace 不得抹除 Claude 所需的控制面 generalError'
+      );
+      assert.equal(e.evaluateClaudeLocalSafety(true), null, '不应误判为本地确定性 disconnect');
+      assert.equal(e.evaluateClaudeSafety(true).alertType, 'verification-unavailable');
+    } finally {
+      isolatedMonitor.stop();
+      isolatedEngine.stop();
+      isolatedStore.update(prevCfg);
+    }
   });
 
   const store = new ConfigStore();

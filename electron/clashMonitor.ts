@@ -74,6 +74,18 @@ interface ResolvedProfileData {
   rawMap: Map<string, Record<string, unknown>>;
   hosts: Record<string, string>;
   nameserverPolicy: Record<string, string[]>;
+  runtimeNodeNames?: Set<string>;
+  runtimeHosts?: Record<string, string>;
+  runtimeNameserverPolicy?: Record<string, string[]>;
+}
+
+export interface ResolvedSlotNodeDefinition {
+  profileUid: string | null;
+  profileName: string | null;
+  rawProxy: Record<string, unknown>;
+  dialerChain: Array<Record<string, unknown>>;
+  hosts: Record<string, string>;
+  nameserverPolicy: Record<string, string[]>;
 }
 
 const CONNECTED_POLL_MS = 3000;
@@ -88,6 +100,7 @@ const ANTIGRAVITY_DIALER_PREFIX = '__guard_ag_dialer_';
 const GUARD_INTERNAL_PROXY_PREFIX = '__guard_';
 const AUTO_REBIND_RETRY_COOLDOWN_MS = 2500;
 const RELOAD_GRACE_WINDOW_MS = 6500;
+const CONFIG_SETTLE_WINDOW_MS = 2200;
 
 const MANAGED_PROCESS_RULES = new Set([
   ...CLAUDE_DESKTOP_PROCESS_PATTERNS.map(
@@ -141,6 +154,7 @@ export type DedicatedChannelId = 'claude' | 'antigravity';
 export interface DedicatedNodeBindResult {
   ok: boolean;
   listening: boolean;
+  rebound?: boolean;
   profileUid?: string | null;
   profileName?: string | null;
   error?: string;
@@ -175,6 +189,7 @@ export class ClashMonitor extends EventEmitter {
   private watchedDir: string | null = null;
 
   private isTicking = false;
+  private pendingImmediateTick = false;
   private listenerApplyQueue: Promise<void> = Promise.resolve();
   private stopped = false;
   private lastGroupsSignature = '';
@@ -231,10 +246,17 @@ export class ClashMonitor extends EventEmitter {
   };
 
   private rebindGraceUntil = 0;
+  private claudeInGraceMask = false;
+  private agInGraceMask = false;
   private lastAutoBindFailAt = 0;
   private lastAutoBindFailKey = '';
+  private lastAutoBindGeneralError: string | null = null;
   private lastConfigReloadAt = 0;
   private lastConfigReloadSig = '';
+  private lastProfilesFileChangeAt = 0;
+  private lastRuntimeFileChangeAt = 0;
+  private lastRuntimeYamlVersion: string | null = null;
+  private lastRuntimeYamlOwnerUid: string | null = null;
   private customDnsCache = new Map<string, { ip: string; expiresAt: number }>();
 
   private info: ClashRuntimeInfo = {
@@ -305,6 +327,7 @@ export class ClashMonitor extends EventEmitter {
 
   public stop(): void {
     this.stopped = true;
+    this.pendingImmediateTick = false;
     if (this.pollTimer) {
       clearTimeout(this.pollTimer);
       this.pollTimer = null;
@@ -405,9 +428,9 @@ export class ClashMonitor extends EventEmitter {
       slot.boundInternalProxyName = null;
       slot.boundPort = null;
       slot.boundDefinition = null;
-      if (channelId === 'claude') {
-        this.rebindGraceUntil = 0;
-      }
+      this.rebindGraceUntil = 0;
+      this.claudeInGraceMask = false;
+      this.agInGraceMask = false;
       const error = '未检测到运行中的 Clash Verge / Mihomo 控制接口';
       this.syncSlotInfoFields(false, false, error);
       this.emit('clash-status-updated');
@@ -428,18 +451,20 @@ export class ClashMonitor extends EventEmitter {
     this.emit('clash-status-updated');
 
     if (!slot.desiredNodeName) {
-      if (channelId === 'claude') {
+      if (!this.slots.claude.desiredNodeName && !this.slots.antigravity.desiredNodeName) {
         this.rebindGraceUntil = 0;
       }
       return { ok: true, listening: false };
     }
 
     const listening = channelId === 'claude' ? res.claudeListening : res.antigravityListening;
+    const rebound = channelId === 'claude' ? Boolean(res.claudeRebound) : Boolean(res.antigravityRebound);
     const channelErr = channelId === 'claude' ? res.claudeError : res.antigravityError;
 
     return {
       ok: listening,
       listening,
+      rebound,
       profileUid: slot.desiredProfileUid,
       profileName: slot.desiredProfileName,
       error: channelErr || res.generalError,
@@ -530,17 +555,32 @@ export class ClashMonitor extends EventEmitter {
           lower === 'profiles.yaml' ||
           lower === 'config.yaml'
         ) {
-          // 当用户在 Clash Verge Rev 中切换订阅组或重载配置时，留出 360ms 让 Clash Verge 完成自身重载后立即无缝补回专属节点
-          if (this.slots.claude.boundNodeName && this.info.dedicatedPortListening) {
-            this.rebindGraceUntil = Date.now() + RELOAD_GRACE_WINDOW_MS;
+          const now = Date.now();
+          if (lower === 'profiles.yaml') {
+            this.lastProfilesFileChangeAt = now;
+          } else {
+            this.lastRuntimeFileChangeAt = now;
+          }
+          // 当用户在 Clash Verge Rev 中切换订阅组或重载配置时，同时为 Claude 与 Antigravity 专属通道开启重绑宽限期
+          if (
+            (this.slots.claude.boundNodeName && this.info.dedicatedPortListening) ||
+            (this.slots.antigravity.boundNodeName && this.info.antigravityPortListening)
+          ) {
+            this.rebindGraceUntil = Math.max(this.rebindGraceUntil, now + RELOAD_GRACE_WINDOW_MS);
+          }
+          // 推迟常规轮询，等待配置文件写入与 Clash Verge 内核重载落定后再无缝补回专属节点
+          if (this.pollTimer) {
+            clearTimeout(this.pollTimer);
+            this.pollTimer = null;
           }
           if (this.configWatchDebounceTimer) {
             clearTimeout(this.configWatchDebounceTimer);
           }
+          const debounceMs = lower === 'profiles.yaml' ? 550 : 420;
           this.configWatchDebounceTimer = setTimeout(() => {
             this.configWatchDebounceTimer = null;
             this.scheduleNextTick(0);
-          }, 360);
+          }, debounceMs);
         }
       });
     } catch {
@@ -572,8 +612,13 @@ export class ClashMonitor extends EventEmitter {
   }
 
   private async tick(): Promise<void> {
-    if (this.stopped || this.isTicking) return;
+    if (this.stopped) return;
+    if (this.isTicking) {
+      this.pendingImmediateTick = true;
+      return;
+    }
     this.isTicking = true;
+    this.pendingImmediateTick = false;
     let fastRetryMs: number | null = null;
 
     try {
@@ -626,6 +671,19 @@ export class ClashMonitor extends EventEmitter {
         const prevBoundAgProfile = agSlot.boundProfileUid;
         const prevBoundAgPort = agSlot.boundPort;
 
+        const prevConnected = this.info.connected;
+        const prevBindingError = this.info.bindingVerificationError;
+        const prevMode = this.info.mode;
+        const prevNode = this.info.activeNode;
+        const prevChainKey = this.info.nodeChain.join(' > ');
+        const nextChainKey = resolved.chain.join(' > ');
+        const prevGroupsSig = this.lastGroupsSignature;
+        const prevProfilesSig = this.lastProfilesSignature;
+        const prevClaudeListening = this.info.dedicatedPortListening;
+        const prevAgListening = this.info.antigravityPortListening;
+        const prevAvailCount = this.info.availableNodes.length;
+        const prevActiveProfileUid = this.info.activeProfileUid;
+
         let claudeListening = false;
         let antigravityListening = false;
         let needsSync = false;
@@ -659,24 +717,16 @@ export class ClashMonitor extends EventEmitter {
             needsSync = true;
           } else if (slot.id === 'claude') {
             claudeListening = true;
-            this.rebindGraceUntil = 0;
           } else {
             antigravityListening = true;
           }
         }
-
-        const prevConnected = this.info.connected;
-        const prevBindingError = this.info.bindingVerificationError;
-        const prevMode = this.info.mode;
-        const prevNode = this.info.activeNode;
-        const prevChainKey = this.info.nodeChain.join(' > ');
-        const nextChainKey = resolved.chain.join(' > ');
-        const prevGroupsSig = this.lastGroupsSignature;
-        const prevProfilesSig = this.lastProfilesSignature;
-        const prevClaudeListening = this.info.dedicatedPortListening;
-        const prevAgListening = this.info.antigravityPortListening;
-        const prevAvailCount = this.info.availableNodes.length;
-        const prevActiveProfileUid = this.info.activeProfileUid;
+        if (!needsSync) {
+          this.claudeInGraceMask = false;
+          this.agInGraceMask = false;
+          this.lastAutoBindGeneralError = null;
+          this.clearRebindGraceIfSettled();
+        }
 
         let claudeBoundChanged = false;
         let agBoundChanged = false;
@@ -694,37 +744,62 @@ export class ClashMonitor extends EventEmitter {
             now >= this.rebindGraceUntil;
 
           if (!inCooldown) {
-            if (prevClaudeListening) {
+            if (
+              (prevClaudeListening && !this.claudeInGraceMask) ||
+              (prevAgListening && !this.agInGraceMask)
+            ) {
               this.rebindGraceUntil = Math.max(
                 this.rebindGraceUntil,
                 Date.now() + RELOAD_GRACE_WINDOW_MS
               );
             }
-            const syncRes = await this.queueSyncDedicatedListeners(false);
-            bindingVerificationError = syncRes.generalError || null;
-            claudeListening = syncRes.claudeListening;
-            antigravityListening = syncRes.antigravityListening;
+            const syncRes = await this.queueSyncDedicatedListeners(false, true);
+            const inGraceNow = Date.now() < this.rebindGraceUntil;
+            const claudeInGrace =
+              Boolean(syncRes.claudeGraceMasked) ||
+              (Boolean(syncRes.generalError) &&
+                Boolean(claudeSlot.desiredNodeName) &&
+                inGraceNow &&
+                prevBoundClaudeNode === claudeSlot.desiredNodeName &&
+                prevBoundClaudePort === claudeSlot.desiredPort);
+            const agInGrace =
+              Boolean(syncRes.antigravityGraceMasked) ||
+              (Boolean(syncRes.generalError) &&
+                Boolean(agSlot.desiredNodeName) &&
+                inGraceNow &&
+                prevBoundAgNode === agSlot.desiredNodeName &&
+                prevBoundAgPort === agSlot.desiredPort);
 
-            const allDesiredOk =
-              (!claudeSlot.desiredNodeName || claudeListening) &&
-              (!agSlot.desiredNodeName || antigravityListening);
+            this.claudeInGraceMask = claudeInGrace;
+            this.agInGraceMask = agInGrace;
+            claudeListening = syncRes.claudeListening || claudeInGrace;
+            antigravityListening = syncRes.antigravityListening || agInGrace;
+            const suppressGeneralError = claudeSlot.desiredNodeName ? claudeInGrace : agInGrace;
+            bindingVerificationError =
+              syncRes.generalError && !suppressGeneralError
+                ? syncRes.generalError
+                : null;
 
-            if (allDesiredOk) {
+            if (claudeInGrace || agInGrace) {
+              fastRetryMs = 400;
+            }
+
+            const allRealOk =
+              (!claudeSlot.desiredNodeName || syncRes.claudeListening) &&
+              (!agSlot.desiredNodeName || syncRes.antigravityListening);
+            const hasHardFailure =
+              (Boolean(claudeSlot.desiredNodeName) && !claudeListening) ||
+              (Boolean(agSlot.desiredNodeName) && !antigravityListening);
+
+            if (allRealOk) {
               this.lastAutoBindFailAt = 0;
               this.lastAutoBindFailKey = '';
-              this.rebindGraceUntil = 0;
-            } else {
+              this.lastAutoBindGeneralError = null;
+              this.clearRebindGraceIfSettled();
+            } else if (hasHardFailure) {
               this.lastAutoBindFailAt = Date.now();
               this.lastAutoBindFailKey = targetKey;
-              if (
-                claudeSlot.desiredNodeName &&
-                !claudeListening &&
-                Date.now() < this.rebindGraceUntil &&
-                prevBoundClaudeNode === claudeSlot.desiredNodeName
-              ) {
-                claudeListening = true;
-                fastRetryMs = 400;
-              }
+              this.lastAutoBindGeneralError = syncRes.generalError || null;
             }
 
             if (
@@ -743,15 +818,19 @@ export class ClashMonitor extends EventEmitter {
             ) {
               agBoundChanged = true;
             }
-          } else if (
-            claudeSlot.desiredNodeName &&
-            Date.now() < this.rebindGraceUntil &&
-            prevBoundClaudeNode === claudeSlot.desiredNodeName
-          ) {
-            claudeListening = true;
-            fastRetryMs = 450;
+          } else {
+            this.claudeInGraceMask = false;
+            this.agInGraceMask = false;
+            bindingVerificationError = this.lastAutoBindGeneralError || prevBindingError;
           }
-          if (inCooldown) bindingVerificationError = prevBindingError;
+        }
+
+        if (
+          this.hasRecentConfigFileActivity() &&
+          (claudeSlot.desiredNodeName || agSlot.desiredNodeName)
+        ) {
+          // 配置文件刚发生变更（Clash Verge 可能仍在异步 PUT /configs 落地中），加密排一拍快速复核
+          fastRetryMs = fastRetryMs !== null ? Math.min(fastRetryMs, 450) : 450;
         }
 
         this.lastGroupsSignature = nextGroupsSig;
@@ -842,9 +921,9 @@ export class ClashMonitor extends EventEmitter {
         if (this.info.connected) {
           // 若处于 Clash 切换订阅或 TUN 重启瞬间的宽限期内，先快速重连而不立即触发断连告警
           if (
-            this.slots.claude.desiredNodeName &&
-            this.slots.claude.boundNodeName &&
-            Date.now() < this.rebindGraceUntil
+            Date.now() < this.rebindGraceUntil &&
+            ((this.slots.claude.desiredNodeName && this.slots.claude.boundNodeName) ||
+              (this.slots.antigravity.desiredNodeName && this.slots.antigravity.boundNodeName))
           ) {
             fastRetryMs = 400;
             return;
@@ -855,13 +934,18 @@ export class ClashMonitor extends EventEmitter {
       }
     } finally {
       this.isTicking = false;
-      const nextDelay =
-        fastRetryMs !== null
-          ? fastRetryMs
-          : this.currentEndpoint
-          ? CONNECTED_POLL_MS
-          : DISCONNECTED_POLL_MS;
-      this.scheduleNextTick(nextDelay);
+      if (this.pendingImmediateTick && !this.stopped) {
+        this.pendingImmediateTick = false;
+        this.scheduleNextTick(60);
+      } else {
+        const nextDelay =
+          fastRetryMs !== null
+            ? fastRetryMs
+            : this.currentEndpoint
+            ? CONNECTED_POLL_MS
+            : DISCONNECTED_POLL_MS;
+        this.scheduleNextTick(nextDelay);
+      }
     }
   }
 
@@ -877,14 +961,36 @@ export class ClashMonitor extends EventEmitter {
     }
   }
 
-  private async queueSyncDedicatedListeners(forceRebind: boolean): Promise<{
+  private hasRecentConfigFileActivity(now = Date.now()): boolean {
+    const latestChangeAt = Math.max(this.lastProfilesFileChangeAt, this.lastRuntimeFileChangeAt);
+    return latestChangeAt > 0 && now - latestChangeAt < CONFIG_SETTLE_WINDOW_MS;
+  }
+
+  private clearRebindGraceIfSettled(now = Date.now()): void {
+    if (!this.hasRecentConfigFileActivity(now)) {
+      this.rebindGraceUntil = 0;
+    }
+  }
+
+  private async queueSyncDedicatedListeners(
+    forceRebind: boolean,
+    allowGraceMask = false
+  ): Promise<{
     claudeListening: boolean;
     antigravityListening: boolean;
+    claudeRebound?: boolean;
+    antigravityRebound?: boolean;
+    claudeGraceMasked?: boolean;
+    antigravityGraceMasked?: boolean;
+    claudeNodeMissing?: boolean;
+    antigravityNodeMissing?: boolean;
     claudeError?: string;
     antigravityError?: string;
     generalError?: string;
   }> {
-    return this.queueListenerChange(() => this.applySyncDedicatedListeners(forceRebind));
+    return this.queueListenerChange(() =>
+      this.applySyncDedicatedListeners(forceRebind, allowGraceMask)
+    );
   }
 
   private queueListenerChange<T>(change: () => Promise<T>): Promise<T> {
@@ -898,12 +1004,21 @@ export class ClashMonitor extends EventEmitter {
 
   private getSlotDefinition(slot: DedicatedChannelSlot): string | null {
     const definition = this.resolveSlotTargetNodeDefinition(slot);
-    return definition ? JSON.stringify(definition) : null;
+    return definition ? buildSlotDefinitionSignature(definition) : null;
   }
 
-  private async applySyncDedicatedListeners(forceRebind: boolean): Promise<{
+  private async applySyncDedicatedListeners(
+    forceRebind: boolean,
+    allowGraceMask = false
+  ): Promise<{
     claudeListening: boolean;
     antigravityListening: boolean;
+    claudeRebound?: boolean;
+    antigravityRebound?: boolean;
+    claudeGraceMasked?: boolean;
+    antigravityGraceMasked?: boolean;
+    claudeNodeMissing?: boolean;
+    antigravityNodeMissing?: boolean;
     claudeError?: string;
     antigravityError?: string;
     generalError?: string;
@@ -945,7 +1060,19 @@ export class ClashMonitor extends EventEmitter {
       const recentlyReloadedSameSig =
         this.lastConfigReloadSig === desiredSig && Date.now() - this.lastConfigReloadAt < 1800;
 
-      const isSlotAlreadyOk = async (slot: DedicatedChannelSlot): Promise<boolean> => {
+      const isSlotAliveInKernel = async (slot: DedicatedChannelSlot): Promise<boolean> => {
+        if (!slot.desiredNodeName) return false;
+        const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
+        if (!proxiesMap[expectedInternal]) return false;
+        return isLocalPortListening(slot.desiredPort);
+      };
+
+      const [wasClaudeAliveInKernel, wasAgAliveInKernel] = await Promise.all([
+        isSlotAliveInKernel(claudeSlot),
+        isSlotAliveInKernel(agSlot),
+      ]);
+
+      const isSlotAlreadyOk = (slot: DedicatedChannelSlot, aliveInKernel: boolean): boolean => {
         if (!slot.desiredNodeName) {
           return !slot.boundNodeName && !proxiesMap[slot.internalProxyName];
         }
@@ -958,22 +1085,17 @@ export class ClashMonitor extends EventEmitter {
               )
             : !this.resolveSlotTargetNodeDefinition(slot))
         ) return false;
-        const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
-        const nodeAliveInKernel = Boolean(proxiesMap[expectedInternal]);
-        if (!nodeAliveInKernel) return false;
+        if (!aliveInKernel) return false;
         return (
           slot.boundNodeName === slot.desiredNodeName &&
           slot.boundDefinition === this.getSlotDefinition(slot) &&
           (!slot.desiredProfileUid || slot.boundProfileUid === slot.desiredProfileUid) &&
-          slot.boundPort === slot.desiredPort &&
-          (await isLocalPortListening(slot.desiredPort))
+          slot.boundPort === slot.desiredPort
         );
       };
 
-      const [claudeAlreadyOk, agAlreadyOk] = await Promise.all([
-        isSlotAlreadyOk(claudeSlot),
-        isSlotAlreadyOk(agSlot),
-      ]);
+      const claudeAlreadyOk = isSlotAlreadyOk(claudeSlot, wasClaudeAliveInKernel);
+      const agAlreadyOk = isSlotAlreadyOk(agSlot, wasAgAliveInKernel);
 
       if (claudeAlreadyOk && agAlreadyOk) {
         const claudeListening = Boolean(claudeSlot.desiredNodeName);
@@ -1021,7 +1143,13 @@ export class ClashMonitor extends EventEmitter {
 
       const slotOutcome: Record<
         DedicatedChannelId,
-        { shouldBind: boolean; targetProxy: string; definition: string | null; error?: string }
+        {
+          shouldBind: boolean;
+          targetProxy: string;
+          definition: string | null;
+          nodeMissing?: boolean;
+          error?: string;
+        }
       > = {
         claude: { shouldBind: false, targetProxy: '', definition: null },
         antigravity: { shouldBind: false, targetProxy: '', definition: null },
@@ -1032,7 +1160,7 @@ export class ClashMonitor extends EventEmitter {
         if (!slot.desiredNodeName) continue;
 
         const resolved = this.resolveSlotTargetNodeDefinition(slot);
-        slotOutcome[slot.id].definition = resolved ? JSON.stringify(resolved) : null;
+        slotOutcome[slot.id].definition = resolved ? buildSlotDefinitionSignature(resolved) : null;
         if (resolved) {
           slot.desiredProfileUid = resolved.profileUid;
           slot.desiredProfileName = resolved.profileName;
@@ -1109,6 +1237,7 @@ export class ClashMonitor extends EventEmitter {
           shouldBind = true;
           targetProxy = slot.desiredNodeName;
         } else {
+          slotOutcome[slot.id].nodeMissing = true;
           slotOutcome[slot.id].error = `指定订阅或节点 "${slot.desiredNodeName}" 不存在，请重新选择`;
         }
 
@@ -1180,47 +1309,101 @@ export class ClashMonitor extends EventEmitter {
           : Promise.resolve(false),
       ]);
 
-      const updateSlotBoundState = (slot: DedicatedChannelSlot, listening: boolean) => {
-        slot.boundNodeName = listening ? slot.desiredNodeName : null;
-        slot.boundProfileUid = listening ? slot.desiredProfileUid : null;
-        slot.boundProfileName = listening ? slot.desiredProfileName : null;
-        slot.boundInternalProxyName = listening ? slotOutcome[slot.id].targetProxy : null;
-        slot.boundPort = listening ? slot.desiredPort : null;
-        slot.boundDefinition = listening ? slotOutcome[slot.id].definition : null;
-        if (slotOutcome[slot.id].shouldBind && !listening && !slotOutcome[slot.id].error) {
-          slotOutcome[slot.id].error = `${slot.label} 专属代理端口 127.0.0.1:${slot.desiredPort} 未能成功启动监听`;
+      const previousClaudeBoundNode = claudeSlot.boundNodeName;
+      const previousClaudeBoundPort = claudeSlot.boundPort;
+      const previousClaudeDefinition = claudeSlot.boundDefinition;
+      const previousAgBoundNode = agSlot.boundNodeName;
+      const previousAgBoundPort = agSlot.boundPort;
+      const previousAgDefinition = agSlot.boundDefinition;
+
+      const updateSlotBoundState = (
+        slot: DedicatedChannelSlot,
+        listening: boolean,
+        prevBoundNode: string | null,
+        prevBoundPort: number | null,
+        prevDef: string | null
+      ): boolean => {
+        const outcome = slotOutcome[slot.id];
+        const preserveInGrace =
+          !listening &&
+          allowGraceMask &&
+          Boolean(slot.desiredNodeName) &&
+          !outcome.nodeMissing &&
+          Date.now() < this.rebindGraceUntil &&
+          prevBoundNode === slot.desiredNodeName &&
+          prevBoundPort === slot.desiredPort &&
+          prevDef === outcome.definition;
+
+        if (!preserveInGrace) {
+          slot.boundNodeName = listening ? slot.desiredNodeName : null;
+          slot.boundProfileUid = listening ? slot.desiredProfileUid : null;
+          slot.boundProfileName = listening ? slot.desiredProfileName : null;
+          slot.boundInternalProxyName = listening ? outcome.targetProxy : null;
+          slot.boundPort = listening ? slot.desiredPort : null;
+          slot.boundDefinition =
+            slot.desiredNodeName && !outcome.nodeMissing ? outcome.definition : null;
         }
+        if (outcome.shouldBind && !listening && !outcome.error) {
+          outcome.error = `${slot.label} 专属代理端口 127.0.0.1:${slot.desiredPort} 未能成功启动监听`;
+        }
+        return preserveInGrace;
       };
 
-      const previousClaudeDefinition = claudeSlot.boundDefinition;
-      const previousAgDefinition = agSlot.boundDefinition;
-      updateSlotBoundState(claudeSlot, claudeListening);
-      updateSlotBoundState(agSlot, antigravityListening);
-      this.syncSlotInfoFields(claudeListening, antigravityListening);
+      const claudeGraceMasked = updateSlotBoundState(
+        claudeSlot,
+        claudeListening,
+        previousClaudeBoundNode,
+        previousClaudeBoundPort,
+        previousClaudeDefinition
+      );
+      const antigravityGraceMasked = updateSlotBoundState(
+        agSlot,
+        antigravityListening,
+        previousAgBoundNode,
+        previousAgBoundPort,
+        previousAgDefinition
+      );
+      this.claudeInGraceMask = claudeGraceMasked;
+      this.agInGraceMask = antigravityGraceMasked;
+      this.syncSlotInfoFields(
+        claudeListening || claudeGraceMasked,
+        antigravityListening || antigravityGraceMasked
+      );
       if (previousClaudeDefinition !== claudeSlot.boundDefinition) {
         this.emit('claude-clash-ready', true);
+      } else if (claudeSlot.desiredNodeName && !wasClaudeAliveInKernel && claudeListening) {
+        this.emit('claude-listener-rebound');
       }
       if (previousAgDefinition !== agSlot.boundDefinition) {
         this.emit('antigravity-clash-ready', true);
+      } else if (agSlot.desiredNodeName && !wasAgAliveInKernel && antigravityListening) {
+        this.emit('antigravity-listener-rebound');
       }
 
-      if (
+      const allSlotsSatisfied =
         (!claudeSlot.desiredNodeName || claudeListening) &&
-        (!agSlot.desiredNodeName || antigravityListening)
-      ) {
+        (!agSlot.desiredNodeName || antigravityListening);
+
+      if (allSlotsSatisfied) {
         this.lastConfigReloadAt = Date.now();
         this.lastConfigReloadSig = desiredSig;
-      }
-
-      if (claudeListening) {
         this.lastAutoBindFailAt = 0;
         this.lastAutoBindFailKey = '';
-        this.rebindGraceUntil = 0;
+        this.lastAutoBindGeneralError = null;
+        this.clearRebindGraceIfSettled();
       }
 
       return {
         claudeListening,
         antigravityListening,
+        claudeRebound: Boolean(claudeSlot.desiredNodeName && !claudeAlreadyOk && claudeListening),
+        antigravityRebound: Boolean(
+          agSlot.desiredNodeName && !agAlreadyOk && antigravityListening
+        ),
+        claudeGraceMasked,
+        antigravityGraceMasked,
+        claudeNodeMissing: slotOutcome.claude.nodeMissing,
+        antigravityNodeMissing: slotOutcome.antigravity.nodeMissing,
         claudeError: slotOutcome.claude.error,
         antigravityError: slotOutcome.antigravity.error,
       };
@@ -1256,14 +1439,38 @@ export class ClashMonitor extends EventEmitter {
     return out;
   }
 
-  private resolveSlotTargetNodeDefinition(slot: DedicatedChannelSlot): {
-    profileUid: string | null;
-    profileName: string | null;
-    rawProxy: Record<string, unknown>;
-    dialerChain: Array<Record<string, unknown>>;
-    hosts: Record<string, string>;
-    nameserverPolicy: Record<string, string[]>;
-  } | null {
+  private buildDefinitionFromProfile(
+    prof: ResolvedProfileData,
+    nodeName: string,
+    raw: Record<string, unknown>
+  ): ResolvedSlotNodeDefinition {
+    const dialerChain = extractDialerChain(raw, prof.rawMap);
+    const usesRuntimeNode = Boolean(
+      prof.runtimeNodeNames &&
+        (prof.runtimeNodeNames.has(nodeName) ||
+          dialerChain.some(
+            (hop) => typeof hop['name'] === 'string' && prof.runtimeNodeNames!.has(hop['name'])
+          ))
+    );
+    const hosts = usesRuntimeNode
+      ? mergeHostsLayers(prof.hosts, prof.runtimeHosts)
+      : { ...prof.hosts };
+    const nameserverPolicy = usesRuntimeNode
+      ? mergeNameserverPolicyLayers(prof.nameserverPolicy, prof.runtimeNameserverPolicy)
+      : mergeNameserverPolicyLayers(prof.nameserverPolicy);
+    return {
+      profileUid: prof.uid,
+      profileName: prof.name,
+      rawProxy: structuredClone(raw),
+      dialerChain,
+      hosts,
+      nameserverPolicy,
+    };
+  }
+
+  private resolveSlotTargetNodeDefinition(
+    slot: DedicatedChannelSlot
+  ): ResolvedSlotNodeDefinition | null {
     const nodeName = slot.desiredNodeName;
     if (!nodeName) return null;
     const preferredProfileUid = slot.desiredProfileUid;
@@ -1274,14 +1481,7 @@ export class ClashMonitor extends EventEmitter {
       if (!targetProf) return null;
       const raw = targetProf.rawMap.get(nodeName);
       if (raw) {
-        return {
-          profileUid: targetProf.uid,
-          profileName: targetProf.name,
-          rawProxy: structuredClone(raw),
-          dialerChain: extractDialerChain(raw, targetProf.rawMap),
-          hosts: { ...targetProf.hosts },
-          nameserverPolicy: structuredClone(targetProf.nameserverPolicy),
-        };
+        return this.buildDefinitionFromProfile(targetProf, nodeName, raw);
       }
       return null;
     }
@@ -1290,14 +1490,7 @@ export class ClashMonitor extends EventEmitter {
     for (const prof of this.profileRawLookup.values()) {
       if (prof.isActive && prof.rawMap.has(nodeName)) {
         const raw = prof.rawMap.get(nodeName)!;
-        return {
-          profileUid: prof.uid,
-          profileName: prof.name,
-          rawProxy: structuredClone(raw),
-          dialerChain: extractDialerChain(raw, prof.rawMap),
-          hosts: { ...prof.hosts },
-          nameserverPolicy: structuredClone(prof.nameserverPolicy),
-        };
+        return this.buildDefinitionFromProfile(prof, nodeName, raw);
       }
     }
 
@@ -1305,14 +1498,7 @@ export class ClashMonitor extends EventEmitter {
     for (const prof of this.profileRawLookup.values()) {
       if (prof.rawMap.has(nodeName)) {
         const raw = prof.rawMap.get(nodeName)!;
-        return {
-          profileUid: prof.uid,
-          profileName: prof.name,
-          rawProxy: structuredClone(raw),
-          dialerChain: extractDialerChain(raw, prof.rawMap),
-          hosts: { ...prof.hosts },
-          nameserverPolicy: structuredClone(prof.nameserverPolicy),
-        };
+        return this.buildDefinitionFromProfile(prof, nodeName, raw);
       }
     }
 
@@ -1337,6 +1523,14 @@ export class ClashMonitor extends EventEmitter {
 
     const lowerServer = rawServer.toLowerCase();
     let resolvedIp: string | null = profileHosts[lowerServer] || profileHosts[rawServer] || null;
+    if (!resolvedIp) {
+      for (const [hostPattern, ipVal] of Object.entries(profileHosts)) {
+        if (doesDomainMatchPolicyPattern(rawServer, hostPattern)) {
+          resolvedIp = ipVal;
+          break;
+        }
+      }
+    }
 
     if (!resolvedIp) {
       for (const [pattern, dnsServers] of Object.entries(profileNsPolicy)) {
@@ -1560,8 +1754,21 @@ export class ClashMonitor extends EventEmitter {
     let activeProfileUid: string | null = null;
     let activeProfileName: string | null = null;
 
+    const globalMergeRawMap = new Map<string, Record<string, unknown>>();
     const vergeDir = this.findClashVergeConfigDir();
     if (vergeDir) {
+      let dnsConfigHosts: Record<string, string> | undefined;
+      let dnsConfigNsPolicy: Record<string, string[]> | undefined;
+
+      const vergeDoc = this.readProfilesIndexCached(path.join(vergeDir, 'verge.yaml'));
+      if (vergeDoc?.['enable_dns_settings'] === true) {
+        const dnsParsed = this.readProfileNodesCached(path.join(vergeDir, 'dns_config.yaml'), vergeDir);
+        if (dnsParsed) {
+          dnsConfigHosts = dnsParsed.hosts;
+          dnsConfigNsPolicy = dnsParsed.nameserverPolicy;
+        }
+      }
+
       const profilesYamlPath = path.join(vergeDir, 'profiles.yaml');
       const profilesDoc = this.readProfilesIndexCached(profilesYamlPath);
 
@@ -1574,6 +1781,12 @@ export class ClashMonitor extends EventEmitter {
             ? [currentRaw.trim()]
             : []
         );
+        const chainRaw = profilesDoc['chain'];
+        const chainUids = new Set<string>(
+          Array.isArray(chainRaw)
+            ? chainRaw.map((x) => String(x || '').trim()).filter(Boolean)
+            : []
+        );
 
         const items = Array.isArray(profilesDoc['items'])
           ? (profilesDoc['items'] as Array<Record<string, unknown>>)
@@ -1581,6 +1794,8 @@ export class ClashMonitor extends EventEmitter {
 
         const itemsByUid = new Map<string, Record<string, unknown>>();
         const baseNameCounts = new Map<string, number>();
+        let globalMergeHosts: Record<string, string> = {};
+        let globalMergeNsPolicy: Record<string, string[]> = {};
 
         for (const item of items) {
           if (!item || typeof item !== 'object') continue;
@@ -1589,9 +1804,32 @@ export class ClashMonitor extends EventEmitter {
           itemsByUid.set(uid, item);
 
           const rawType = String(item['type'] || 'remote').toLowerCase();
+          const fileField = String(item['file'] || '').trim();
+
+          if (
+            rawType === 'merge' &&
+            (uid === 'Merge' || activeUids.has(uid) || chainUids.has(uid))
+          ) {
+            const mergeYamlPath = this.resolveProfileItemYamlPath(vergeDir, fileField, uid);
+            const mergeParsed = mergeYamlPath
+              ? this.readProfileNodesCached(mergeYamlPath, vergeDir)
+              : null;
+            if (mergeParsed) {
+              globalMergeHosts = mergeHostsLayers(globalMergeHosts, mergeParsed.hosts);
+              globalMergeNsPolicy = mergeNameserverPolicyLayers(
+                globalMergeNsPolicy,
+                mergeParsed.nameserverPolicy
+              );
+              for (const [mName, mRaw] of mergeParsed.rawMap.entries()) {
+                if (!globalMergeRawMap.has(mName)) {
+                  globalMergeRawMap.set(mName, mRaw);
+                }
+              }
+            }
+          }
+
           if (rawType !== 'remote' && rawType !== 'local') continue;
 
-          const fileField = String(item['file'] || '').trim();
           const fallbackBaseName = fileField
             ? path.basename(fileField, path.extname(fileField))
             : uid;
@@ -1599,6 +1837,12 @@ export class ClashMonitor extends EventEmitter {
             String(item['name'] || item['desc'] || fallbackBaseName || uid).trim() || uid;
           baseNameCounts.set(baseName, (baseNameCounts.get(baseName) || 0) + 1);
         }
+
+        const globalHosts = mergeHostsLayers(globalMergeHosts, dnsConfigHosts);
+        const globalNsPolicy = mergeNameserverPolicyLayers(
+          globalMergeNsPolicy,
+          dnsConfigNsPolicy
+        );
 
         for (const item of items) {
           if (!item || typeof item !== 'object') continue;
@@ -1639,10 +1883,8 @@ export class ClashMonitor extends EventEmitter {
 
           const rawMap = new Map<string, Record<string, unknown>>(parsedNodes.rawMap);
           const mergedNodeList: ClashProxyNodeOption[] = [...parsedNodes.nodes];
-          const mergedHosts: Record<string, string> = { ...parsedNodes.hosts };
-          const mergedNsPolicy: Record<string, string[]> = structuredClone(
-            parsedNodes.nameserverPolicy
-          );
+          let companionHosts: Record<string, string> = {};
+          let companionNsPolicy: Record<string, string[]> = {};
 
           // 合并该订阅关联的自定义节点增强配置 (option.proxies / option.merge)
           const optionObj =
@@ -1666,10 +1908,11 @@ export class ClashMonitor extends EventEmitter {
               if (!companionPath) continue;
               const companionParsed = this.readProfileNodesCached(companionPath, vergeDir);
               if (!companionParsed) continue;
-              Object.assign(mergedHosts, companionParsed.hosts);
-              for (const [pat, servers] of Object.entries(companionParsed.nameserverPolicy)) {
-                mergedNsPolicy[pat] = servers;
-              }
+              companionHosts = mergeHostsLayers(companionHosts, companionParsed.hosts);
+              companionNsPolicy = mergeNameserverPolicyLayers(
+                companionNsPolicy,
+                companionParsed.nameserverPolicy
+              );
               for (const cn of companionParsed.nodes) {
                 if (!rawMap.has(cn.name)) {
                   const rawObj = companionParsed.rawMap.get(cn.name);
@@ -1681,6 +1924,14 @@ export class ClashMonitor extends EventEmitter {
               }
             }
           }
+
+          // 增强管线优先级（低 -> 高）：原始订阅 YAML < option.proxies / option.merge < 全局 Merge < dns_config.yaml
+          const mergedHosts = mergeHostsLayers(parsedNodes.hosts, companionHosts, globalHosts);
+          const mergedNsPolicy = mergeNameserverPolicyLayers(
+            parsedNodes.nameserverPolicy,
+            companionNsPolicy,
+            globalNsPolicy
+          );
 
           if (mergedNodeList.length === 0 && !isActive) {
             continue;
@@ -1736,24 +1987,47 @@ export class ClashMonitor extends EventEmitter {
       }
     }
 
-    // 补充检查当前运行时 clash-verge.yaml（兼容通过 Merge/Script 动态追加的落地节点，或无 profiles.yaml 时的兜底）
+    // 补充检查当前运行时 clash-verge.yaml（兼容通过 Merge/Script 动态追加或改写的落地节点，或无 profiles.yaml 时的兜底）
     const activeRuntimeYaml = this.findActiveClashYamlFile();
     if (activeRuntimeYaml && fs.existsSync(activeRuntimeYaml)) {
+      const fileVer = getFileVersion(activeRuntimeYaml);
+      const curRuntimeVersion = fileVer ? `${activeRuntimeYaml}|${fileVer}` : null;
+      if (curRuntimeVersion !== this.lastRuntimeYamlVersion) {
+        this.lastRuntimeYamlVersion = curRuntimeVersion;
+        this.lastRuntimeYamlOwnerUid = null;
+      }
+
       const runtimeDir = vergeDir || path.dirname(activeRuntimeYaml);
       const runtimeParsed = this.readProfileNodesCached(activeRuntimeYaml, runtimeDir);
       if (runtimeParsed && runtimeParsed.nodes.length > 0) {
         const activeProf = resolvedProfiles.find((p) => p.isActive);
         if (activeProf) {
-          Object.assign(activeProf.hosts, runtimeParsed.hosts);
-          for (const [pat, servers] of Object.entries(runtimeParsed.nameserverPolicy)) {
-            if (!activeProf.nameserverPolicy[pat]) {
-              activeProf.nameserverPolicy[pat] = servers;
+          const ownedByOtherProfile = Boolean(
+            this.lastRuntimeYamlOwnerUid && this.lastRuntimeYamlOwnerUid !== activeProf.uid
+          );
+          const runtimeMatchesActive =
+            !ownedByOtherProfile &&
+            doesRuntimeMatchActiveProfile(
+              activeProf,
+              resolvedProfiles,
+              runtimeParsed,
+              globalMergeRawMap
+            );
+          if (runtimeMatchesActive) {
+            if (!this.lastRuntimeYamlOwnerUid) {
+              this.lastRuntimeYamlOwnerUid = activeProf.uid;
             }
-          }
-          for (const rtNode of runtimeParsed.nodes) {
-            if (!activeProf.rawMap.has(rtNode.name)) {
+            // 仅将 clash-verge.yaml 的全局 hosts/nameserver-policy 关联给运行时新增或脚本改写的节点，
+            // 避免订阅组激活态切换时污染原订阅固定节点的定义签名
+            let hasDynamicRuntimeNode = false;
+            const runtimeNodeNames = new Set<string>();
+            for (const rtNode of runtimeParsed.nodes) {
               const rawObj = runtimeParsed.rawMap.get(rtNode.name);
-              if (rawObj) {
+              if (!rawObj) continue;
+              const existingRaw = activeProf.rawMap.get(rtNode.name);
+              if (!existingRaw) {
+                hasDynamicRuntimeNode = true;
+                runtimeNodeNames.add(rtNode.name);
                 activeProf.rawMap.set(rtNode.name, rawObj);
                 const liveItem = activeProxiesMap[rtNode.name];
                 activeProf.nodes.push({
@@ -1763,7 +2037,29 @@ export class ClashMonitor extends EventEmitter {
                   delay: extractProxyDelay(liveItem),
                   alive: liveItem ? liveItem.alive !== false : true,
                 });
+              } else if (
+                (existingRaw['server'] !== rawObj['server'] ||
+                  existingRaw['port'] !== rawObj['port']) &&
+                String(existingRaw['type'] || '').trim().toLowerCase() ===
+                  String(rawObj['type'] || '').trim().toLowerCase() &&
+                extractProxyCredential(existingRaw) === extractProxyCredential(rawObj)
+              ) {
+                hasDynamicRuntimeNode = true;
+                runtimeNodeNames.add(rtNode.name);
+                activeProf.rawMap.set(rtNode.name, rawObj);
+                const existingNode = activeProf.nodes.find((n) => n.name === rtNode.name);
+                if (existingNode) {
+                  existingNode.server = rtNode.server;
+                  existingNode.port = rtNode.port;
+                }
               }
+            }
+            if (hasDynamicRuntimeNode) {
+              activeProf.runtimeNodeNames = runtimeNodeNames;
+              activeProf.runtimeHosts = { ...runtimeParsed.hosts };
+              activeProf.runtimeNameserverPolicy = mergeNameserverPolicyLayers(
+                runtimeParsed.nameserverPolicy
+              );
             }
           }
         } else if (resolvedProfiles.length === 0) {
@@ -2073,6 +2369,10 @@ export class ClashMonitor extends EventEmitter {
         typeof dnsObj['nameserver-policy'] === 'object' &&
         !Array.isArray(dnsObj['nameserver-policy'])
           ? (dnsObj['nameserver-policy'] as Record<string, unknown>)
+          : doc['nameserver-policy'] &&
+            typeof doc['nameserver-policy'] === 'object' &&
+            !Array.isArray(doc['nameserver-policy'])
+          ? (doc['nameserver-policy'] as Record<string, unknown>)
           : null;
       if (rawNsPolicy) {
         for (const [pat, val] of Object.entries(rawNsPolicy)) {
@@ -2125,6 +2425,9 @@ export class ClashMonitor extends EventEmitter {
 
   private resetDisconnectedState(reason = 'Clash 控制接口暂时不可用，无法确认专属节点绑定状态'): void {
     this.lastGroupsSignature = '';
+    this.claudeInGraceMask = false;
+    this.agInGraceMask = false;
+    this.lastAutoBindGeneralError = null;
     for (const slot of [this.slots.claude, this.slots.antigravity]) {
       slot.boundNodeName = null;
       slot.boundInternalProxyName = null;
@@ -2480,6 +2783,164 @@ function extractDialerChain(
   return chain;
 }
 
+function mergeHostsLayers(
+  ...layersLowToHigh: Array<Record<string, string> | undefined>
+): Record<string, string> {
+  const merged: Record<string, string> = {};
+  for (let i = layersLowToHigh.length - 1; i >= 0; i--) {
+    const layer = layersLowToHigh[i];
+    if (!layer) continue;
+    for (const [host, ip] of Object.entries(layer)) {
+      if (!Object.prototype.hasOwnProperty.call(merged, host)) {
+        merged[host] = ip;
+      }
+    }
+  }
+  return merged;
+}
+
+function mergeNameserverPolicyLayers(
+  ...layersLowToHigh: Array<Record<string, string[]> | undefined>
+): Record<string, string[]> {
+  const merged: Record<string, string[]> = {};
+  for (let i = layersLowToHigh.length - 1; i >= 0; i--) {
+    const layer = layersLowToHigh[i];
+    if (!layer) continue;
+    for (const [pat, servers] of Object.entries(layer)) {
+      if (!Object.prototype.hasOwnProperty.call(merged, pat)) {
+        merged[pat] = [...servers];
+      }
+    }
+  }
+  return merged;
+}
+
+function extractProxyCredential(proxyObj: Record<string, unknown>): string | null {
+  for (const key of ['uuid', 'password', 'private-key', 'auth-str', 'auth_str', 'token', 'psk']) {
+    const val = proxyObj[key];
+    if (typeof val === 'string' && val.trim()) {
+      return `${key}:${val.trim()}`;
+    }
+  }
+  return null;
+}
+
+function hasEndpointNodeMatch(
+  rtRaw: Record<string, unknown>,
+  profRawMap: Map<string, Record<string, unknown>>
+): boolean {
+  if (profRawMap.size === 0) return false;
+  const rtType = String(rtRaw['type'] || '').trim().toLowerCase();
+  const rtServer = typeof rtRaw['server'] === 'string' ? rtRaw['server'].trim().toLowerCase() : '';
+  const rtPort = rtRaw['port'];
+  if (!rtType || !rtServer || rtPort === undefined) return false;
+
+  for (const raw of profRawMap.values()) {
+    if (
+      String(raw['type'] || '').trim().toLowerCase() === rtType &&
+      typeof raw['server'] === 'string' &&
+      raw['server'].trim().toLowerCase() === rtServer &&
+      raw['port'] === rtPort
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+function hasRewrittenNodeMatch(
+  rtName: string,
+  rtRaw: Record<string, unknown>,
+  profRawMap: Map<string, Record<string, unknown>>
+): boolean {
+  if (profRawMap.size === 0) return false;
+  const rtType = String(rtRaw['type'] || '').trim().toLowerCase();
+  if (!rtType) return false;
+  const rtCred = extractProxyCredential(rtRaw);
+  if (rtCred) {
+    for (const raw of profRawMap.values()) {
+      if (
+        String(raw['type'] || '').trim().toLowerCase() === rtType &&
+        extractProxyCredential(raw) === rtCred
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+  const sameName = profRawMap.get(rtName);
+  return Boolean(
+    sameName &&
+      String(sameName['type'] || '').trim().toLowerCase() === rtType &&
+      extractProxyCredential(sameName) === null
+  );
+}
+
+function doesRuntimeMatchActiveProfile(
+  activeProf: ResolvedProfileData,
+  resolvedProfiles: ResolvedProfileData[],
+  runtimeParsed: CachedProfileNodesEntry,
+  globalMergeRawMap: Map<string, Record<string, unknown>>
+): boolean {
+  const inactiveProfiles = resolvedProfiles.filter((p) => !p.isActive);
+  const nonGlobalNodes: Array<{ name: string; raw: Record<string, unknown> }> = [];
+
+  for (const rtNode of runtimeParsed.nodes) {
+    const raw = runtimeParsed.rawMap.get(rtNode.name);
+    if (!raw) continue;
+    if (
+      hasEndpointNodeMatch(raw, globalMergeRawMap) ||
+      hasRewrittenNodeMatch(rtNode.name, raw, globalMergeRawMap)
+    ) {
+      continue;
+    }
+    nonGlobalNodes.push({ name: rtNode.name, raw });
+  }
+
+  if (nonGlobalNodes.length === 0) {
+    return true;
+  }
+
+  let activeMatchCount = 0;
+  let exclusiveActiveMatchCount = 0;
+  const inactiveMatchCounts = new Array<number>(inactiveProfiles.length).fill(0);
+
+  for (const item of nonGlobalNodes) {
+    let matchesActive = hasEndpointNodeMatch(item.raw, activeProf.rawMap);
+    const matchedInactiveIndices: number[] = [];
+    for (let i = 0; i < inactiveProfiles.length; i++) {
+      if (hasEndpointNodeMatch(item.raw, inactiveProfiles[i].rawMap)) {
+        matchedInactiveIndices.push(i);
+      }
+    }
+
+    // 若所有静态订阅均无同 server:port 节点（如脚本改写了 server，或同时重命名并改写 server），回退按协议凭据归属
+    if (!matchesActive && matchedInactiveIndices.length === 0) {
+      matchesActive = hasRewrittenNodeMatch(item.name, item.raw, activeProf.rawMap);
+      for (let i = 0; i < inactiveProfiles.length; i++) {
+        if (hasRewrittenNodeMatch(item.name, item.raw, inactiveProfiles[i].rawMap)) {
+          matchedInactiveIndices.push(i);
+        }
+      }
+    }
+
+    for (const idx of matchedInactiveIndices) {
+      inactiveMatchCounts[idx]++;
+    }
+    if (matchesActive) {
+      activeMatchCount++;
+      if (matchedInactiveIndices.length === 0) {
+        exclusiveActiveMatchCount++;
+      }
+    }
+  }
+
+  const maxInactiveMatchCount =
+    inactiveMatchCounts.length > 0 ? Math.max(...inactiveMatchCounts) : 0;
+
+  return exclusiveActiveMatchCount > 0 || activeMatchCount >= maxInactiveMatchCount;
+}
+
 function formatControllerErrorBody(body: string): string {
   if (!body) return '';
 
@@ -2647,6 +3108,50 @@ export function buildProfilesSignature(groups: ClashProfileGroupOption[]): strin
     g.nodeCount,
     g.nodes.map((n) => [n.name, n.delay || 0, n.alive !== false]),
   ]));
+}
+
+export function buildSlotDefinitionSignature(definition: ResolvedSlotNodeDefinition): string {
+  const serverHostSet = new Set<string>();
+  for (const proxyObj of [definition.rawProxy, ...definition.dialerChain]) {
+    const rawServer = typeof proxyObj['server'] === 'string' ? proxyObj['server'].trim() : '';
+    if (rawServer && net.isIP(rawServer) === 0) {
+      serverHostSet.add(rawServer.toLowerCase().replace(/\.$/, ''));
+    }
+  }
+
+  const matchedHosts: Array<[string, string]> = [];
+  const matchedNsPolicy: Array<[string, string[]]> = [];
+
+  if (serverHostSet.size > 0) {
+    for (const [k, v] of Object.entries(definition.hosts)) {
+      const cleanKey = k.trim().toLowerCase().replace(/\.$/, '');
+      for (const host of serverHostSet) {
+        if (cleanKey === host || doesDomainMatchPolicyPattern(host, cleanKey)) {
+          matchedHosts.push([cleanKey, v]);
+          break;
+        }
+      }
+    }
+    matchedHosts.sort((a, b) => a[0].localeCompare(b[0]));
+
+    for (const [pat, servers] of Object.entries(definition.nameserverPolicy)) {
+      for (const host of serverHostSet) {
+        if (doesDomainMatchPolicyPattern(host, pat)) {
+          matchedNsPolicy.push([pat, servers]);
+          break;
+        }
+      }
+    }
+    matchedNsPolicy.sort((a, b) => a[0].localeCompare(b[0]));
+  }
+
+  return JSON.stringify({
+    profileUid: definition.profileUid,
+    rawProxy: definition.rawProxy,
+    dialerChain: definition.dialerChain,
+    hosts: matchedHosts,
+    nameserverPolicy: matchedNsPolicy,
+  });
 }
 
 function resolveActiveProxyChain(

@@ -280,6 +280,254 @@ export async function runMihomoIntegration(directory: string, sourceMonitor: Cla
       assert.equal(initialSafety.safe, true, initialSafety.reason);
       assert.equal(runtime.getClaudeExpectedRegion().countryCode, verified.countryCode);
 
+      // 同时将 Antigravity 绑定至可用通道，验证 Clash Verge 切换订阅组、重载闪断及半途中断恢复
+      const verifiedAgState = await engine.selectAntigravityClashNode(upstreamName, node.profileUid);
+      const verifiedAg = verifiedAgState.antigravityState.nodeProbe;
+      assert.ok(verifiedAg, verifiedAgState.antigravityState.nodeProbeError || 'Antigravity 未取得真实出口结果');
+      assert.equal(getTargetServiceVerificationError(verifiedAg, 'antigravity'), null);
+
+      const secondProfileUid = `${node.profileUid}-other`;
+      const secondProfilePath = path.join(root, 'profiles', 'other-subscription.yaml');
+      fs.writeFileSync(secondProfilePath, yaml.dump({
+        proxies: [{ name: 'Other-Node', type: 'socks5', server: '127.0.0.1', port: 65530 }],
+      }));
+      const writeProfilesYaml = (activeUid: string) => {
+        fs.writeFileSync(path.join(root, 'profiles.yaml'), yaml.dump({
+          current: activeUid,
+          items: [
+            { uid: node.profileUid, name: node.profileName, type: 'local', file: 'subscription.yaml' },
+            { uid: secondProfileUid, name: '备用测试订阅', type: 'local', file: 'other-subscription.yaml' },
+          ],
+        }));
+      };
+      const simulateClashVergeReload = async (extraDoc: Record<string, unknown> = {}) => {
+        const coreDoc = {
+          'external-controller': `127.0.0.1:${controllerPort}`,
+          mode: 'rule',
+          'log-level': 'silent',
+          ipv6: false,
+          proxies: [{ name: 'Other-Node', type: 'socks5', server: '127.0.0.1', port: 65530 }],
+          hosts: { 'intranet.local': '10.0.0.1' },
+          dns: {
+            'enhanced-mode': 'fake-ip',
+            'nameserver-policy': {
+              '+.quandao.com': ['223.5.5.5'],
+              '+.jiandaoyun.com': ['223.5.5.5'],
+            },
+          },
+          rules: ['MATCH,DIRECT'],
+          tun: { enable: false },
+          ...extraDoc,
+        };
+        const rawCoreYaml = yaml.dump(coreDoc) + `secret: ${secret}\n`;
+        fs.writeFileSync(yamlPath, rawCoreYaml);
+        await internal.requestRaw(
+          endpoint,
+          'PUT',
+          '/configs?force=true',
+          JSON.stringify({ payload: rawCoreYaml }),
+          3500
+        );
+      };
+
+      // 1) 切换订阅组（携带全局 hosts/nameserver-policy 且清空卫士专属监听）后：自动无感补回监听且不清空/重刷健康探测结果
+      const claudeSeqBeforeSwitch = runtime.claudeProbeSeq;
+      const agSeqBeforeSwitch = runtime.antigravityProbeSeq;
+      const claudeDefBeforeSwitch = internal.slots.claude.boundDefinition;
+      const agDefBeforeSwitch = internal.slots.antigravity.boundDefinition;
+      claudeReprobed = false;
+      agReprobed = false;
+
+      writeProfilesYaml(secondProfileUid);
+      await simulateClashVergeReload();
+      const wipedKernel = await internal.requestJson(endpoint, '/proxies');
+      assert.equal(wipedKernel.proxies.__guard_claude_dedicated_proxy__, undefined);
+      assert.equal(wipedKernel.proxies.__guard_ag_dedicated_proxy__, undefined);
+
+      await internal.tick();
+      await sleep(350);
+      assert.equal(monitor.getRuntimeInfo().dedicatedPortListening, true);
+      assert.equal(monitor.getRuntimeInfo().antigravityPortListening, true);
+      assert.equal(internal.slots.claude.boundDefinition, claudeDefBeforeSwitch);
+      assert.equal(internal.slots.antigravity.boundDefinition, agDefBeforeSwitch);
+      assert.equal(runtime.claudeProbeSeq, claudeSeqBeforeSwitch);
+      assert.equal(runtime.antigravityProbeSeq, agSeqBeforeSwitch);
+      assert.equal(claudeReprobed, false);
+      assert.equal(agReprobed, false);
+      assert.ok(engine.getSnapshot().claudeState.nodeProbe);
+      assert.ok(engine.getSnapshot().antigravityState.nodeProbe);
+
+      // 再切回原订阅组，依然不应误判定义变化或重刷
+      writeProfilesYaml(node.profileUid);
+      await simulateClashVergeReload();
+      await internal.tick();
+      await sleep(350);
+      assert.equal(internal.slots.claude.boundDefinition, claudeDefBeforeSwitch);
+      assert.equal(internal.slots.antigravity.boundDefinition, agDefBeforeSwitch);
+      assert.equal(runtime.claudeProbeSeq, claudeSeqBeforeSwitch);
+      assert.equal(runtime.antigravityProbeSeq, agSeqBeforeSwitch);
+      assert.equal(claudeReprobed, false);
+      assert.equal(agReprobed, false);
+      console.log('通过：Clash Verge 切换订阅组及全局 DNS 策略不误刷 Claude 与 Antigravity 健康探测状态');
+
+      // 2) profiles.yaml 早于或晚于 clash-verge.yaml 落盘均不污染节点池且不冻结补绑（验证 Bug 1A / 1B 修复）
+      writeProfilesYaml(secondProfileUid);
+      await internal.tick();
+      const secondGroupBeforeReload = monitor
+        .getRuntimeInfo()
+        .profileGroups.find((g) => g.uid === secondProfileUid);
+      assert.deepEqual(
+        secondGroupBeforeReload?.nodes.map((n) => n.name),
+        ['Other-Node'],
+        '切换订阅瞬间未更新的 clash-verge.yaml 旧节点不应污染新订阅节点池'
+      );
+      assert.equal(monitor.getRuntimeInfo().dedicatedPortListening, true);
+      assert.equal(monitor.getRuntimeInfo().antigravityPortListening, true);
+
+      // 模拟 Clash Verge 先重载生成 clash-verge.yaml 清空端口、随后再保存 profiles.yaml（pStat.mtimeMs > rStat.mtimeMs）
+      await simulateClashVergeReload();
+      const olderRuntimeTime = new Date(Date.now() - 800);
+      fs.utimesSync(yamlPath, olderRuntimeTime, olderRuntimeTime);
+      writeProfilesYaml(secondProfileUid);
+      await internal.tick();
+      assert.equal(
+        monitor.getRuntimeInfo().dedicatedPortListening,
+        true,
+        'profiles.yaml 晚于 clash-verge.yaml 落盘时也应立即补绑端口，不得被时间戳冻结'
+      );
+      assert.equal(monitor.getRuntimeInfo().antigravityPortListening, true);
+      writeProfilesYaml(node.profileUid);
+      await simulateClashVergeReload();
+      await internal.tick();
+      console.log('通过：profiles.yaml 早于或晚于 clash-verge.yaml 写入均不污染节点池且立即补绑恢复');
+
+      // 2b) 宽限期内单次补绑瞬态失败不清空健康探测态且第 2 拍继续受宽限保护 + isTicking 期间唤醒不丢失（验证 Bug 2 / Bug 3）
+      internal.isTicking = true;
+      await internal.tick();
+      assert.equal(internal.pendingImmediateTick, true);
+      internal.isTicking = false;
+      internal.pendingImmediateTick = false;
+
+      internal.rebindGraceUntil = Date.now() + 8000;
+      const origReloadDoc = internal.reloadClashDocAndRestoreSelections.bind(internal);
+      let concurrentWipeOnce = true;
+      internal.reloadClashDocAndRestoreSelections = async (
+        doc: Record<string, unknown>,
+        selections: Array<{ group: string; now: string }>
+      ) => {
+        await origReloadDoc(doc, selections);
+        if (concurrentWipeOnce) {
+          concurrentWipeOnce = false;
+          await simulateClashVergeReload();
+        }
+      };
+      try {
+        await simulateClashVergeReload();
+        await internal.tick();
+        assert.equal(concurrentWipeOnce, false);
+        assert.equal(monitor.getRuntimeInfo().dedicatedPortListening, true);
+        assert.equal(monitor.getRuntimeInfo().antigravityPortListening, true);
+        assert.ok(engine.getSnapshot().claudeState.nodeProbe, '宽限期瞬态失败不应清空健康探测态');
+        assert.ok(engine.getSnapshot().antigravityState.nodeProbe, '宽限期瞬态失败不应清空健康探测态');
+        assert.equal(internal.slots.claude.boundNodeName, upstreamName);
+        assert.equal(internal.slots.antigravity.boundNodeName, upstreamName);
+        await internal.tick();
+        assert.equal(monitor.getRuntimeInfo().dedicatedPortListening, true);
+        assert.equal(monitor.getRuntimeInfo().antigravityPortListening, true);
+        const restoredKernel = await internal.requestJson(endpoint, '/proxies');
+        assert.ok(restoredKernel.proxies.__guard_claude_dedicated_proxy__);
+        assert.ok(restoredKernel.proxies.__guard_ag_dedicated_proxy__);
+      } finally {
+        internal.reloadClashDocAndRestoreSelections = origReloadDoc;
+      }
+      console.log('通过：宽限期瞬态补绑失败保留绑定与健康探测态，且 isTicking 唤醒补偿正常');
+
+      // 3) 若此前处于失败或校验未完成状态，内核监听补绑完成后自动自愈重测（Claude & Antigravity）
+      runtime.claudeNodeProbe = {
+        ...verified,
+        claudeTraceLoc: undefined,
+        claudeTraceError: 'https://claude.ai/cdn-cgi/trace：connect ECONNREFUSED',
+      };
+      runtime.antigravityNodeProbe = {
+        ...verifiedAg,
+        googleCountryCode: undefined,
+        googleCountryName: undefined,
+      };
+      await simulateClashVergeReload();
+      await internal.tick();
+      await sleep(350);
+      await Promise.all([runtime.claudeProbePromise, runtime.antigravityProbePromise]);
+      assert.equal(getTargetServiceVerificationError(engine.getSnapshot().claudeState.nodeProbe, 'claude'), null);
+      assert.equal(getTargetServiceVerificationError(engine.getSnapshot().antigravityState.nodeProbe, 'antigravity'), null);
+      console.log('通过：内核专属监听补绑后自动自愈 Claude 与 Antigravity 残留的失败/未完成校验状态');
+
+      // 4) 二阶段连续两次重载冲掉专属端口仍能恢复 + 正常网络失败不空跑翻倍 + 对端运行时禁止跨通道强刷（验证 Bug 4 / 过度设计精简）
+      runtime.claudeRunning = true;
+      runtime.antigravityRunning = false;
+      assert.equal(runtime.canForceReloadDedicatedListeners(), false);
+      runtime.claudeRunning = false;
+      assert.equal(runtime.canForceReloadDedicatedListeners(), true);
+
+      let normalFailCalls = 0;
+      const origVerify = runtime.verifyTargetServiceRegion.bind(runtime);
+      runtime.verifyTargetServiceRegion = async (
+        _pUrl: string | null,
+        pRes: any,
+        targetApp: 'claude' | 'antigravity'
+      ) => {
+        normalFailCalls++;
+        if (targetApp === 'claude') {
+          pRes.claudeTraceLoc = undefined;
+          pRes.claudeTraceError = '模拟目标站网络超时（本地专属端口完好）';
+        } else {
+          pRes.googleCountryCode = undefined;
+        }
+      };
+      try {
+        await engine.probeAntigravityNodeNow();
+        assert.equal(normalFailCalls, 1, '本地专属监听完好时二阶段失败不应空转重跑第二遍');
+      } finally {
+        runtime.verifyTargetServiceRegion = origVerify;
+      }
+
+      let claudeWipeCount = 0;
+      let agWipeCount = 0;
+      runtime.verifyTargetServiceRegion = async (
+        pUrl: string | null,
+        pRes: unknown,
+        targetApp: 'claude' | 'antigravity',
+        forceRefresh?: boolean
+      ) => {
+        if (targetApp === 'claude' && claudeWipeCount < 2) {
+          claudeWipeCount++;
+          await simulateClashVergeReload();
+          if (claudeWipeCount === 2) {
+            // 第 2 次重载由 ClashMonitor 巡检补绑并触发 claude-listener-rebound，验证连续两次重载不丢事件
+            void internal.tick();
+          }
+        } else if (targetApp === 'antigravity' && agWipeCount < 2) {
+          agWipeCount++;
+          await simulateClashVergeReload();
+          if (agWipeCount === 2) {
+            void internal.tick();
+          }
+        }
+        return origVerify(pUrl, pRes, targetApp, forceRefresh);
+      };
+      try {
+        const midReloadClaude = await engine.probeClaudeNodeNow('手动刷新验证连续重载恢复', true);
+        assert.equal(claudeWipeCount, 2);
+        assert.equal(getTargetServiceVerificationError(midReloadClaude.claudeState.nodeProbe, 'claude'), null);
+
+        const midReloadAg = await engine.probeAntigravityNodeNow();
+        assert.equal(agWipeCount, 2);
+        assert.equal(getTargetServiceVerificationError(midReloadAg.antigravityState.nodeProbe, 'antigravity'), null);
+      } finally {
+        runtime.verifyTargetServiceRegion = origVerify;
+      }
+      await engine.selectAntigravityClashNode(null, null);
+      console.log('通过：连续两次内核重载恢复、正常超时单次退出及对端运行跨通道防强刷验证通过');
+
       const rejectedEndpoint = { ...endpoint, secret: `${secret}-invalid` };
       internal.currentEndpoint = rejectedEndpoint;
       internal.rebindGraceUntil = 0;

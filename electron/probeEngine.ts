@@ -190,6 +190,8 @@ export class ProbeEngine extends EventEmitter {
   private lastNetFingerprint = '';
   private lastAlertSignature: string | null = null;
   private lastGuardFailSignature: string | null = null;
+  private claudeReboundDuringProbe = false;
+  private antigravityReboundDuringProbe = false;
   private targetVerifyCache = new Map<
     string,
     {
@@ -278,6 +280,14 @@ export class ProbeEngine extends EventEmitter {
           void this.probeAntigravityNodeNow();
         }, 250);
       }
+    });
+
+    this.clashMonitor.on('claude-listener-rebound', () => {
+      this.handleChannelListenerRebound('claude');
+    });
+
+    this.clashMonitor.on('antigravity-listener-rebound', () => {
+      this.handleChannelListenerRebound('antigravity');
     });
 
     this.clashMonitor.on('clash-status-updated', () => {
@@ -573,12 +583,138 @@ export class ProbeEngine extends EventEmitter {
     }
   }
 
+  private needsChannelRecoveryProbe(channel: 'claude' | 'antigravity'): boolean {
+    const probe = channel === 'claude' ? this.claudeNodeProbe : this.antigravityNodeProbe;
+    const probeErr =
+      channel === 'claude' ? this.claudeNodeProbeError : this.antigravityNodeProbeError;
+    if (!probe || Boolean(probeErr)) {
+      return true;
+    }
+    return !isValidIsoCountryCode(
+      channel === 'claude' ? probe.claudeTraceLoc : probe.googleCountryCode
+    );
+  }
+
+  private handleChannelListenerRebound(channel: 'claude' | 'antigravity'): void {
+    if (channel === 'claude') {
+      if (this.claudeIsProbing) this.claudeReboundDuringProbe = true;
+    } else if (this.antigravityIsProbing) {
+      this.antigravityReboundDuringProbe = true;
+    }
+    this.emitState();
+
+    const cfg = this.configStore.get();
+    const info = this.clashMonitor.getRuntimeInfo();
+    if (channel === 'claude') {
+      if (
+        cfg.selectedClashNode &&
+        info.dedicatedPortListening &&
+        this.claudeSwitchingCount === 0 &&
+        !this.claudeIsProbing &&
+        this.needsChannelRecoveryProbe('claude')
+      ) {
+        if (this.claudeDebounceTimer) clearTimeout(this.claudeDebounceTimer);
+        this.claudeDebounceTimer = setTimeout(() => {
+          this.claudeDebounceTimer = null;
+          void this.probeClaudeNodeNow('Claude 专属代理端口恢复重测');
+        }, 250);
+      }
+    } else if (
+      cfg.antigravityClashNode &&
+      info.antigravityPortListening &&
+      this.antigravitySwitchingCount === 0 &&
+      !this.antigravityIsProbing &&
+      this.needsChannelRecoveryProbe('antigravity')
+    ) {
+      if (this.antigravityDebounceTimer) clearTimeout(this.antigravityDebounceTimer);
+      this.antigravityDebounceTimer = setTimeout(() => {
+        this.antigravityDebounceTimer = null;
+        void this.probeAntigravityNodeNow();
+      }, 250);
+    }
+  }
+
+  private canForceReloadDedicatedListeners(): boolean {
+    return !this.claudeRunning && !this.antigravityRunning;
+  }
+
+  private isCurrentClaudeProbe(sequence: number, config: AppConfig): boolean {
+    const current = this.configStore.get();
+    return (
+      this.claudeSwitchingCount === 0 &&
+      this.claudeProbeSeq === sequence &&
+      current.selectedClashNode === config.selectedClashNode &&
+      current.selectedClashProfileUid === config.selectedClashProfileUid &&
+      current.dedicatedProxyPort === config.dedicatedProxyPort
+    );
+  }
+
   private isCurrentAntigravityProbe(sequence: number, config: AppConfig): boolean {
     const current = this.configStore.get();
     return this.antigravitySwitchingCount === 0 && this.antigravityProbeSeq === sequence &&
       current.antigravityClashNode === config.antigravityClashNode &&
       current.antigravityClashProfileUid === config.antigravityClashProfileUid &&
       current.antigravityDedicatedPort === config.antigravityDedicatedPort;
+  }
+
+  private async tryRecoverChannelBindingAfterFailure(
+    channel: 'claude' | 'antigravity',
+    config: AppConfig,
+    sequence: number,
+    allowForceRebind: boolean
+  ): Promise<boolean> {
+    if (this.clashMonitor.getRuntimeInfo().bindingVerificationError) return false;
+    const isCurrent = () =>
+      channel === 'claude'
+        ? this.isCurrentClaudeProbe(sequence, config)
+        : this.isCurrentAntigravityProbe(sequence, config);
+    if (!isCurrent()) return false;
+
+    const forceRebind = allowForceRebind && this.canForceReloadDedicatedListeners();
+    const port =
+      channel === 'claude' ? config.dedicatedProxyPort : config.antigravityDedicatedPort;
+    const reboundBefore =
+      channel === 'claude' ? this.claudeReboundDuringProbe : this.antigravityReboundDuringProbe;
+
+    if (!forceRebind) {
+      const portListening = await isLocalPortListening(port);
+      if (portListening) {
+        if (!reboundBefore || !isCurrent()) return false;
+        if (channel === 'claude') {
+          this.claudeReboundDuringProbe = false;
+        } else {
+          this.antigravityReboundDuringProbe = false;
+        }
+        return true;
+      }
+    } else {
+      await sleep(320);
+      if (!isCurrent()) return false;
+    }
+    const rebindRes =
+      channel === 'claude'
+        ? await this.clashMonitor.configureDedicatedNode(
+            config.selectedClashNode,
+            config.dedicatedProxyPort,
+            config.selectedClashProfileUid,
+            forceRebind
+          )
+        : await this.clashMonitor.configureAntigravityNode(
+            config.antigravityClashNode,
+            config.antigravityDedicatedPort,
+            config.antigravityClashProfileUid,
+            forceRebind
+          );
+    const reboundAfter =
+      channel === 'claude' ? this.claudeReboundDuringProbe : this.antigravityReboundDuringProbe;
+    if (channel === 'claude') {
+      this.claudeReboundDuringProbe = false;
+    } else {
+      this.antigravityReboundDuringProbe = false;
+    }
+
+    if (!rebindRes.ok || !rebindRes.listening || !isCurrent()) return false;
+    return Boolean(forceRebind || rebindRes.rebound || reboundBefore || reboundAfter);
   }
 
   /** 探测 Antigravity 专属端口的出口地区，用于界面展示。 */
@@ -588,6 +724,7 @@ export class ProbeEngine extends EventEmitter {
     if (!cfg.antigravityClashNode) {
       this.antigravityProbeSeq++;
       this.antigravityPendingReprobe = false;
+      this.antigravityReboundDuringProbe = false;
       this.antigravityNodeProbe = null;
       this.antigravityNodeProbeError = null;
       this.emitState();
@@ -628,11 +765,7 @@ export class ProbeEngine extends EventEmitter {
             clash = this.clashMonitor.getRuntimeInfo();
             if (!bindRes.ok || !bindRes.listening) {
               const latestCfg = this.configStore.get();
-              if (
-                this.antigravityProbeSeq !== seqAtStart ||
-                latestCfg.antigravityClashNode !== targetNode ||
-                latestCfg.antigravityClashProfileUid !== targetProfileUid
-              ) {
+              if (!this.isCurrentAntigravityProbe(seqAtStart, curCfg)) {
                 if (latestCfg.antigravityClashNode) continue;
                 this.antigravityNodeProbe = null;
                 this.antigravityNodeProbeError = null;
@@ -649,6 +782,7 @@ export class ProbeEngine extends EventEmitter {
             }
           }
 
+          this.antigravityReboundDuringProbe = false;
           const proxyUrl = `http://127.0.0.1:${curCfg.antigravityDedicatedPort}`;
           const channelDesc = `Antigravity 专属端口 (127.0.0.1:${curCfg.antigravityDedicatedPort})`;
 
@@ -658,30 +792,25 @@ export class ProbeEngine extends EventEmitter {
 
           if (
             !probeSuccess &&
-            this.isCurrentAntigravityProbe(seqAtStart, curCfg)
+            (await this.tryRecoverChannelBindingAfterFailure('antigravity', curCfg, seqAtStart, true))
           ) {
-            await sleep(320);
-            if (!this.isCurrentAntigravityProbe(seqAtStart, curCfg)) continue;
-            const rebindRes = await this.clashMonitor.configureAntigravityNode(
-              targetNode,
-              curCfg.antigravityDedicatedPort,
-              targetProfileUid,
-              true
-            );
-            if (rebindRes.ok && rebindRes.listening) {
-              const secondPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5500);
-              probeSuccess = secondPass.result;
-              if (!probeSuccess) {
-                lastErrMsg = secondPass.errMsg;
-              }
+            clash = this.clashMonitor.getRuntimeInfo();
+            const secondPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5500);
+            probeSuccess = secondPass.result;
+            if (!probeSuccess) {
+              lastErrMsg = secondPass.errMsg;
             }
           }
 
-          if (
-            probeSuccess &&
-            this.isCurrentAntigravityProbe(seqAtStart, curCfg)
-          ) {
+          if (probeSuccess && this.isCurrentAntigravityProbe(seqAtStart, curCfg)) {
             await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'antigravity', true);
+            if (
+              !isValidIsoCountryCode(probeSuccess.googleCountryCode) &&
+              (await this.tryRecoverChannelBindingAfterFailure('antigravity', curCfg, seqAtStart, false))
+            ) {
+              clash = this.clashMonitor.getRuntimeInfo();
+              await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'antigravity', true);
+            }
           }
 
           const afterCfg = this.configStore.get();
@@ -692,6 +821,13 @@ export class ProbeEngine extends EventEmitter {
             this.antigravityNodeProbe = null;
             this.antigravityNodeProbeError = null;
             break;
+          }
+
+          if (
+            this.antigravityReboundDuringProbe &&
+            (!probeSuccess || !isValidIsoCountryCode(probeSuccess.googleCountryCode))
+          ) {
+            continue;
           }
 
           if (probeSuccess) {
@@ -989,6 +1125,7 @@ export class ProbeEngine extends EventEmitter {
     if (!cfg.selectedClashNode) {
       this.claudeProbeSeq++;
       this.claudePendingProbe = null;
+      this.claudeReboundDuringProbe = false;
       this.claudeNodeProbe = null;
       this.claudeNodeProbeError = null;
       this.emitState();
@@ -1038,8 +1175,7 @@ export class ProbeEngine extends EventEmitter {
             );
             if (
               (bindRes.profileUid || bindRes.profileName) &&
-              this.claudeProbeSeq === seqAtStart &&
-              this.configStore.get().selectedClashNode === targetNode
+              this.isCurrentClaudeProbe(seqAtStart, curCfg)
             ) {
               curCfg = this.configStore.update({
                 selectedClashProfileUid: bindRes.profileUid ?? curCfg.selectedClashProfileUid,
@@ -1053,11 +1189,7 @@ export class ProbeEngine extends EventEmitter {
               (await isLocalPortListening(curCfg.dedicatedProxyPort));
             if ((!bindRes.ok || !bindRes.listening) && !canProbeExistingPort) {
               const latestCfg = this.configStore.get();
-              if (
-                this.claudeProbeSeq !== seqAtStart ||
-                latestCfg.selectedClashNode !== targetNode ||
-                latestCfg.selectedClashProfileUid !== (curCfg.selectedClashProfileUid ?? targetProfileUid)
-              ) {
+              if (!this.isCurrentClaudeProbe(seqAtStart, curCfg)) {
                 if (this.claudePendingProbe) {
                   const next = this.claudePendingProbe;
                   this.claudePendingProbe = null;
@@ -1085,6 +1217,7 @@ export class ProbeEngine extends EventEmitter {
             }
           }
 
+          this.claudeReboundDuringProbe = false;
           const effectiveProfileUid = curCfg.selectedClashProfileUid;
           const label =
             curCfg.selectedClashProfileName || clash.boundProfileName
@@ -1100,7 +1233,7 @@ export class ProbeEngine extends EventEmitter {
             '探测超时',
             (error) => {
               if (
-                this.claudeProbeSeq === seqAtStart &&
+                this.isCurrentClaudeProbe(seqAtStart, curCfg) &&
                 !activeSkipSafety &&
                 this.claudeRunning &&
                 !this.claudeSafetyKillPromise &&
@@ -1115,52 +1248,40 @@ export class ProbeEngine extends EventEmitter {
 
           if (
             !probeSuccess &&
-            !this.claudeRunning &&
-            !clash.bindingVerificationError &&
-            this.claudeProbeSeq === seqAtStart &&
-            this.configStore.get().selectedClashNode === targetNode
+            (await this.tryRecoverChannelBindingAfterFailure('claude', curCfg, seqAtStart, true))
           ) {
-            await sleep(320);
-            if (this.claudeProbeSeq !== seqAtStart || this.claudeSwitchingCount > 0) {
-              continue;
-            }
-            const rebindRes = await this.clashMonitor.configureDedicatedNode(
-              targetNode,
-              curCfg.dedicatedProxyPort,
-              effectiveProfileUid,
-              true
-            );
-            if (rebindRes.ok && rebindRes.listening) {
-              const secondPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5800);
-              probeSuccess = secondPass.result;
-              if (!probeSuccess) {
-                lastErrMsg = secondPass.errMsg;
-              }
+            clash = this.clashMonitor.getRuntimeInfo();
+            const secondPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5800);
+            probeSuccess = secondPass.result;
+            if (!probeSuccess) {
+              lastErrMsg = secondPass.errMsg;
             }
           }
 
           const isHeartbeat = activeReason.includes('心跳');
           const isSilentPoll = isHeartbeat || activeReason.includes('后台复核');
-          if (
-            probeSuccess &&
-            this.claudeProbeSeq === seqAtStart &&
-            this.configStore.get().selectedClashNode === targetNode
-          ) {
+          if (probeSuccess && this.isCurrentClaudeProbe(seqAtStart, curCfg)) {
             const forceRefresh =
               activeReason.includes('手动') ||
               activeReason.includes('切换') ||
               activeReason.includes('启动') ||
+              activeReason.includes('恢复重测') ||
               this.claudeVerificationRecovery.snapshot !== null ||
-              !this.claudeNodeProbe;
+              !this.claudeNodeProbe ||
+              Boolean(getTargetServiceVerificationError(this.claudeNodeProbe, 'claude'));
             await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'claude', forceRefresh);
+
+            if (
+              !isValidIsoCountryCode(probeSuccess.claudeTraceLoc) &&
+              (await this.tryRecoverChannelBindingAfterFailure('claude', curCfg, seqAtStart, false))
+            ) {
+              clash = this.clashMonitor.getRuntimeInfo();
+              await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'claude', true);
+            }
           }
 
           const afterCfg = this.configStore.get();
-          if (
-            this.claudeProbeSeq !== seqAtStart ||
-            afterCfg.selectedClashNode !== targetNode ||
-            afterCfg.selectedClashProfileUid !== effectiveProfileUid
-          ) {
+          if (!this.isCurrentClaudeProbe(seqAtStart, curCfg)) {
             if (this.claudePendingProbe) {
               const next = this.claudePendingProbe;
               this.claudePendingProbe = null;
@@ -1174,6 +1295,14 @@ export class ProbeEngine extends EventEmitter {
             this.claudeNodeProbe = null;
             this.claudeNodeProbeError = null;
             break;
+          }
+
+          if (
+            this.claudeReboundDuringProbe &&
+            (!probeSuccess || !isValidIsoCountryCode(probeSuccess.claudeTraceLoc))
+          ) {
+            activeReason = 'Claude 专属代理端口恢复重测';
+            continue;
           }
 
           if (probeSuccess) {
