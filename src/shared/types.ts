@@ -38,6 +38,7 @@ export interface AppConfig {
   dedicatedProxyPort: number;              // 为所选节点分配的本地独立专属代理端口（默认 27897）
   claudeExePath: string;                   // 自定义 Claude Desktop 启动路径（留空则自动探测）
   claudeExclusiveGuard: boolean;           // 唯一入口守护：禁止任何外部途径启动 Claude，不一致立杀
+  claudeLockExitIp: boolean;               // 会话出口 IP 锁定：运行期 claude.ai 识别出口 IP 变更即强杀
 
   // Antigravity 启动器专栏配置（纯代理绑定，无监控/预警/强杀）
   antigravityClashNode: string | null;        // Antigravity 独立指定的 Clash 节点名称
@@ -143,6 +144,7 @@ export interface ClaudeRuntimeState {
   nodeProbeError: string | null;  // 节点独立探测失败提示
   verificationFailure: ClaudeVerificationFailure | null;
   lastVerificationSuccessAt: number | null;
+  lockedSessionIp: string | null; // 当前会话锁定的初始 Claude 出口 IP（开启锁定且会话已建立基线时非空）
 }
 
 export interface AntigravityRuntimeState {
@@ -169,9 +171,17 @@ export interface GuardEventLog {
 
 export interface AlertPayload {
   source?: 'claude' | 'monitor';
-  alertType: 'mismatch' | 'disconnect' | 'locale-mismatch' | 'unauthorized-launch' | 'verification-unavailable' | 'recovered';
+  alertType:
+    | 'mismatch'
+    | 'ip-change'
+    | 'disconnect'
+    | 'locale-mismatch'
+    | 'unauthorized-launch'
+    | 'verification-unavailable'
+    | 'recovered';
   expectedCode: string | null;
   expectedName: string | null;
+  expectedIp?: string | null;
   actualCode: string | null;
   actualName: string | null;
   actualIp: string | null;

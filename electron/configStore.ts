@@ -31,6 +31,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   dedicatedProxyPort: 27897,
   claudeExePath: '',
   claudeExclusiveGuard: true,
+  claudeLockExitIp: true,
   antigravityClashNode: null,
   antigravityClashProfileUid: null,
   antigravityClashProfileName: null,
@@ -115,6 +116,11 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
       ? raw.claudeExclusiveGuard
       : DEFAULT_CONFIG.claudeExclusiveGuard;
 
+  const claudeLockExitIp =
+    typeof raw.claudeLockExitIp === 'boolean'
+      ? raw.claudeLockExitIp
+      : DEFAULT_CONFIG.claudeLockExitIp;
+
   const antigravityClashNode =
     typeof raw.antigravityClashNode === 'string' && raw.antigravityClashNode.trim()
       ? raw.antigravityClashNode.trim()
@@ -189,6 +195,7 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     dedicatedProxyPort,
     claudeExePath,
     claudeExclusiveGuard,
+    claudeLockExitIp,
     antigravityClashNode,
     antigravityClashProfileUid,
     antigravityClashProfileName,

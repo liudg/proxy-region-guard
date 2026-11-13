@@ -39,7 +39,10 @@ function playAlertChime(type: AlertPayload['alertType']): void {
 
     const now = ctx.currentTime;
     const notes =
-      type === 'mismatch' || type === 'locale-mismatch' || type === 'unauthorized-launch'
+      type === 'mismatch' ||
+      type === 'ip-change' ||
+      type === 'locale-mismatch' ||
+      type === 'unauthorized-launch'
         ? [880, 622.25, 880]
         : [660, 440];
 
@@ -103,6 +106,7 @@ export const AlertPopup: React.FC = () => {
   }
 
   const isRecovered = payload.alertType === 'recovered';
+  const isIpChange = payload.alertType === 'ip-change';
   const isDisconnect = payload.alertType === 'disconnect';
   const isVerificationUnavailable = payload.alertType === 'verification-unavailable';
   const isLocaleMismatch = payload.alertType === 'locale-mismatch';
@@ -124,6 +128,8 @@ export const AlertPopup: React.FC = () => {
     ? '代理连接异常断开警告'
     : isLocaleMismatch
     ? '代理与系统时区/区域不一致！'
+    : isIpChange
+    ? 'Claude 出口 IP 变更熔断！'
     : '代理 IP 地区变更警告！';
 
   return (
@@ -232,6 +238,46 @@ export const AlertPopup: React.FC = () => {
               </div>
             </div>
           </div>
+        ) : isIpChange ? (
+          <div className="alert-compare-grid">
+            <div className="compare-box">
+              <span className="compare-label">会话锁定 IP</span>
+              <div className="compare-region-main">
+                <CountryFlag code={payload.expectedCode} size="md" />
+                <div className="compare-region-text">
+                  <strong title={payload.expectedIp || undefined}>
+                    {payload.expectedIp || '未记录'}
+                  </strong>
+                  <small>
+                    {payload.expectedName
+                      ? `${payload.expectedName} (${payload.expectedCode})`
+                      : payload.expectedCode}
+                  </small>
+                </div>
+              </div>
+            </div>
+
+            <div className="compare-arrow">
+              <ArrowRight size={18} />
+            </div>
+
+            <div className="compare-box actual danger">
+              <span className="compare-label">当前漂移 IP</span>
+              <div className="compare-region-main">
+                <CountryFlag code={payload.actualCode || payload.expectedCode} size="md" />
+                <div className="compare-region-text">
+                  <strong title={payload.actualIp || undefined}>
+                    {payload.actualIp || '未知'}
+                  </strong>
+                  <small>
+                    {payload.actualName
+                      ? `${payload.actualName}${payload.actualCode ? ` (${payload.actualCode})` : ''}`
+                      : payload.actualCode}
+                  </small>
+                </div>
+              </div>
+            </div>
+          </div>
         ) : (
           <div className="alert-compare-grid">
             <div className="compare-box">
@@ -282,16 +328,25 @@ export const AlertPopup: React.FC = () => {
         )}
 
         <div className="alert-meta-lines">
-          {payload.actualIp && (
+          {isIpChange ? (
             <div className="alert-meta-item">
-              <span className="meta-k">当前出口 IP：</span>
-              <code className="meta-v">{payload.actualIp}</code>
-              {payload.edgeLoc &&
-                payload.actualCode &&
-                payload.edgeLoc !== payload.actualCode && (
-                  <span className="broadcast-tag">路由点: {payload.edgeLoc}</span>
-                )}
+              <span className="meta-k">IP 漂移：</span>
+              <code className="meta-v alert-detail">
+                {payload.expectedIp || '未知'} → {payload.actualIp || '未知'}
+              </code>
             </div>
+          ) : (
+            payload.actualIp && (
+              <div className="alert-meta-item">
+                <span className="meta-k">当前出口 IP：</span>
+                <code className="meta-v">{payload.actualIp}</code>
+                {payload.edgeLoc &&
+                  payload.actualCode &&
+                  payload.edgeLoc !== payload.actualCode && (
+                    <span className="broadcast-tag">路由点: {payload.edgeLoc}</span>
+                  )}
+              </div>
+            )
           )}
           <div className="alert-meta-item">
             <span className="meta-k">触发原因：</span>
@@ -306,6 +361,7 @@ export const AlertPopup: React.FC = () => {
       {/* 底部快捷处置按钮 */}
       <div className="alert-actions no-drag">
         {!isRecovered &&
+          !isIpChange &&
           !isDisconnect &&
           !isLocaleMismatch &&
           !isUnauthorizedLaunch &&

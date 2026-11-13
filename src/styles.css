@@ -1262,6 +1262,7 @@ code {
 }
 
 .compare-box {
+  min-width: 0;
   padding: 9px 10px;
   border-radius: 10px;
   background: rgba(15, 23, 42, 0.72);

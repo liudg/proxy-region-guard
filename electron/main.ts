@@ -284,7 +284,7 @@ function estimateTextLines(text: string | undefined | null, cjkPerLine: number):
 function computeAlertWindowHeight(payload: AlertPayload): number {
   const hasKilled = Boolean(payload.killedProcesses && payload.killedProcesses.length > 0);
   const hasErr = Boolean(payload.killError);
-  const hasIp = Boolean(payload.actualIp);
+  const hasIp = Boolean(payload.actualIp || (payload.alertType === 'ip-change' && payload.expectedIp));
   const isCompactBox =
     payload.alertType === 'disconnect' ||
     payload.alertType === 'unauthorized-launch' ||
@@ -295,6 +295,13 @@ function computeAlertWindowHeight(payload: AlertPayload): number {
   if (hasKilled) height += 38;
   if (hasErr) height += 34;
 
+  const ipMetaText =
+    payload.alertType === 'ip-change'
+      ? `IP 漂移：${payload.expectedIp || '未知'} → ${payload.actualIp || '未知'}`
+      : payload.actualIp
+      ? `当前出口 IP：${payload.actualIp}`
+      : '';
+  const extraIpLines = ipMetaText ? Math.max(0, estimateTextLines(ipMetaText, 27) - 1) : 0;
   const reasonText = `${payload.activeNode ? `[${payload.activeNode}] · ` : ''}${payload.triggerReason || ''}`;
   const extraReasonLines = Math.max(0, estimateTextLines(reasonText, 24) - 1);
   const extraKilledLines = hasKilled
@@ -304,7 +311,7 @@ function computeAlertWindowHeight(payload: AlertPayload): number {
     ? Math.max(0, estimateTextLines(payload.killError, 27) - 1)
     : 0;
 
-  const extraHeight = (extraReasonLines + extraKilledLines + extraErrLines) * 17;
+  const extraHeight = (extraIpLines + extraReasonLines + extraKilledLines + extraErrLines) * 17;
   return Math.min(420, height + extraHeight);
 }
 
@@ -476,8 +483,14 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
 
   const profilePrefix =
     state.config.selectedClashProfileName || state.clashInfo.boundProfileName;
+  const effectiveClaudeIp =
+    state.claudeState.lockedSessionIp ||
+    state.claudeState.nodeProbe?.claudeTraceIp ||
+    state.claudeState.nodeProbe?.ip;
   const claudeProbeSuffix = state.claudeState.nodeProbe
-    ? ` (${state.claudeState.nodeProbe.countryCode} · ${state.claudeState.nodeProbe.ip})`
+    ? ` (${state.claudeState.nodeProbe.countryCode} · ${
+        state.claudeState.lockedSessionIp ? `🔒${effectiveClaudeIp}` : effectiveClaudeIp
+      })`
     : '';
   const nodeText = state.config.selectedClashNode
     ? `Claude节点: ${profilePrefix ? `${profilePrefix} / ` : ''}${state.config.selectedClashNode}${claudeProbeSuffix}`

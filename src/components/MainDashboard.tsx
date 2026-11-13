@@ -1508,13 +1508,38 @@ export const MainDashboard: React.FC = () => {
                               </small>
                             ) : claudeVerificationError ? (
                               <small className="text-danger">{claudeVerificationError}</small>
+                            ) : claudeState.running && claudeState.lockedSessionIp ? (
+                              <small
+                                className="ellipsis"
+                                title={`已锁定会话出口 IP: ${claudeState.lockedSessionIp}${
+                                  claudeState.nodeProbe.claudeTraceIp &&
+                                  claudeState.nodeProbe.claudeTraceIp !== claudeState.nodeProbe.ip
+                                    ? ` · 常规回显 IP: ${claudeState.nodeProbe.ip}`
+                                    : ''
+                                } (${claudeState.nodeProbe.latencyMs} ms)`}
+                              >
+                                🔒 锁定会话 IP: {claudeState.lockedSessionIp} ·{' '}
+                                {claudeState.nodeProbe.latencyMs} ms
+                              </small>
                             ) : (
                               <small
                                 className="ellipsis"
-                                title={`${claudeState.nodeProbe.ip} (${claudeState.nodeProbe.latencyMs} ms)`}
+                                title={`Claude 实际出口 IP: ${
+                                  claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip
+                                }${
+                                  claudeState.nodeProbe.claudeTraceIp &&
+                                  claudeState.nodeProbe.claudeTraceIp !== claudeState.nodeProbe.ip
+                                    ? ` · 常规回显 IP: ${claudeState.nodeProbe.ip} (同国 AI 分流)`
+                                    : ''
+                                } (${claudeState.nodeProbe.latencyMs} ms)`}
                               >
-                                IP: {claudeState.nodeProbe.ip} · {claudeState.nodeProbe.latencyMs}{' '}
-                                ms
+                                Claude IP:{' '}
+                                {claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip}
+                                {claudeState.nodeProbe.claudeTraceIp &&
+                                claudeState.nodeProbe.claudeTraceIp !== claudeState.nodeProbe.ip
+                                  ? ' (AI分流)'
+                                  : ''}{' '}
+                                · {claudeState.nodeProbe.latencyMs} ms
                                 {' · 目标服务地区校验通过'}
                               </small>
                             )}
@@ -1763,7 +1788,8 @@ export const MainDashboard: React.FC = () => {
                     </div>
                     <div className="collapsible-header-right">
                       <span className="mini-badge neutral">
-                        {config.claudeExclusiveGuard ? '唯一入口拦截' : '拦截已关'} · 127.0.0.1:
+                        {config.claudeExclusiveGuard ? '唯一入口拦截' : '拦截已关'} ·{' '}
+                        {config.claudeLockExitIp ? 'IP锁定开启' : 'IP锁定已关'} · 127.0.0.1:
                         {config.dedicatedProxyPort} · {installTypeLabel}
                       </span>
                       <span className="collapse-chevron">
@@ -1798,9 +1824,29 @@ export const MainDashboard: React.FC = () => {
 
                       <div className="setting-row">
                         <div>
+                          <strong>锁定会话出口 IP（变更即强杀）</strong>
+                          <p>
+                            锁定会话启动时 claude.ai 识别的真实出口 IP；运行期发生任何 IP 漂移（含同国换 IP、IPv4/IPv6 切换）立即 0 秒强杀进程树。动态轮换住宅代理可按需关闭。
+                          </p>
+                        </div>
+                        <input
+                          type="checkbox"
+                          className="toggle-switch"
+                          checked={config.claudeLockExitIp}
+                          onChange={(e) =>
+                            void updateConfigSafe(
+                              { claudeLockExitIp: e.target.checked },
+                              'claude'
+                            )
+                          }
+                        />
+                      </div>
+
+                      <div className="setting-row">
+                        <div>
                           <strong>Claude 保护终止提醒</strong>
                           <p>
-                            保护措施终止 Claude 时始终弹窗。请求暂时失败期间静默复核，持续 30 秒未恢复时终止并提醒。
+                            出口 IP 漂移、地区或时区不一致时立即 0 秒强杀并置顶弹窗提醒；请求暂时失败期间静默复核，持续 30 秒未恢复时终止并提醒。
                           </p>
                         </div>
                         <span className="mini-badge connected" style={{ flexShrink: 0 }}>
