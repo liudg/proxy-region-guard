@@ -1461,6 +1461,9 @@ export const MainDashboard: React.FC = () => {
                           持续至 {formatTime(claudeState.verificationFailure.deadlineAt)} 仍未恢复将终止 Claude 并提醒。
                         </p>
                         <small>
+                          {claudeState.lockedSessionIp
+                            ? `🔒 锁定会话 IP：${claudeState.lockedSessionIp} · `
+                            : ''}
                           最后成功校验：{claudeState.lastVerificationSuccessAt
                             ? formatTime(claudeState.lastVerificationSuccessAt) : '暂无成功记录'}
                         </small>

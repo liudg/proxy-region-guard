@@ -23,7 +23,11 @@ import {
 } from '../electron/processGuard';
 import { readWindowsLocaleState } from '../electron/winSystemLocale';
 import { readWindowsSystemProxy } from '../electron/systemProxy';
-import { getTargetServiceVerificationError, isValidIpAddress } from '../src/shared/probeValidation';
+import {
+  getTargetServiceVerificationError,
+  isValidIpAddress,
+  normalizeIpAddress,
+} from '../src/shared/probeValidation';
 import {
   COUNTRY_DEFAULT_WINDOWS_TZ,
   isWindowsLocaleMatchingCountry,
@@ -819,10 +823,25 @@ async function run(): Promise<void> {
       timerEngine.restartHeartbeatTimer();
       assert.equal(timerInternal.heartbeatTimer, null, '全局心跳为 0 时不应启动实时监控定时器');
       assert.ok(timerInternal.claudeHeartbeatTimer, '全局心跳为 0 时仍应启动 Claude 专属 10 秒巡检定时器');
+      assert.equal(
+        timerInternal.claudeHeartbeatTimer._idleTimeout,
+        CLAUDE_MAX_RUNTIME_POLL_SEC * 1000,
+        '全局心跳为 0 时 Claude 巡检周期应为 10000ms'
+      );
       timerStore.update({ heartbeatIntervalSec: 60 });
       timerEngine.restartHeartbeatTimer();
       assert.ok(timerInternal.heartbeatTimer);
       assert.ok(timerInternal.claudeHeartbeatTimer);
+      assert.equal(timerInternal.heartbeatTimer._idleTimeout, 60000);
+      assert.equal(
+        timerInternal.claudeHeartbeatTimer._idleTimeout,
+        CLAUDE_MAX_RUNTIME_POLL_SEC * 1000,
+        '全局心跳超过 10 秒时 Claude 巡检周期必须封顶在 10000ms'
+      );
+      timerStore.update({ heartbeatIntervalSec: 5 });
+      timerEngine.restartHeartbeatTimer();
+      assert.equal(timerInternal.heartbeatTimer._idleTimeout, 5000);
+      assert.equal(timerInternal.claudeHeartbeatTimer._idleTimeout, 5000);
     } finally {
       timerEngine.stop();
       assert.equal(timerInternal.heartbeatTimer, null);
@@ -852,9 +871,18 @@ async function run(): Promise<void> {
   await check('各应用按对应目标服务判定缺失、出口 IP 合法性和地区冲突', () => {
     assert.equal(isValidIpAddress('104.28.12.34'), true);
     assert.equal(isValidIpAddress('2606:4700:4700::1111'), true);
+    assert.equal(isValidIpAddress('2606:4700:4700:0000:0000:0000:0000:ABCD'), true);
     assert.equal(isValidIpAddress('999.1.1.1'), false);
+    assert.equal(isValidIpAddress('::1]/evil'), false);
+    assert.equal(isValidIpAddress('::1]:8080/x'), false);
+    assert.equal(isValidIpAddress('2606:4700::1111]?a=1'), false);
+    assert.equal(isValidIpAddress('2606:4700::1111]#x'), false);
     assert.equal(isValidIpAddress('not-an-ip'), false);
     assert.equal(isValidIpAddress(''), false);
+    assert.equal(
+      normalizeIpAddress('2606:4700:4700:0000:0000:0000:0000:ABCD'),
+      '2606:4700:4700::abcd'
+    );
 
     const country = probe.countryCode;
     assert.ok(getTargetServiceVerificationError({ ...probe, googleCountryCode: country }));

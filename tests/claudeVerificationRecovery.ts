@@ -53,8 +53,16 @@ export async function runClaudeVerificationRecoveryTests(
   assert.ok(requestFailures > 1);
   assert.ok(firstRequestFailedAt <= Date.now());
 
-  const proxyServer = http.createServer((_req, res) => {
+  const proxyServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
+    if (req.url?.endsWith('/plain-v6')) {
+      res.end('2606:4700:4700:0000:0000:0000:0000:ABCD\n');
+      return;
+    }
+    if (req.url?.endsWith('/plain-json-v6')) {
+      res.end(JSON.stringify({ ip: '2606:4700:4700:0000:0000:0000:0000:BEEF' }));
+      return;
+    }
     res.end(`ip=${recoveredProbe.ip}\nloc=${recoveredProbe.countryCode}\n`);
   });
   proxyServer.on('connect', (_req, clientSocket) => {
@@ -247,6 +255,42 @@ export async function runClaudeVerificationRecoveryTests(
       assert.equal(v6Check.expectedIp, initialTraceIp);
       assert.equal(v6Check.actualIp, '2606:4700:4700::1111');
 
+      // IPv6 大小写与零压缩等价表示不得误判为漂移
+      runtime.claudeSessionInitialIp = '2606:4700:4700::abcd';
+      runtime.claudeNodeProbe = {
+        ...recoveredProbe,
+        claudeTraceIp: '2606:4700:4700:0000:0000:0000:0000:ABCD',
+        regionMismatchDetail: null,
+      };
+      const v6SameCheck = runtime.evaluateClaudeSafety(true);
+      assert.equal(v6SameCheck.safe, true, '等价 IPv6 写法不应触发误杀');
+      runtime.claudeSessionInitialIp = initialTraceIp;
+
+      // 控制接口异常期 (bindingVerificationError 非空) 若实测已确认出口 IP 漂移，必须立即返回 ip-change 而非退化为 30s 静默宽限
+      const savedClashInfo = runtime.clashMonitor.info;
+      try {
+        runtime.clashMonitor.info = {
+          ...savedClashInfo,
+          bindingVerificationError: 'Clash 控制接口响应超时',
+        };
+        runtime.claudeNodeProbe = {
+          ...recoveredProbe,
+          claudeTraceIp: driftedTraceIp,
+          regionMismatchDetail: null,
+        };
+        const apiDownDriftCheck = runtime.evaluateClaudeSafety(true);
+        assert.equal(apiDownDriftCheck.safe, false);
+        assert.equal(
+          apiDownDriftCheck.alertType,
+          'ip-change',
+          '控制接口故障期实测确认 IP 漂移仍须立即 0 秒熔断而非进入 30 秒宽限'
+        );
+        assert.equal(apiDownDriftCheck.expectedIp, initialTraceIp);
+        assert.equal(apiDownDriftCheck.actualIp, driftedTraceIp);
+      } finally {
+        runtime.clashMonitor.info = savedClashInfo;
+      }
+
       // 同国 IPv4 出口漂移 -> 0 秒立即强杀（不进入 30s 宽限期）
       runtime.claudeNodeProbe = {
         ...recoveredProbe,
@@ -399,6 +443,175 @@ export async function runClaudeVerificationRecoveryTests(
     } finally {
       await case4.cleanup();
     }
+
+    // Case 5: 强杀首次受阻 (claudeRunning 仍为 true) 时保留原始 claudeSessionInitialIp，绝不将漂移 IP 误锁为新基线，后续重试完成强杀
+    const case5 = await spawnClaudeTreeForCase('kill-retry');
+    const origKillSafely = runtime.executeProcessKillSafely.bind(runtime);
+    try {
+      alerts.length = 0;
+      store.update({ claudeLockExitIp: true, claudeExclusiveGuard: false });
+      markClaudeLaunchedByGuard(null);
+      runtime.claudeRunning = true;
+      runtime.claudeAuthorizedSession = false;
+      runtime.claudeSessionInitialIp = initialTraceIp;
+      runtime.claudeExternalBaselinePending = false;
+      runtime.claudeExternalBaselineMinSeq = 0;
+      runtime.claudeNodeProbe = {
+        ...recoveredProbe,
+        claudeTraceIp: driftedTraceIp,
+        regionMismatchDetail: null,
+      };
+      runtime.claudeNodeProbeError = null;
+
+      let failOnce = true;
+      runtime.executeProcessKillSafely = async (patterns: string[]) => {
+        if (failOnce) {
+          failOnce = false;
+          runtime.claudeRunning = true;
+          return {
+            attemptedPids: [case5.proc.pid!],
+            killedCount: 0,
+            killedSummary: [],
+            failedPids: [case5.proc.pid!],
+            errorDetail: '模拟首次进程终止受阻',
+          };
+        }
+        return origKillSafely(patterns);
+      };
+
+      assert.equal(await runtime.enforceClaudeRunningSafety('Claude 运行期心跳巡检'), true);
+      assert.equal(case5.proc.exitCode, null, '首次模拟受阻时子进程仍存活');
+      assert.equal(alerts.length, 1);
+      assert.equal(alerts[0].alertType, 'ip-change');
+      assert.equal(alerts[0].killError, '模拟首次进程终止受阻');
+      assert.equal(
+        runtime.claudeSessionInitialIp,
+        initialTraceIp,
+        '终止受阻进程未退出时不得清空原始锁定 IP 基线'
+      );
+
+      const retryEval = runtime.evaluateClaudeSafety(false);
+      assert.equal(retryEval.safe, false, '后续巡检不得把漂移 IP 采纳为新基线');
+      assert.equal(retryEval.alertType, 'ip-change');
+      assert.equal(retryEval.expectedIp, initialTraceIp);
+      assert.equal(retryEval.actualIp, driftedTraceIp);
+
+      assert.equal(await runtime.enforceClaudeRunningSafety('Claude 运行期实时监控'), true);
+      await case5.procExited;
+      assert.equal(runtime.claudeSessionInitialIp, null, '进程确认退出后清空锁定 IP 基线');
+      assert.equal(alerts.length, 2);
+      assert.equal(alerts[1].alertType, 'ip-change');
+      assert.ok(alerts[1].killedProcesses?.some((item) => item.includes(case5.exeName)));
+      console.log('通过：强杀受阻时保留原始锁定 IP 基线不发生漂移覆盖，后续重试成功终止进程树');
+    } finally {
+      runtime.executeProcessKillSafely = origKillSafely;
+      await case5.cleanup();
+    }
+
+    // Case 6: 外部启动 Claude 时若恰有启动前发起的在途探测，必须等待新序号探测完成才锁定会话基线
+    const origVerifyTarget = runtime.verifyTargetServiceRegion.bind(runtime);
+    try {
+      alerts.length = 0;
+      store.update({ claudeLockExitIp: true, claudeExclusiveGuard: false });
+      markClaudeLaunchedByGuard(null);
+      runtime.claudeRunning = false;
+      runtime.claudeAuthorizedSession = false;
+      runtime.claudeSessionInitialIp = null;
+      runtime.claudeExternalBaselinePending = false;
+      runtime.claudeExternalBaselineMinSeq = 0;
+
+      let callCount = 0;
+      let notifyFirstEntered!: () => void;
+      const firstEntered = new Promise<void>((resolve) => {
+        notifyFirstEntered = resolve;
+      });
+      let releaseFirst!: () => void;
+      const firstGate = new Promise<void>((resolve) => {
+        releaseFirst = resolve;
+      });
+      let snapshotWhenSecondStarts: { initialIp: string | null; pending: boolean } | null = null;
+
+      runtime.verifyTargetServiceRegion = async (
+        _proxyUrl: string | null,
+        probeObj: ProbeResult,
+        targetApp: 'claude' | 'antigravity'
+      ) => {
+        if (targetApp !== 'claude') return;
+        callCount++;
+        if (callCount === 1) {
+          notifyFirstEntered();
+          await firstGate;
+          probeObj.claudeTraceLoc = recoveredProbe.countryCode;
+          probeObj.claudeTraceIp = '198.51.100.10';
+          probeObj.claudeTraceCheckedAt = Date.now();
+          probeObj.regionMismatchDetail = null;
+        } else {
+          snapshotWhenSecondStarts = {
+            initialIp: runtime.claudeSessionInitialIp,
+            pending: runtime.claudeExternalBaselinePending,
+          };
+          probeObj.claudeTraceLoc = recoveredProbe.countryCode;
+          probeObj.claudeTraceIp = initialTraceIp;
+          probeObj.claudeTraceCheckedAt = Date.now();
+          probeObj.regionMismatchDetail = null;
+        }
+      };
+
+      const inFlightPreLaunch = engine.probeClaudeNodeNow('启动前在途检测', true);
+      await firstEntered;
+
+      // 此时旧探测在途，模拟外部 Claude 先于 watcher 被其他路径感知 (claudeExternalBaselinePending 尚未手动置位)
+      runtime.claudeRunning = true;
+      runtime.claudeNodeProbe = {
+        ...recoveredProbe,
+        claudeTraceIp: '198.51.100.10',
+        regionMismatchDetail: null,
+      };
+      assert.equal(
+        runtime.evaluateClaudeSafety(false).alertType,
+        'verification-unavailable',
+        '外部会话尚未建立基线时即使 pending 未置位也不得直接信任启动前旧缓存'
+      );
+      assert.equal(await runtime.enforceClaudeRunningSafety('外部进程先行被感知'), false);
+      assert.equal(runtime.claudeExternalBaselinePending, true);
+
+      releaseFirst();
+      await inFlightPreLaunch;
+
+      assert.equal(callCount, 2);
+      assert.deepEqual(
+        snapshotWhenSecondStarts,
+        { initialIp: null, pending: true },
+        '启动前在途探测完成时不得抢先写入旧 IP 或解除 pending'
+      );
+      assert.equal(runtime.claudeSessionInitialIp, initialTraceIp);
+      assert.equal(runtime.claudeExternalBaselinePending, false);
+      assert.equal(runtime.claudeExternalBaselineMinSeq, 0);
+
+      // plain-ip 探测源返回未压缩大写 IPv6（纯文本或 JSON）时同样必须规范化，避免与 claudeTraceIp 比较时误报 AI 分流
+      store.update({ customProbeUrl: `http://127.0.0.1:${testPort}/plain-v6` });
+      const plainV6Probe = await runtime.probeOnceViaChannel(
+        `http://127.0.0.1:${testPort}`,
+        'plain-ip IPv6 规范化检测',
+        4500
+      );
+      assert.equal(plainV6Probe.result?.ip, '2606:4700:4700::abcd');
+      store.update({ customProbeUrl: `http://127.0.0.1:${testPort}/plain-json-v6` });
+      const jsonV6Probe = await runtime.probeOnceViaChannel(
+        `http://127.0.0.1:${testPort}`,
+        'plain-ip JSON IPv6 规范化检测',
+        4500
+      );
+      assert.equal(jsonV6Probe.result?.ip, '2606:4700:4700::beef');
+      store.update({ customProbeUrl: `http://127.0.0.1:${testPort}/trace` });
+      console.log('通过：外部会话基线严格等待启动后新发起的探测轮次，忽略启动前在途旧探测结果且 plain-ip IPv6 统一规范化');
+    } finally {
+      runtime.verifyTargetServiceRegion = origVerifyTarget;
+      runtime.claudeRunning = false;
+      runtime.claudeSessionInitialIp = null;
+      runtime.claudeExternalBaselinePending = false;
+      runtime.claudeExternalBaselineMinSeq = 0;
+    }
   } finally {
     runtime.claudeVerificationRecovery.clear();
     runtime.claudeVerificationRecovery.retryMs = CLAUDE_VERIFICATION_RETRY_MS;
@@ -410,6 +623,7 @@ export async function runClaudeVerificationRecoveryTests(
     runtime.claudeAuthorizedSession = false;
     runtime.claudeSessionInitialIp = null;
     runtime.claudeExternalBaselinePending = false;
+    runtime.claudeExternalBaselineMinSeq = 0;
     runtime.claudeNodeProbe = null;
     runtime.claudeNodeProbeError = null;
     runtime.winLocale = previousLocale;

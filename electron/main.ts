@@ -491,6 +491,8 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     ? ` (${state.claudeState.nodeProbe.countryCode} · ${
         state.claudeState.lockedSessionIp ? `🔒${effectiveClaudeIp}` : effectiveClaudeIp
       })`
+    : state.claudeState.lockedSessionIp
+    ? ` (🔒${state.claudeState.lockedSessionIp})`
     : '';
   const nodeText = state.config.selectedClashNode
     ? `Claude节点: ${profilePrefix ? `${profilePrefix} / ` : ''}${state.config.selectedClashNode}${claudeProbeSuffix}`

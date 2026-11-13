@@ -38,7 +38,11 @@ import {
   SystemProxyState,
 } from './systemProxy';
 import { assertProcessesStopped, ProcessKillReport, terminateProtectedProcesses } from './processGuard';
-import { getTargetServiceVerificationError, isValidIpAddress } from '../src/shared/probeValidation';
+import {
+  getTargetServiceVerificationError,
+  isValidIpAddress,
+  normalizeIpAddress,
+} from '../src/shared/probeValidation';
 import { ClaudeVerificationRecovery } from './claudeVerificationRecovery';
 import {
   ANTIGRAVITY_PROCESS_PATTERNS,
@@ -151,6 +155,7 @@ export class ProbeEngine extends EventEmitter {
   private claudeAuthorizedSession = false;
   private claudeSessionInitialIp: string | null = null;
   private claudeExternalBaselinePending = false;
+  private claudeExternalBaselineMinSeq = 0;
   private claudeSeenRunningSinceAuth = false;
   private claudeLaunchGraceUntil = 0;
   private claudeIsProbing = false;
@@ -400,6 +405,7 @@ export class ProbeEngine extends EventEmitter {
     if (cfg.selectedClashNode) {
       if (this.claudeRunning && !cfg.claudeExclusiveGuard) {
         this.claudeExternalBaselinePending = true;
+        this.claudeExternalBaselineMinSeq = this.claudeProbeSeq + 1;
       }
       void this.probeClaudeNodeNow('应用启动检测 Claude 专属节点');
     }
@@ -419,6 +425,7 @@ export class ProbeEngine extends EventEmitter {
     this.claudeAuthorizedSession = false;
     this.claudeSessionInitialIp = null;
     this.claudeExternalBaselinePending = false;
+    this.claudeExternalBaselineMinSeq = 0;
     this.claudeSeenRunningSinceAuth = false;
     this.claudeLaunchGraceUntil = 0;
     markClaudeLaunchedByGuard(null);
@@ -1342,10 +1349,15 @@ export class ProbeEngine extends EventEmitter {
           }
 
           if (probeSuccess) {
-            const prevIp = this.claudeNodeProbe?.claudeTraceIp || this.claudeNodeProbe?.ip;
+            const prevIp =
+              normalizeIpAddress(this.claudeNodeProbe?.claudeTraceIp) || this.claudeNodeProbe?.ip;
             const prevCountry = this.claudeNodeProbe?.countryCode;
             const previousVerificationError = getTargetServiceVerificationError(this.claudeNodeProbe);
             const verificationError = getTargetServiceVerificationError(probeSuccess);
+            const normalizedTraceIp = normalizeIpAddress(probeSuccess.claudeTraceIp);
+            if (normalizedTraceIp) {
+              probeSuccess.claudeTraceIp = normalizedTraceIp;
+            }
             this.claudeNodeProbe = probeSuccess;
             this.claudeNodeProbeError = null;
             if (!verificationError && !clash.bindingVerificationError) {
@@ -1357,18 +1369,25 @@ export class ProbeEngine extends EventEmitter {
                 countryCode: probeSuccess.countryCode,
                 countryName: probeSuccess.countryName,
               };
+              const canRecordSessionBaseline = this.claudeAuthorizedSession
+                ? true
+                : !curCfg.claudeExclusiveGuard &&
+                  this.claudeExternalBaselinePending &&
+                  seqAtStart >= this.claudeExternalBaselineMinSeq;
               if (
                 this.claudeRunning &&
                 this.claudeSessionInitialIp === null &&
-                isValidIpAddress(probeSuccess.claudeTraceIp) &&
+                canRecordSessionBaseline &&
+                normalizedTraceIp &&
                 isWindowsLocaleMatchingCountry(
                   this.winLocale.timeZoneId,
                   this.winLocale.regionCode,
                   probeSuccess.countryCode
                 )
               ) {
-                this.claudeSessionInitialIp = probeSuccess.claudeTraceIp!.trim();
+                this.claudeSessionInitialIp = normalizedTraceIp;
                 this.claudeExternalBaselinePending = false;
+                this.claudeExternalBaselineMinSeq = 0;
                 this.addLog(
                   'info',
                   `已记录运行中 Claude 会话初始出口 IP 基线：${this.claudeSessionInitialIp} (${probeSuccess.countryName} ${probeSuccess.countryCode})`
@@ -1376,14 +1395,16 @@ export class ProbeEngine extends EventEmitter {
               }
             }
 
-            const effectiveTraceIp = probeSuccess.claudeTraceIp || probeSuccess.ip;
+            const normalizedLockedIp = normalizeIpAddress(this.claudeSessionInitialIp);
+            const effectiveTraceIp = normalizedTraceIp || probeSuccess.ip;
             const willTriggerIpDriftKill = Boolean(
               !activeSkipSafety &&
                 this.claudeRunning &&
+                !this.claudeExternalBaselinePending &&
                 curCfg.claudeLockExitIp &&
-                this.claudeSessionInitialIp &&
-                isValidIpAddress(probeSuccess.claudeTraceIp) &&
-                probeSuccess.claudeTraceIp!.trim() !== this.claudeSessionInitialIp
+                normalizedLockedIp &&
+                normalizedTraceIp &&
+                normalizedTraceIp !== normalizedLockedIp
             );
 
             if (verificationError) {
@@ -1505,9 +1526,7 @@ export class ProbeEngine extends EventEmitter {
 
     // 4. 统一复用 buildClaudeRuntimeState 校验结果，消除重复校验代码
     const prelaunchState = this.buildClaudeRuntimeState();
-    const initialClaudeIp = isValidIpAddress(this.claudeNodeProbe?.claudeTraceIp)
-      ? this.claudeNodeProbe!.claudeTraceIp!.trim()
-      : null;
+    const initialClaudeIp = normalizeIpAddress(this.claudeNodeProbe?.claudeTraceIp);
     if (
       !prelaunchState.canLaunch ||
       !install.exePath ||
@@ -1530,6 +1549,7 @@ export class ProbeEngine extends EventEmitter {
     this.claudeAuthorizedSession = true;
     this.claudeSessionInitialIp = initialClaudeIp;
     this.claudeExternalBaselinePending = false;
+    this.claudeExternalBaselineMinSeq = 0;
     this.claudeSeenRunningSinceAuth = false;
     this.claudeLaunchGraceUntil = Date.now() + 12000;
     markClaudeLaunchedByGuard(cfg.dedicatedProxyPort);
@@ -1589,9 +1609,12 @@ export class ProbeEngine extends EventEmitter {
    * 手动一键终止 Claude 所有关联进程并回收授权锁
    */
   public async terminateClaudeManually(): Promise<ClaudeLaunchResult> {
-    this.unsetClaudeAuthLock();
+    this.claudeVerificationRecovery.clear();
 
     const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
+    if (!this.claudeRunning) {
+      this.unsetClaudeAuthLock();
+    }
 
     const msg =
       report.killedCount > 0
@@ -1612,6 +1635,7 @@ export class ProbeEngine extends EventEmitter {
     this.claudeAuthorizedSession = false;
     this.claudeSessionInitialIp = null;
     this.claudeExternalBaselinePending = false;
+    this.claudeExternalBaselineMinSeq = 0;
     this.claudeSeenRunningSinceAuth = false;
     this.claudeLaunchGraceUntil = 0;
     markClaudeLaunchedByGuard(null);
@@ -1631,11 +1655,12 @@ export class ProbeEngine extends EventEmitter {
   }
 
   private async stopClaudeBeforeRoutingChange(): Promise<ProcessKillReport> {
+    this.claudeVerificationRecovery.clear();
+    const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
+    await assertProcessesStopped(CLAUDE_DESKTOP_PROCESS_PATTERNS, report);
     this.unsetClaudeAuthLock();
     this.claudeLastVerificationSuccessAt = null;
     this.claudeLastVerifiedRegion = null;
-    const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
-    await assertProcessesStopped(CLAUDE_DESKTOP_PROCESS_PATTERNS, report);
     if (report.killedCount > 0) {
       this.addLog('info', `调整 Claude 专属代理前已终止关联进程：${report.killedSummary.join(', ')}`);
     }
@@ -1776,6 +1801,7 @@ export class ProbeEngine extends EventEmitter {
           ) {
             this.claudeSessionInitialIp = null;
             this.claudeExternalBaselinePending = false;
+            this.claudeExternalBaselineMinSeq = 0;
             this.emitState();
           }
 
@@ -1784,6 +1810,9 @@ export class ProbeEngine extends EventEmitter {
           // 拦截 1：开启唯一启动入口拦截时，未通过卫士专栏授权启动的外部 Claude -> 立即无条件强杀！
           if (proc.running && !this.claudeAuthorizedSession && cfg.claudeExclusiveGuard) {
             const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
+            if (!this.claudeRunning) {
+              this.unsetClaudeAuthLock();
+            }
             const reason = '拦截到从外部直接启动 Claude！本卫士【Claude 专栏】是唯一允许的启动入口';
             if (report.killedCount > 0) {
               this.addLog(
@@ -1811,18 +1840,7 @@ export class ProbeEngine extends EventEmitter {
           }
 
           // 若关闭了唯一入口拦截且检测到外部拉起的 Claude 尚未建立会话出口 IP 基线，立即发起实时重测（不复用启动前旧缓存）
-          if (
-            proc.running &&
-            !this.claudeAuthorizedSession &&
-            !cfg.claudeExclusiveGuard &&
-            this.claudeSessionInitialIp === null &&
-            cfg.selectedClashNode &&
-            !this.claudeExternalBaselinePending
-          ) {
-            this.claudeExternalBaselinePending = true;
-            this.emitState();
-            void this.probeClaudeNodeNow('检测到外部运行 Claude，建立会话出口 IP 基线');
-          }
+          this.ensureExternalClaudeBaselineProbe(cfg);
 
           // 运行期安全检查独立于唯一启动入口设置。
           if (proc.running) {
@@ -1855,6 +1873,22 @@ export class ProbeEngine extends EventEmitter {
     scheduleNext(1200);
   }
 
+  private ensureExternalClaudeBaselineProbe(cfg: AppConfig = this.configStore.get()): void {
+    if (
+      this.claudeRunning &&
+      !this.claudeAuthorizedSession &&
+      !cfg.claudeExclusiveGuard &&
+      this.claudeSessionInitialIp === null &&
+      cfg.selectedClashNode &&
+      !this.claudeExternalBaselinePending
+    ) {
+      this.claudeExternalBaselinePending = true;
+      this.claudeExternalBaselineMinSeq = this.claudeProbeSeq + 1;
+      this.emitState();
+      void this.probeClaudeNodeNow('检测到外部运行 Claude，建立会话出口 IP 基线');
+    }
+  }
+
   /**
    * 明确冲突立即终止；校验请求失败静默复核，持续 30 秒未恢复时终止并提醒。
    */
@@ -1865,6 +1899,7 @@ export class ProbeEngine extends EventEmitter {
     }
     if (this.claudeSafetyKillPromise) return this.claudeSafetyKillPromise;
     const cfg = this.configStore.get();
+    this.ensureExternalClaudeBaselineProbe(cfg);
     const requireDedicatedNode =
       this.claudeAuthorizedSession || cfg.claudeExclusiveGuard;
     if (this.claudeIsProbing || this.claudeSwitchingCount > 0) {
@@ -1880,8 +1915,23 @@ export class ProbeEngine extends EventEmitter {
     }
     const check = this.evaluateClaudeSafety(requireDedicatedNode);
     if (check.safe) {
+      let stateChanged = false;
+      if (
+        this.claudeRunning &&
+        this.claudeAuthorizedSession &&
+        this.claudeSessionInitialIp === null
+      ) {
+        const traceIp = normalizeIpAddress(this.claudeNodeProbe?.claudeTraceIp);
+        if (traceIp) {
+          this.claudeSessionInitialIp = traceIp;
+          stateChanged = true;
+        }
+      }
       if (this.claudeVerificationRecovery.clear()) {
         this.addLog('success', 'Claude 地区校验已恢复，后台复核结束');
+        stateChanged = true;
+      }
+      if (stateChanged) {
         this.emitState();
       }
       return false;
@@ -1903,9 +1953,12 @@ export class ProbeEngine extends EventEmitter {
   private terminateUnsafeClaude(check: ClaudeSafetyCheck, triggerContext: string): Promise<boolean> {
     if (this.claudeSafetyKillPromise) return this.claudeSafetyKillPromise;
     const operation = async () => {
-      this.unsetClaudeAuthLock();
+      this.claudeVerificationRecovery.clear();
 
       const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
+      if (!this.claudeRunning) {
+        this.unsetClaudeAuthLock();
+      }
       if (report.killedCount > 0) {
         this.addLog(
           'danger',
@@ -2030,6 +2083,25 @@ export class ProbeEngine extends EventEmitter {
           alertType: isRegionMismatch ? 'mismatch' : 'verification-unavailable',
         };
       }
+
+      const probeTraceIp = normalizeIpAddress(this.claudeNodeProbe.claudeTraceIp);
+      const lockedSessionIp = normalizeIpAddress(this.claudeSessionInitialIp);
+      if (
+        this.claudeRunning &&
+        !this.claudeExternalBaselinePending &&
+        cfg.claudeLockExitIp &&
+        lockedSessionIp &&
+        probeTraceIp &&
+        probeTraceIp !== lockedSessionIp
+      ) {
+        return {
+          safe: false,
+          reason: `Claude 会话出口 IP 发生变更（锁定基线 ${lockedSessionIp} → 当前 ${probeTraceIp}）`,
+          alertType: 'ip-change',
+          expectedIp: lockedSessionIp,
+          actualIp: probeTraceIp,
+        };
+      }
     }
 
     if (cfg.selectedClashNode && (!clash.connected || clash.bindingVerificationError)) {
@@ -2048,9 +2120,7 @@ export class ProbeEngine extends EventEmitter {
       };
     }
 
-    const actualTraceIp = isValidIpAddress(this.claudeNodeProbe.claudeTraceIp)
-      ? this.claudeNodeProbe.claudeTraceIp!.trim()
-      : null;
+    const actualTraceIp = normalizeIpAddress(this.claudeNodeProbe.claudeTraceIp);
     if (!actualTraceIp) {
       return {
         safe: false,
@@ -2059,28 +2129,18 @@ export class ProbeEngine extends EventEmitter {
       };
     }
 
-    if (this.claudeRunning) {
-      if (this.claudeExternalBaselinePending) {
-        return {
-          safe: false,
-          reason: '正在实时核验并锁定 Claude 会话初始出口 IP...',
-          alertType: 'verification-unavailable',
-        };
-      }
-
-      if (this.claudeSessionInitialIp === null) {
-        this.claudeSessionInitialIp = actualTraceIp;
-      }
-
-      if (cfg.claudeLockExitIp && actualTraceIp !== this.claudeSessionInitialIp) {
-        return {
-          safe: false,
-          reason: `Claude 会话出口 IP 发生变更（锁定基线 ${this.claudeSessionInitialIp} → 当前 ${actualTraceIp}）`,
-          alertType: 'ip-change',
-          expectedIp: this.claudeSessionInitialIp,
-          actualIp: actualTraceIp,
-        };
-      }
+    if (
+      this.claudeRunning &&
+      (this.claudeExternalBaselinePending ||
+        (!this.claudeAuthorizedSession &&
+          !cfg.claudeExclusiveGuard &&
+          this.claudeSessionInitialIp === null))
+    ) {
+      return {
+        safe: false,
+        reason: '正在实时核验并锁定 Claude 会话初始出口 IP...',
+        alertType: 'verification-unavailable',
+      };
     }
 
     return {
@@ -2162,7 +2222,9 @@ export class ProbeEngine extends EventEmitter {
       verificationFailure: this.claudeVerificationRecovery.snapshot,
       lastVerificationSuccessAt: this.claudeLastVerificationSuccessAt,
       lockedSessionIp:
-        this.claudeRunning && cfg.claudeLockExitIp ? this.claudeSessionInitialIp : null,
+        this.claudeRunning && cfg.claudeLockExitIp
+          ? normalizeIpAddress(this.claudeSessionInitialIp)
+          : null,
     };
   }
 
@@ -2529,9 +2591,10 @@ export class ProbeEngine extends EventEmitter {
       ...(stopClaude ? CLAUDE_DESKTOP_PROCESS_PATTERNS : []),
       ...(stopProtected ? cfg.protectedProcessPatterns : []),
     ])];
-    if (stopClaude) this.unsetClaudeAuthLock();
+    if (stopClaude) this.claudeVerificationRecovery.clear();
     const report = await this.executeProcessKillSafely(patterns);
     await assertProcessesStopped(patterns, report);
+    if (stopClaude) this.unsetClaudeAuthLock();
     if (report.killedCount > 0) {
       this.addLog('info', `修改系统时区与区域前已终止关联进程：${report.killedSummary.join(', ')}`);
     }
@@ -2743,9 +2806,12 @@ export class ProbeEngine extends EventEmitter {
       );
 
       if (combinedPatterns.length > 0) {
-        this.unsetClaudeAuthLock();
+        this.claudeVerificationRecovery.clear();
 
         const killReport = await this.executeProcessKillSafely(combinedPatterns);
+        if (!this.claudeRunning) {
+          this.unsetClaudeAuthLock();
+        }
 
         if (killReport.killedCount > 0) {
           killedProcesses.push(...killReport.killedSummary);
@@ -2774,6 +2840,9 @@ export class ProbeEngine extends EventEmitter {
         }
 
         await assertProcessesStopped(combinedPatterns, killReport);
+        if (claudeNeedsKill) {
+          this.unsetClaudeAuthLock();
+        }
       }
 
       const applyRes = await applyWindowsTimeZoneAndRegion(
@@ -3261,9 +3330,10 @@ export class ProbeEngine extends EventEmitter {
       probe.googleCountryName = getCountryNameZh(googleCode);
     }
 
-    if (claudeRes && isValidIsoCountryCode(claudeRes.loc) && isValidIpAddress(claudeRes.ip)) {
+    const normalizedClaudeIp = claudeRes ? normalizeIpAddress(claudeRes.ip) : null;
+    if (claudeRes && isValidIsoCountryCode(claudeRes.loc) && normalizedClaudeIp) {
       probe.claudeTraceLoc = claudeRes.loc;
-      probe.claudeTraceIp = claudeRes.ip.trim();
+      probe.claudeTraceIp = normalizedClaudeIp;
       probe.claudeTraceCheckedAt = Date.now();
     }
 
@@ -3423,7 +3493,7 @@ function parseTraceResponse(
       const k = line.slice(0, idx).trim();
       const v = line.slice(idx + 1).trim();
       if (k === 'ip' && net.isIP(v)) {
-        ip = v;
+        ip = normalizeIpAddress(v) || v;
       } else if (k === 'loc' && v) {
         loc = v.toUpperCase();
       }
@@ -3432,18 +3502,18 @@ function parseTraceResponse(
   }
 
   if (net.isIP(text)) {
-    return { ip: text };
+    return { ip: normalizeIpAddress(text) || text };
   }
   try {
     const obj = JSON.parse(text) as Record<string, unknown>;
     const candidate = String(obj['ip'] || obj['query'] || '').trim();
     if (net.isIP(candidate)) {
-      return { ip: candidate };
+      return { ip: normalizeIpAddress(candidate) || candidate };
     }
   } catch {
     const firstLine = text.split(/\r?\n/)[0]?.trim() || '';
     if (net.isIP(firstLine)) {
-      return { ip: firstLine };
+      return { ip: normalizeIpAddress(firstLine) || firstLine };
     }
   }
   return { ip: null };

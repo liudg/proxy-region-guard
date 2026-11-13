@@ -4,18 +4,32 @@ import { ProbeResult } from './types';
 const IPV4_REGEX =
   /^(?:(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)$/;
 
-export function isValidIpAddress(ip: string | null | undefined): boolean {
-  if (!ip) return false;
+export function normalizeIpAddress(ip: string | null | undefined): string | null {
+  if (!ip) return null;
   const trimmed = ip.trim();
-  if (!trimmed) return false;
-  if (IPV4_REGEX.test(trimmed)) return true;
-  if (!trimmed.includes(':')) return false;
+  if (!trimmed) return null;
+  if (IPV4_REGEX.test(trimmed)) return trimmed;
+  if (!trimmed.includes(':') || !/^[0-9a-fA-F:.]+$/.test(trimmed)) return null;
   try {
     const parsed = new URL(`http://[${trimmed}]/`);
-    return parsed.hostname === `[${trimmed.toLowerCase()}]` || parsed.hostname.startsWith('[');
+    if (
+      parsed.hostname.startsWith('[') &&
+      parsed.hostname.endsWith(']') &&
+      parsed.port === '' &&
+      parsed.pathname === '/' &&
+      parsed.search === '' &&
+      parsed.hash === ''
+    ) {
+      return parsed.hostname.slice(1, -1);
+    }
+    return null;
   } catch {
-    return false;
+    return null;
   }
+}
+
+export function isValidIpAddress(ip: string | null | undefined): boolean {
+  return normalizeIpAddress(ip) !== null;
 }
 
 export function getTargetServiceVerificationError(
