@@ -2624,7 +2624,7 @@ export const MainDashboard: React.FC = () => {
                   />
                   <div>
                     <strong>自动识别 Clash 选中通道（推荐）</strong>
-                    <p>优先检测 Clash Verge 当前选中的代理通道（混合端口/当前模式），未连接时自动检测系统代理或网卡路由</p>
+                    <p>优先跟随 Clash Verge，未连接时回退系统代理或直连</p>
                   </div>
                 </label>
 
@@ -2643,7 +2643,7 @@ export const MainDashboard: React.FC = () => {
                   />
                   <div>
                     <strong>手动指定本地代理端口</strong>
-                    <p>固定通过指定的 HTTP / SOCKS5 本地端口检测</p>
+                    <p>固定使用自定义 HTTP / SOCKS5 代理检测</p>
                   </div>
                 </label>
 
@@ -2695,7 +2695,7 @@ export const MainDashboard: React.FC = () => {
                   />
                   <div>
                     <strong>强制纯网卡直连（仅限全局 TUN 模式）</strong>
-                    <p>忽略系统代理设置，直接检测系统默认网卡路由出口</p>
+                    <p>忽略系统代理，直接检测默认网卡出口</p>
                   </div>
                 </label>
               </div>
@@ -2703,7 +2703,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>实时监控异常弹窗告警</strong>
-                  <p>开启后，Clash 选中通道与保护地区/系统时区不一致，或触发联动进程强杀时弹出置顶提醒</p>
+                  <p>出口地区/时区不符或触发联动强杀时置顶提醒</p>
                 </div>
                 <input
                   type="checkbox"
@@ -2721,7 +2721,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row no-border-bottom">
                 <div>
                   <strong>实时监控断连或超时报警</strong>
-                  <p>实时监控代理连接失败或节点超时时也弹窗提醒（需先开启实时监控异常弹窗）</p>
+                  <p>代理连接失败或节点超时时弹窗（需开启上方告警）</p>
                 </div>
                 <input
                   type="checkbox"
@@ -2750,7 +2750,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>运行期后台巡检间隔</strong>
-                  <p>后台定时静默复核出口 IP 是否漂移（同时作用于运行中的 Claude 与实时监控）</p>
+                  <p>定时复核出口 IP 漂移（作用于 Claude 与实时监控）</p>
                 </div>
                 <select
                   className="compact-select"
@@ -2774,7 +2774,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>异常警告提示音</strong>
-                  <p>任何模块触发右下角置顶警告弹窗时播放短促提示音</p>
+                  <p>触发置顶告警弹窗时播放声音提醒</p>
                 </div>
                 <input
                   type="checkbox"
@@ -2792,7 +2792,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>关闭窗口时最小化到托盘</strong>
-                  <p>点击右上角关闭按钮后隐藏至系统托盘继续守护</p>
+                  <p>隐藏至系统托盘继续后台守护，不退出程序</p>
                 </div>
                 <input
                   type="checkbox"
@@ -2810,7 +2810,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>开机自动启动</strong>
-                  <p>登录 Windows 时自动在系统托盘静默运行守护</p>
+                  <p>登录 Windows 时静默启动并驻留托盘</p>
                 </div>
                 <input
                   type="checkbox"
@@ -2827,7 +2827,7 @@ export const MainDashboard: React.FC = () => {
 
               <div className="custom-probe-box">
                 <label>
-                  自定义探测 URL（留空默认使用 Cloudflare / AWS 全球探测源）：
+                  自定义探测 URL（留空默认 Cloudflare / AWS 探测源）：
                 </label>
                 <div className="custom-probe-row">
                   <input
@@ -3060,9 +3060,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>自动检查并预下载轻量增量更新</strong>
-                  <p>
-                    启动与后台静默检查更新，发现增量热更包 (~200KB) 时自动下载并完成验签就绪，绝不自动重启
-                  </p>
+                  <p>后台静默完成下载与验签，不会自动重启</p>
                 </div>
                 <input
                   type="checkbox"
@@ -3080,9 +3078,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row no-border-bottom">
                 <div>
                   <strong>GitHub 下载加速镜像兜底</strong>
-                  <p>
-                    当代理与直连访问 GitHub 超时时自动回退公开镜像（全程强制 Ed25519 公钥签名校验防篡改）
-                  </p>
+                  <p>连接超时时自动切换公开镜像，全程签名校验防篡改</p>
                 </div>
                 <input
                   type="checkbox"
