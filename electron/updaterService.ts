@@ -1,6 +1,7 @@
 import { app, shell } from 'electron';
 import { spawn } from 'node:child_process';
 import * as crypto from 'node:crypto';
+import * as os from 'node:os';
 import * as path from 'node:path';
 import * as zlib from 'node:zlib';
 import {
@@ -65,6 +66,150 @@ export interface UpdaterServiceOptions {
   exePathOverride?: string;
   stagingRootDirOverride?: string;
   allowLocalhostForTest?: boolean;
+  targetPidOverride?: number;
+  bootHandshakeTimeoutMsOverride?: number;
+  waitExitAttemptsOverride?: number;
+}
+
+export function resolveWindowsPowerShellExe(): string {
+  const sysRoot = process.env.SystemRoot || process.env.WINDIR;
+  if (sysRoot) {
+    const candidate = path.join(
+      sysRoot,
+      'System32',
+      'WindowsPowerShell',
+      'v1.0',
+      'powershell.exe'
+    );
+    if (rawFs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return 'powershell.exe';
+}
+
+export function quoteWindowsArg(value: string): string {
+  if (value.length === 0) return '""';
+  if (!/[\s"]/.test(value)) return value;
+  const escaped = value.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/g, '$1$1');
+  return `"${escaped}"`;
+}
+
+export function quoteWindowsCommandLine(args: readonly string[]): string {
+  return args.map(quoteWindowsArg).join(' ');
+}
+
+function buildDetachedTrampolineEncodedCommand(): string {
+  // 注意：
+  // 1) Windows 下直接对 powershell.exe 传 detached: true (DETACHED_PROCESS) 会使其因无控制台宿主立即静默退出 0；
+  // 2) 通过短生命周期跳板以 ProcessStartInfo { UseShellExecute = true, WindowStyle = Hidden } 拉起内层 PowerShell：
+  //    - ShellExecuteEx 在底层以 bInheritHandles = FALSE 创建新进程，彻底隔绝主进程打开的 asar/pak/dll/pipe 句柄继承锁死；
+  //    - 规避 Start-Process -WorkingDirectory 对含 [ ] 方括号路径的通配符解析异常；
+  //    - 同时为内层分配独立隐藏控制台并切断与旧主进程的父子链，防止兜底 taskkill /T 误杀更新器自身。
+  const trampoline = [
+    '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
+    '$ProgressPreference = "SilentlyContinue"',
+    '$ErrorActionPreference = "Stop"',
+    '$psExe = Join-Path $PSHome "powershell.exe"',
+    'if (-not (Test-Path -LiteralPath $psExe)) { $psExe = "powershell.exe" }',
+    '$safeWorkDir = if ($env:SystemRoot -and (Test-Path -LiteralPath $env:SystemRoot)) { $env:SystemRoot } else { [System.IO.Path]::GetTempPath() }',
+    '$psi = New-Object System.Diagnostics.ProcessStartInfo',
+    '$psi.FileName = $psExe',
+    '$psi.WorkingDirectory = $safeWorkDir',
+    '$psi.Arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -EncodedCommand " + $env:GUARD_UPD_INNER_ENC',
+    '$psi.UseShellExecute = $true',
+    '$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden',
+    '[System.Diagnostics.Process]::Start($psi) | Out-Null',
+  ].join('\r\n');
+  return Buffer.from(trampoline, 'utf16le').toString('base64');
+}
+
+async function launchDetachedWindowsUpdater(
+  encodedInnerCommand: string,
+  updaterEnv: Record<string, string>
+): Promise<void> {
+  const psExe = resolveWindowsPowerShellExe();
+  const trampolineEncoded = buildDetachedTrampolineEncodedCommand();
+  const safeCwd =
+    process.env.SystemRoot && rawFs.existsSync(process.env.SystemRoot)
+      ? process.env.SystemRoot
+      : os.tmpdir();
+
+  await new Promise<void>((resolve, reject) => {
+    const child = spawn(
+      psExe,
+      ['-NoProfile', '-NonInteractive', '-EncodedCommand', trampolineEncoded],
+      {
+        cwd: safeCwd,
+        detached: false,
+        stdio: ['ignore', 'ignore', 'pipe'],
+        windowsHide: true,
+        env: {
+          ...process.env,
+          ...updaterEnv,
+          GUARD_UPD_INNER_ENC: encodedInnerCommand,
+        },
+      }
+    );
+
+    let stderrText = '';
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try {
+        child.kill();
+      } catch {
+        // ignore
+      }
+      child.stderr?.destroy();
+      reject(new Error('拉起后台更新器超时'));
+    }, 10000);
+    timer.unref?.();
+
+    child.stderr?.on('data', (chunk: Buffer | string) => {
+      if (stderrText.length < 2048) {
+        stderrText += chunk.toString('utf-8');
+      }
+    });
+
+    child.once('error', (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      child.stderr?.destroy();
+      reject(err);
+    });
+
+    child.once('exit', (code) => {
+      if (settled) return;
+      if (code === 0) {
+        settled = true;
+        clearTimeout(timer);
+        child.stderr?.destroy();
+        resolve();
+        return;
+      }
+      const finalizeNonZero = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        clearTimeout(drainTimer);
+        child.stderr?.destroy();
+        const detail =
+          stderrText.trim() || `更新跳板进程异常退出 (代码 ${String(code)})`;
+        reject(new Error(detail));
+      };
+      const drainTimer = setTimeout(finalizeNonZero, 250);
+      drainTimer.unref?.();
+      if (!child.stderr || child.stderr.readableEnded || child.stderr.destroyed) {
+        finalizeNonZero();
+      } else {
+        child.stderr.once('end', finalizeNonZero);
+        child.stderr.once('close', finalizeNonZero);
+      }
+    });
+  });
 }
 
 export function buildEncodedPowerShellLaunch(
@@ -110,6 +255,54 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '$skipRelaunch = $env:GUARD_UPD_SKIP_RELAUNCH -eq "1"',
     '$defaultBootMs = if ($readyFile) { 12000 } else { 2200 }',
     '$bootCheckMs = if ($env:GUARD_UPD_BOOT_CHECK_MS) { [int]$env:GUARD_UPD_BOOT_CHECK_MS } else { $defaultBootMs }',
+    '$waitExitAttempts = if ($env:GUARD_UPD_WAIT_EXIT_ATTEMPTS) { [int]$env:GUARD_UPD_WAIT_EXIT_ATTEMPTS } else { 48 }',
+    '',
+    'function Quote-WinArg([string]$Value) {',
+    '  if ([string]::IsNullOrEmpty($Value)) { return \'""\' }',
+    '  if ($Value -notmatch \'[\\s"]\') { return $Value }',
+    '  $escaped = [regex]::Replace($Value, \'(\\\\*)"\', \'$1$1\\"\')',
+    '  $escaped = [regex]::Replace($escaped, \'(\\\\+)$\', \'$1$1\')',
+    '  return \'"\' + $escaped + \'"\'',
+    '}',
+    '',
+    'function Invoke-SafeTaskkill([int]$ProcId) {',
+    '  if ($ProcId -le 0) { return }',
+    '  try {',
+    '    & cmd.exe /d /c "taskkill.exe /F /T /PID $ProcId >nul 2>&1"',
+    '  } catch {}',
+    '}',
+    '',
+    'function Start-GuardProcess([string]$FilePath, [string]$WorkDir, [string[]]$RawArgs, [switch]$PassThru) {',
+    '  $psi = New-Object System.Diagnostics.ProcessStartInfo',
+    '  $psi.FileName = $FilePath',
+    '  if ($WorkDir) { $psi.WorkingDirectory = $WorkDir }',
+    '  $psi.UseShellExecute = $true',
+    '  if ($RawArgs -and $RawArgs.Count -gt 0) {',
+    '    $psi.Arguments = @($RawArgs | ForEach-Object { Quote-WinArg $_ }) -join " "',
+    '  }',
+    '  try {',
+    '    $started = [System.Diagnostics.Process]::Start($psi)',
+    '    if ($PassThru) { return $started }',
+    '    return $null',
+    '  } catch {',
+    '    $needsRunAs = $false',
+    '    $curEx = $_.Exception',
+    '    while ($curEx) {',
+    '      if ($curEx -is [System.ComponentModel.Win32Exception] -and $curEx.NativeErrorCode -eq 740) {',
+    '        $needsRunAs = $true',
+    '        break',
+    '      }',
+    '      $curEx = $curEx.InnerException',
+    '    }',
+    '    if ($needsRunAs) {',
+    '      $psi.Verb = "runas"',
+    '      $started = [System.Diagnostics.Process]::Start($psi)',
+    '      if ($PassThru) { return $started }',
+    '      return $null',
+    '    }',
+    '    throw',
+    '  }',
+    '}',
     '',
     'function Invoke-WithRetry([scriptblock]$Action, [int]$MaxAttempts = 12, [int]$DelayMs = 350) {',
     '  $lastErr = $null',
@@ -150,7 +343,7 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '    Verify-StreamSha256 $inStream $ExpectedSha $Label',
     '    $parent = Split-Path -Parent $DestPath',
     '    if ($parent -and -not (Test-Path -LiteralPath $parent)) {',
-    '      New-Item -ItemType Directory -Path $parent -Force | Out-Null',
+    '      [System.IO.Directory]::CreateDirectory($parent) | Out-Null',
     '    }',
     '    Invoke-WithRetry {',
     '      if (Test-Path -LiteralPath $DestPath) {',
@@ -172,15 +365,24 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '}',
     '',
     'if ($targetPid -gt 0) {',
-    '  for ($i = 0; $i -lt 48; $i++) {',
+    '  for ($i = 0; $i -lt $waitExitAttempts; $i++) {',
     '    $p = Get-Process -Id $targetPid -ErrorAction SilentlyContinue',
     '    if (-not $p) { break }',
     '    Start-Sleep -Milliseconds 250',
     '  }',
     '  $still = Get-Process -Id $targetPid -ErrorAction SilentlyContinue',
     '  if ($still) {',
-    '    & taskkill.exe /F /T /PID $targetPid *> $null',
-    '    Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue',
+    '    $myParentId = 0',
+    '    try {',
+    '      $selfProc = Get-CimInstance Win32_Process -Filter "ProcessId = $PID" -ErrorAction SilentlyContinue',
+    '      if ($selfProc) { $myParentId = [int]$selfProc.ParentProcessId }',
+    '    } catch {}',
+    '    if ($myParentId -eq $targetPid -or $PID -eq $targetPid) {',
+    '      Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue',
+    '    } else {',
+    '      Invoke-SafeTaskkill $targetPid',
+    '      Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue',
+    '    }',
     '    Start-Sleep -Milliseconds 600',
     '  }',
     '}',
@@ -200,6 +402,12 @@ export function buildWindowsUpdatePowerShellScript(): string {
     'function Cleanup-ExtractArtifact {',
     '  if ($extractDir -and (Test-Path -LiteralPath $extractDir)) {',
     '    Remove-Item -LiteralPath $extractDir -Recurse -Force -ErrorAction SilentlyContinue',
+    '  }',
+    '}',
+    '',
+    'function Cleanup-ReadyFile {',
+    '  if ($readyFile -and (Test-Path -LiteralPath $readyFile)) {',
+    '    Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue',
     '  }',
     '}',
     '',
@@ -227,7 +435,7 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '        $origDest = Join-Path $appDir $rel',
     '        $origParent = Split-Path -Parent $origDest',
     '        if ($origParent -and -not (Test-Path -LiteralPath $origParent)) {',
-    '          New-Item -ItemType Directory -Path $origParent -Force | Out-Null',
+    '          [System.IO.Directory]::CreateDirectory($origParent) | Out-Null',
     '        }',
     '        Invoke-WithRetry { Copy-Item -LiteralPath $bf.FullName -Destination $origDest -Force }',
     '      }',
@@ -302,7 +510,7 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '    if (Test-Path -LiteralPath $backupDir) {',
     '      Remove-Item -LiteralPath $backupDir -Recurse -Force',
     '    }',
-    '    New-Item -ItemType Directory -Path $backupDir -Force | Out-Null',
+    '    [System.IO.Directory]::CreateDirectory($backupDir) | Out-Null',
     '    $existingRelSet = New-Object "System.Collections.Generic.HashSet[string]" ([System.StringComparer]::OrdinalIgnoreCase)',
     '    if (Test-Path -LiteralPath $appDir) {',
     '      $appNorm = Resolve-FullDir $appDir',
@@ -314,7 +522,7 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '        $bakDest = Join-Path $backupDir $cRel',
     '        $bakParent = Split-Path -Parent $bakDest',
     '        if ($bakParent -and -not (Test-Path -LiteralPath $bakParent)) {',
-    '          New-Item -ItemType Directory -Path $bakParent -Force | Out-Null',
+    '          [System.IO.Directory]::CreateDirectory($bakParent) | Out-Null',
     '        }',
     '        Invoke-WithRetry { Copy-Item -LiteralPath $cf.FullName -Destination $bakDest -Force }',
     '      }',
@@ -327,13 +535,13 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '      $destPath = Join-Path $appDir $relPath',
     '      if ($entry.PSIsContainer) {',
     '        if (-not (Test-Path -LiteralPath $destPath)) {',
-    '          New-Item -ItemType Directory -Path $destPath -Force | Out-Null',
+    '          [System.IO.Directory]::CreateDirectory($destPath) | Out-Null',
     '          $script:createdRelDirs.Add($relPath)',
     '        }',
     '      } else {',
     '        $parentDir = Split-Path -Parent $destPath',
     '        if ($parentDir -and -not (Test-Path -LiteralPath $parentDir)) {',
-    '          New-Item -ItemType Directory -Path $parentDir -Force | Out-Null',
+    '          [System.IO.Directory]::CreateDirectory($parentDir) | Out-Null',
     '        }',
     '        if (-not $existingRelSet.Contains($relPath) -and -not (Test-Path -LiteralPath $destPath)) {',
     '          $script:createdRelFiles.Add($relPath)',
@@ -347,48 +555,89 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '  }',
     '} catch {',
     '  Cleanup-ExtractArtifact',
+    '  Cleanup-ReadyFile',
     '  $restoredOk = Restore-UpdateBackup',
     '  if ($restoredOk -and (-not $skipRelaunch) -and (Test-Path -LiteralPath $exePath)) {',
-    '    Start-Process -FilePath $exePath -WorkingDirectory $appDir -ArgumentList @("--update-rolled-back=$toVer") | Out-Null',
+    '    try {',
+    '      Start-GuardProcess -FilePath $exePath -WorkDir $appDir -RawArgs @("--update-rolled-back=$toVer")',
+    '    } catch {}',
     '  }',
     '  exit 1',
     '}',
     '',
     'if (-not $skipRelaunch) {',
-    '  if ($readyFile -and (Test-Path -LiteralPath $readyFile)) {',
-    '    Remove-Item -LiteralPath $readyFile -Force -ErrorAction SilentlyContinue',
-    '  }',
+    '  Cleanup-ReadyFile',
     '  $relaunchArgs = @("--updated-from=$fromVer")',
     '  if ($readyFile) {',
     '    $relaunchArgs += "--update-ready-file=$readyFile"',
     '  }',
-    '  $proc = Start-Process -FilePath $exePath -WorkingDirectory $appDir -ArgumentList $relaunchArgs -PassThru',
-    '  if ($bootCheckMs -gt 0) {',
-    '    $deadline = [DateTime]::UtcNow.AddMilliseconds($bootCheckMs)',
+    '  $proc = $null',
+    '  $launchFailed = $false',
+    '  try {',
+    '    $proc = Start-GuardProcess -FilePath $exePath -WorkDir $appDir -RawArgs $relaunchArgs -PassThru',
+    '  } catch {',
+    '    $launchFailed = $true',
+    '  }',
+    '  if ($launchFailed -or ($bootCheckMs -gt 0)) {',
     '    $bootReady = $false',
-    '    while ([DateTime]::UtcNow -lt $deadline) {',
-    '      if ($readyFile -and (Test-Path -LiteralPath $readyFile)) {',
+    '    if ((-not $launchFailed) -and ($bootCheckMs -gt 0)) {',
+    '      $deadline = [DateTime]::UtcNow.AddMilliseconds($bootCheckMs)',
+    '      while ([DateTime]::UtcNow -lt $deadline) {',
+    '        if ($readyFile -and (Test-Path -LiteralPath $readyFile)) {',
+    '          $bootReady = $true',
+    '          break',
+    '        }',
+    '        if ($proc) {',
+    '          $procExited = $false',
+    '          $procExitCode = 0',
+    '          try {',
+    '            $proc.Refresh()',
+    '            $procExited = $proc.HasExited',
+    '            if ($procExited) { $procExitCode = $proc.ExitCode }',
+    '          } catch {}',
+    '          if ($procExited) {',
+    '            if ((-not $readyFile) -or ($procExitCode -ne 0)) { break }',
+    '          }',
+    '        }',
+    '        Start-Sleep -Milliseconds 120',
+    '      }',
+    '      if ((-not $bootReady) -and $readyFile -and (Test-Path -LiteralPath $readyFile)) {',
     '        $bootReady = $true',
-    '        break',
     '      }',
-    '      $proc.Refresh()',
-    '      if ($proc.HasExited) {',
-    '        if (-not $readyFile -or ($proc.ExitCode -ne 0)) { break }',
-    '      }',
-    '      Start-Sleep -Milliseconds 120',
     '    }',
-    '    $proc.Refresh()',
-    '    $shouldRollback = if ($readyFile) { -not $bootReady } else { $proc.HasExited -and ($proc.ExitCode -ne 0) }',
+    '    $procExitedFinal = $false',
+    '    $procExitCodeFinal = 0',
+    '    if ($proc) {',
+    '      try {',
+    '        $proc.Refresh()',
+    '        $procExitedFinal = $proc.HasExited',
+    '        if ($procExitedFinal) { $procExitCodeFinal = $proc.ExitCode }',
+    '      } catch {}',
+    '    }',
+    '    $shouldRollback = if ($launchFailed) {',
+    '      $true',
+    '    } elseif ($readyFile) {',
+    '      -not $bootReady',
+    '    } else {',
+    '      ($null -eq $proc) -or ($procExitedFinal -and ($procExitCodeFinal -ne 0))',
+    '    }',
     '    if ($shouldRollback) {',
-    '      if (-not $proc.HasExited) {',
-    '        & taskkill.exe /F /T /PID $($proc.Id) *> $null',
-    '        Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue',
-    '        Start-Sleep -Milliseconds 500',
+    '      if ($proc -and (-not $procExitedFinal)) {',
+    '        $killPid = 0',
+    '        try { $killPid = [int]$proc.Id } catch {}',
+    '        if ($killPid -gt 0) {',
+    '          Invoke-SafeTaskkill $killPid',
+    '          Stop-Process -Id $killPid -Force -ErrorAction SilentlyContinue',
+    '          Start-Sleep -Milliseconds 500',
+    '        }',
     '      }',
     '      Cleanup-ExtractArtifact',
+    '      Cleanup-ReadyFile',
     '      $restoredOk = Restore-UpdateBackup',
     '      if ($restoredOk -and (Test-Path -LiteralPath $exePath)) {',
-    '        Start-Process -FilePath $exePath -WorkingDirectory $appDir -ArgumentList @("--update-rolled-back=$toVer") | Out-Null',
+    '        try {',
+    '          Start-GuardProcess -FilePath $exePath -WorkDir $appDir -RawArgs @("--update-rolled-back=$toVer")',
+    '        } catch {}',
     '      }',
     '      exit 2',
     '    }',
@@ -396,6 +645,7 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '}',
     '',
     'Cleanup-ExtractArtifact',
+    'Cleanup-ReadyFile',
     'Remove-Item -LiteralPath $asarBak -Force -ErrorAction SilentlyContinue',
     'Remove-Item -LiteralPath $mmdbBak -Force -ErrorAction SilentlyContinue',
     'Remove-Item -LiteralPath $exeBak -Force -ErrorAction SilentlyContinue',
@@ -499,6 +749,9 @@ export class UpdaterService {
   private readonly exePath: string;
   private readonly stagingRootDir: string;
   private readonly allowLocalhostForTest: boolean;
+  private readonly targetPidOverride?: number;
+  private readonly bootHandshakeTimeoutMs: number;
+  private readonly waitExitAttemptsOverride?: number;
 
   private status: UpdateStatus = 'idle';
   private cachedManifest: UpdateReleaseManifest | null = null;
@@ -515,6 +768,7 @@ export class UpdaterService {
   private startupTimer: NodeJS.Timeout | null = null;
   private periodicTimer: NodeJS.Timeout | null = null;
   private bakCleanupTimer: NodeJS.Timeout | null = null;
+  private quitTimer: NodeJS.Timeout | null = null;
   private checkPromise: Promise<UpdateActionResult> | null = null;
   private downloadPromise: Promise<UpdateActionResult> | null = null;
   private applyingInProgress = false;
@@ -542,6 +796,10 @@ export class UpdaterService {
     this.stagingRootDir =
       options.stagingRootDirOverride || path.join(app.getPath('userData'), 'updates');
     this.allowLocalhostForTest = Boolean(options.allowLocalhostForTest);
+    this.targetPidOverride = options.targetPidOverride;
+    this.bootHandshakeTimeoutMs =
+      options.bootHandshakeTimeoutMsOverride ?? DEFAULT_BOOT_HANDSHAKE_TIMEOUT_MS;
+    this.waitExitAttemptsOverride = options.waitExitAttemptsOverride;
     this.nativeShellVersion =
       normalizeSemverString(options.nativeShellVersionOverride) || this.readNativeShellVersion();
 
@@ -590,7 +848,6 @@ export class UpdaterService {
 
   public startBackgroundSchedule(argv: string[] = process.argv): void {
     this.handlePostUpdateStartupFlags(argv);
-    void this.cleanupObsoleteStagingDirs();
     this.reconcileAutoCheckTimer(true);
   }
 
@@ -606,6 +863,10 @@ export class UpdaterService {
     if (this.bakCleanupTimer) {
       clearTimeout(this.bakCleanupTimer);
       this.bakCleanupTimer = null;
+    }
+    if (this.quitTimer) {
+      clearTimeout(this.quitTimer);
+      this.quitTimer = null;
     }
   }
 
@@ -651,7 +912,10 @@ export class UpdaterService {
     let readyFilePath = '';
     for (const arg of argv) {
       if (arg.startsWith('--update-ready-file=')) {
-        readyFilePath = arg.slice('--update-ready-file='.length).trim();
+        readyFilePath = arg
+          .slice('--update-ready-file='.length)
+          .trim()
+          .replace(/^"+|"+$/g, '');
       } else if (arg.startsWith('--updated-from=')) {
         const fromVer = arg.slice('--updated-from='.length).trim();
         if (fromVer && fromVer !== this.currentVersion) {
@@ -679,7 +943,7 @@ export class UpdaterService {
       }
     }
 
-    // 推迟兜底清理残留 .bak 文件，避免在更新脚本观察窗口内提前删除回滚备份
+    // 推迟兜底清理残留 .bak 与历史暂存目录，避免在后台更新脚本观察/收尾窗口内抢删握手或回滚备份
     if (this.bakCleanupTimer) {
       clearTimeout(this.bakCleanupTimer);
     }
@@ -698,6 +962,7 @@ export class UpdaterService {
           // ignore
         }
       }
+      void this.cleanupObsoleteStagingDirs();
     }, POST_UPDATE_BAK_CLEANUP_DELAY_MS);
     this.bakCleanupTimer.unref?.();
   }
@@ -708,14 +973,30 @@ export class UpdaterService {
       const entries = await rawFs.promises.readdir(this.stagingRootDir, {
         withFileTypes: true,
       });
+      const now = Date.now();
       for (const entry of entries) {
-        if (!entry.isDirectory() || !entry.name.startsWith('v-')) continue;
-        const ver = normalizeSemverString(entry.name.slice(2));
-        if (!ver || compareSemver(ver, this.currentVersion) <= 0) {
-          await rawFs.promises.rm(path.join(this.stagingRootDir, entry.name), {
-            recursive: true,
-            force: true,
-          });
+        const fullEntryPath = path.join(this.stagingRootDir, entry.name);
+        if (entry.isDirectory() && entry.name.startsWith('v-')) {
+          const ver = normalizeSemverString(entry.name.slice(2));
+          if (!ver || compareSemver(ver, this.currentVersion) <= 0) {
+            await rawFs.promises.rm(fullEntryPath, {
+              recursive: true,
+              force: true,
+            });
+          }
+        } else if (
+          entry.isFile() &&
+          entry.name.startsWith('boot-ready-') &&
+          entry.name.endsWith('.ok')
+        ) {
+          try {
+            const stat = await rawFs.promises.stat(fullEntryPath);
+            if (now - stat.mtimeMs > 60_000) {
+              await rawFs.promises.rm(fullEntryPath, { force: true });
+            }
+          } catch {
+            // ignore
+          }
         }
       }
     } catch {
@@ -1513,55 +1794,51 @@ export class UpdaterService {
           ? path.join(stageDir, 'geolite2-country.mmdb.staged')
           : '';
       const stagedZip = path.join(stageDir, 'release.zip.staged');
-      const readyHandshakeFile = path.join(stageDir, 'boot-ready.ok');
+      const targetPid = this.targetPidOverride ?? process.pid;
+      // 将就绪握手标记置于 stageDir 之外，防止任何暂存目录清理操作误删握手文件导致误判超时回滚
+      const readyHandshakeFile = path.join(
+        this.stagingRootDir,
+        `boot-ready-${manifest.version}-${targetPid}.ok`
+      );
 
       const { encodedCommand, scriptGzB64 } = buildEncodedPowerShellLaunch();
 
-      const child = spawn(
-        'powershell.exe',
-        [
-          '-NoProfile',
-          '-NonInteractive',
-          '-WindowStyle',
-          'Hidden',
-          '-EncodedCommand',
-          encodedCommand,
-        ],
-        {
-          detached: true,
-          stdio: 'ignore',
-          windowsHide: true,
-          env: {
-            ...process.env,
-            GUARD_UPD_SCRIPT_GZ: scriptGzB64,
-            GUARD_UPD_PID: String(process.pid),
-            GUARD_UPD_MODE: mode,
-            GUARD_UPD_APP_DIR: this.appDir,
-            GUARD_UPD_RES_DIR: this.resourcesDir,
-            GUARD_UPD_EXE_PATH: this.exePath,
-            GUARD_UPD_FROM_VER: this.currentVersion,
-            GUARD_UPD_TO_VER: manifest.version,
-            GUARD_UPD_STAGED_ASAR: stagedAsar,
-            GUARD_UPD_STAGED_MMDB: stagedMmdb,
-            GUARD_UPD_STAGED_ZIP: stagedZip,
-            GUARD_UPD_ASAR_SHA256:
-              mode === 'asar' ? manifest.asar.uncompressedSha256.toLowerCase() : '',
-            GUARD_UPD_MMDB_SHA256:
-              mode === 'asar' && includeMmdb && manifest.mmdb
-                ? manifest.mmdb.uncompressedSha256.toLowerCase()
-                : '',
-            GUARD_UPD_ZIP_SHA256:
-              mode === 'full-zip' ? manifest.fullZip.sha256.toLowerCase() : '',
-            GUARD_UPD_STAGE_DIR: stageDir,
-            GUARD_UPD_READY_FILE: readyHandshakeFile,
-            GUARD_UPD_BOOT_CHECK_MS: String(DEFAULT_BOOT_HANDSHAKE_TIMEOUT_MS),
-          },
-        }
-      );
-      child.unref();
+      const updaterEnv: Record<string, string> = {
+        GUARD_UPD_SCRIPT_GZ: scriptGzB64,
+        GUARD_UPD_PID: String(targetPid),
+        GUARD_UPD_MODE: mode,
+        GUARD_UPD_APP_DIR: this.appDir,
+        GUARD_UPD_RES_DIR: this.resourcesDir,
+        GUARD_UPD_EXE_PATH: this.exePath,
+        GUARD_UPD_FROM_VER: this.currentVersion,
+        GUARD_UPD_TO_VER: manifest.version,
+        GUARD_UPD_STAGED_ASAR: stagedAsar,
+        GUARD_UPD_STAGED_MMDB: stagedMmdb,
+        GUARD_UPD_STAGED_ZIP: stagedZip,
+        GUARD_UPD_ASAR_SHA256:
+          mode === 'asar' ? manifest.asar.uncompressedSha256.toLowerCase() : '',
+        GUARD_UPD_MMDB_SHA256:
+          mode === 'asar' && includeMmdb && manifest.mmdb
+            ? manifest.mmdb.uncompressedSha256.toLowerCase()
+            : '',
+        GUARD_UPD_ZIP_SHA256:
+          mode === 'full-zip' ? manifest.fullZip.sha256.toLowerCase() : '',
+        GUARD_UPD_STAGE_DIR: stageDir,
+        GUARD_UPD_READY_FILE: readyHandshakeFile,
+        GUARD_UPD_BOOT_CHECK_MS: String(this.bootHandshakeTimeoutMs),
+      };
+      if (this.waitExitAttemptsOverride !== undefined) {
+        updaterEnv.GUARD_UPD_WAIT_EXIT_ATTEMPTS = String(this.waitExitAttemptsOverride);
+      }
+
+      await launchDetachedWindowsUpdater(encodedCommand, updaterEnv);
 
       const finalState = this.probeEngine.getSnapshot();
-      setTimeout(() => {
+      if (this.quitTimer) {
+        clearTimeout(this.quitTimer);
+      }
+      this.quitTimer = setTimeout(() => {
+        this.quitTimer = null;
         if (this.onQuitForUpdate) {
           this.onQuitForUpdate();
         } else {

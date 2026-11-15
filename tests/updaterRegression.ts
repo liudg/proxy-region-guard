@@ -26,6 +26,8 @@ import {
 } from '../electron/updateCrypto';
 import {
   buildEncodedPowerShellLaunch,
+  quoteWindowsCommandLine,
+  resolveWindowsPowerShellExe,
   UpdaterService,
 } from '../electron/updaterService';
 import {
@@ -557,6 +559,7 @@ export async function runUpdaterRegressionTests(
         'powershell.exe',
         ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodedScript],
         {
+          stdio: 'ignore',
           windowsHide: true,
           env: {
             ...process.env,
@@ -830,6 +833,7 @@ export async function runUpdaterRegressionTests(
         'powershell.exe',
         ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodedScript],
         {
+          stdio: 'ignore',
           windowsHide: true,
           env: {
             ...process.env,
@@ -871,6 +875,408 @@ export async function runUpdaterRegressionTests(
       );
       assert.equal(fullAsarHash.sha256, sha256Hex(v110AsarRaw));
       assert.equal(rawFs.existsSync(fullOkStage), false, '全量更新握手成功后应清理暂存目录');
+
+      // 9e. 真实端到端验证 applyDownloadedUpdate() 脱离拉起链路（防 DETACHED_PROCESS 静默秒退 + 含空格与 [ ] 方括号路径参数转义握手）
+      servedManifestJson = JSON.stringify(validManifest);
+      const spaceAppDir = path.join(root, 'Program Files Space Test', 'Installed [Guard] Space');
+      const spaceResDir = path.join(spaceAppDir, 'resources');
+      const spaceStageRoot = path.join(root, 'User Space Profile', 'Updates [Stage] Dir');
+      fs.mkdirSync(spaceResDir, { recursive: true });
+      rawFs.copyFileSync(v100Asar, path.join(spaceResDir, 'app.asar'));
+      fs.writeFileSync(path.join(spaceResDir, 'geolite2-country.mmdb'), newMmdbRaw);
+      fs.writeFileSync(
+        path.join(spaceResDir, 'shell-meta.json'),
+        JSON.stringify({ shellVersion: '1.0.0', electronVersion: '33.2.1' }),
+        'utf-8'
+      );
+
+      const relaunchReportFile = path.join(root, 'e2e-relaunch-report.json');
+      const mockRelaunchCjs = path.join(spaceAppDir, 'mock-relaunch.cjs');
+      const mockRelaunchCmd = path.join(spaceAppDir, '代理地区卫士.cmd');
+      const runtimeNodeBin = process.env.GUARD_TEST_NODE || process.execPath;
+
+      fs.writeFileSync(
+        mockRelaunchCjs,
+        [
+          'const fs = require("node:fs");',
+          'const path = require("node:path");',
+          'let readyFile = "";',
+          'let updatedFrom = "";',
+          'for (const arg of process.argv) {',
+          '  if (arg.startsWith("--update-ready-file=")) {',
+          '    readyFile = arg.slice("--update-ready-file=".length).trim().replace(/^"+|"+$/g, "");',
+          '  } else if (arg.startsWith("--updated-from=")) {',
+          '    updatedFrom = arg.slice("--updated-from=".length).trim();',
+          '  }',
+          '}',
+          `const reportPath = ${JSON.stringify(relaunchReportFile)};`,
+          'const reportTmp = reportPath + "." + process.pid + ".tmp";',
+          'fs.writeFileSync(reportTmp, JSON.stringify({ argv: process.argv, readyFile, updatedFrom, cwd: process.cwd() }), "utf-8");',
+          'fs.renameSync(reportTmp, reportPath);',
+          'if (readyFile) {',
+          '  fs.mkdirSync(path.dirname(readyFile), { recursive: true });',
+          '  fs.writeFileSync(readyFile, `${process.pid}:${Date.now()}\\n`, "utf-8");',
+          '}',
+          'process.exit(0);',
+        ].join('\n'),
+        'utf-8'
+      );
+      fs.writeFileSync(
+        mockRelaunchCmd,
+        `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${runtimeNodeBin}" "${mockRelaunchCjs}" %*\r\nexit /b %ERRORLEVEL%\r\n`,
+        'utf-8'
+      );
+
+      const dummyOldApp = spawn(runtimeNodeBin, ['-e', 'setInterval(() => {}, 1000)'], {
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+        windowsHide: true,
+      });
+      await once(dummyOldApp, 'spawn');
+      const dummyOldPid = dummyOldApp.pid!;
+
+      let quitTriggered = false;
+      const e2eUpdater = new UpdaterService({
+        configStore: store,
+        probeEngine: engine,
+        manifestUrlOverride: `${baseUrl}/latest.json`,
+        publicKeyOverride: pubB64,
+        isPackagedOverride: true,
+        currentVersionOverride: '1.0.0',
+        electronVersionOverride: '33.2.1',
+        appDirOverride: spaceAppDir,
+        resourcesDirOverride: spaceResDir,
+        exePathOverride: mockRelaunchCmd,
+        stagingRootDirOverride: spaceStageRoot,
+        allowLocalhostForTest: true,
+        targetPidOverride: dummyOldPid,
+        bootHandshakeTimeoutMsOverride: 5000,
+        onQuitForUpdate: () => {
+          quitTriggered = true;
+          dummyOldApp.kill();
+        },
+      });
+
+      try {
+        const dlRes = await e2eUpdater.checkForUpdates({ silent: true });
+        assert.equal(dlRes.ok, true, dlRes.message);
+        assert.equal(e2eUpdater.getSnapshot().status, 'downloaded');
+
+        const applyRes = await e2eUpdater.applyDownloadedUpdate(false);
+        assert.equal(applyRes.ok, true, applyRes.message);
+
+        const waitDeadline = Date.now() + 12000;
+        const expectedStageV110 = path.join(spaceStageRoot, 'v-1.1.0');
+        const expectedReadyFile = path.join(
+          spaceStageRoot,
+          `boot-ready-1.1.0-${dummyOldPid}.ok`
+        );
+        while (Date.now() < waitDeadline) {
+          if (
+            quitTriggered &&
+            fs.existsSync(relaunchReportFile) &&
+            !rawFs.existsSync(expectedStageV110) &&
+            !rawFs.existsSync(expectedReadyFile)
+          ) {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 120));
+        }
+
+        assert.equal(quitTriggered, true, 'applyDownloadedUpdate 成功后应触发退出回调');
+        assert.equal(
+          fs.existsSync(relaunchReportFile),
+          true,
+          '脱离式后台 PowerShell 更新器必须在主进程退出后继续存活并成功重启新版本'
+        );
+        const report = JSON.parse(fs.readFileSync(relaunchReportFile, 'utf-8')) as {
+          readyFile: string;
+          updatedFrom: string;
+          cwd: string;
+        };
+        assert.equal(report.updatedFrom, '1.0.0');
+        assert.equal(
+          path.resolve(report.readyFile),
+          path.resolve(expectedReadyFile),
+          `含空格与方括号路径的 --update-ready-file 参数必须精准无损传递并位于 stageDir 之外: ${report.readyFile}`
+        );
+        assert.equal(
+          path.resolve(report.cwd),
+          path.resolve(spaceAppDir),
+          '重启进程的工作目录必须精确兼容含 [ ] 方括号与空格路径'
+        );
+        const e2eAsarHash = await computeFileSha256(path.join(spaceResDir, 'app.asar'));
+        assert.equal(
+          e2eAsarHash.sha256,
+          sha256Hex(v110AsarRaw),
+          '真实 applyDownloadedUpdate 链路应将 app.asar 替换为 v1.1.0'
+        );
+        assert.equal(
+          rawFs.existsSync(expectedStageV110),
+          false,
+          '新实例握手就绪后后台更新器应自动清理暂存目录'
+        );
+        assert.equal(
+          rawFs.existsSync(expectedReadyFile),
+          false,
+          '新实例握手就绪后后台更新器应自动清理外部 boot-ready 标记文件'
+        );
+      } finally {
+        e2eUpdater.stop();
+        try {
+          dummyOldApp.kill();
+        } catch {
+          // ignore
+        }
+      }
+
+      // 9f. 验证旧主进程退出挂起超时时，后台更新器执行安全 taskkill /F /T 强杀旧进程且不会误杀自身或触发 NativeCommandError
+      rawFs.copyFileSync(v100Asar, path.join(spaceResDir, 'app.asar'));
+      fs.rmSync(relaunchReportFile, { force: true });
+      const hungOldApp = spawn(runtimeNodeBin, ['-e', 'setInterval(() => {}, 1000)'], {
+        env: { ...process.env, ELECTRON_RUN_AS_NODE: '1' },
+        windowsHide: true,
+      });
+      await once(hungOldApp, 'spawn');
+      const hungOldPid = hungOldApp.pid!;
+
+      const hungUpdater = new UpdaterService({
+        configStore: store,
+        probeEngine: engine,
+        manifestUrlOverride: `${baseUrl}/latest.json`,
+        publicKeyOverride: pubB64,
+        isPackagedOverride: true,
+        currentVersionOverride: '1.0.0',
+        electronVersionOverride: '33.2.1',
+        appDirOverride: spaceAppDir,
+        resourcesDirOverride: spaceResDir,
+        exePathOverride: mockRelaunchCmd,
+        stagingRootDirOverride: spaceStageRoot,
+        allowLocalhostForTest: true,
+        targetPidOverride: hungOldPid,
+        bootHandshakeTimeoutMsOverride: 5000,
+        waitExitAttemptsOverride: 3,
+        onQuitForUpdate: () => {
+          // 模拟旧进程卡死未响应 app.quit()
+        },
+      });
+
+      try {
+        const dlHung = await hungUpdater.checkForUpdates({ silent: true });
+        assert.equal(dlHung.ok, true, dlHung.message);
+        const applyHung = await hungUpdater.applyDownloadedUpdate(false);
+        assert.equal(applyHung.ok, true, applyHung.message);
+
+        const hungDeadline = Date.now() + 12000;
+        const expectedStageV110 = path.join(spaceStageRoot, 'v-1.1.0');
+        const expectedHungReady = path.join(
+          spaceStageRoot,
+          `boot-ready-1.1.0-${hungOldPid}.ok`
+        );
+        while (Date.now() < hungDeadline) {
+          if (
+            hungOldApp.exitCode !== null &&
+            fs.existsSync(relaunchReportFile) &&
+            !rawFs.existsSync(expectedStageV110) &&
+            !rawFs.existsSync(expectedHungReady)
+          ) {
+            break;
+          }
+          await new Promise((r) => setTimeout(r, 120));
+        }
+
+        assert.notEqual(
+          hungOldApp.exitCode,
+          null,
+          '旧进程挂起超时后应被后台更新器强制终止'
+        );
+        assert.equal(
+          fs.existsSync(relaunchReportFile),
+          true,
+          '后台更新器强杀旧进程后不得误杀自身，仍须完成文件替换与重启握手'
+        );
+        assert.equal(
+          (await computeFileSha256(path.join(spaceResDir, 'app.asar'))).sha256,
+          sha256Hex(v110AsarRaw)
+        );
+      } finally {
+        hungUpdater.stop();
+        try {
+          hungOldApp.kill();
+        } catch {
+          // ignore
+        }
+      }
+
+      // 9g. 验证新版本实例真实调用 startBackgroundSchedule() 时：同步写出握手标记，且在观察窗口期内绝不提前抢删 v-1.1.0 暂存/回滚备份或握手标记！
+      const postBootStageV110 = path.join(spaceStageRoot, 'v-1.1.0', '_backup_app');
+      rawFs.mkdirSync(postBootStageV110, { recursive: true });
+      const postBootBackupSentinel = path.join(postBootStageV110, 'ffmpeg.dll');
+      rawFs.writeFileSync(postBootBackupSentinel, 'BACKUP-SENTINEL', 'utf-8');
+      const postBootReadyFile = path.join(spaceStageRoot, 'boot-ready-1.1.0-99999.ok');
+      rawFs.rmSync(postBootReadyFile, { force: true });
+
+      const postBootUpdater = new UpdaterService({
+        configStore: store,
+        probeEngine: engine,
+        manifestUrlOverride: `${baseUrl}/latest.json`,
+        publicKeyOverride: pubB64,
+        isPackagedOverride: false,
+        currentVersionOverride: '1.1.0',
+        electronVersionOverride: '33.2.1',
+        appDirOverride: spaceAppDir,
+        resourcesDirOverride: spaceResDir,
+        exePathOverride: mockRelaunchCmd,
+        stagingRootDirOverride: spaceStageRoot,
+        allowLocalhostForTest: true,
+      });
+      try {
+        postBootUpdater.startBackgroundSchedule([
+          runtimeNodeBin,
+          '--updated-from=1.0.0',
+          `--update-ready-file="${postBootReadyFile}"`,
+        ]);
+        assert.equal(
+          rawFs.existsSync(postBootReadyFile),
+          true,
+          'startBackgroundSchedule 必须同步立即写出正向就绪握手文件'
+        );
+        await new Promise((r) => setTimeout(r, 250));
+        assert.equal(
+          rawFs.existsSync(postBootReadyFile),
+          true,
+          '新实例启动初期不得提前自删握手文件，需交由后台更新器轮询确认'
+        );
+        assert.equal(
+          rawFs.existsSync(postBootBackupSentinel),
+          true,
+          '新实例启动初期不得与后台更新器竞态抢删 v-1.1.0/_backup_app 回滚目录'
+        );
+        assert.equal(
+          engine
+            .getSnapshot()
+            .logs.some((l) => l.message.includes('已成功完成版本更新：v1.0.0 → v1.1.0')),
+          true,
+          '新实例带 --updated-from 启动后应记录版本升级成功日志'
+        );
+      } finally {
+        postBootUpdater.stop();
+        rawFs.rmSync(path.join(spaceStageRoot, 'v-1.1.0'), {
+          recursive: true,
+          force: true,
+        });
+        rawFs.rmSync(postBootReadyFile, { force: true });
+      }
+
+      // 9h. 验证新版本可执行文件启动直接抛异常（如损坏/缺失）时，更新脚本捕获异常并完整回滚返回状态码 2
+      rawFs.copyFileSync(v100Asar, path.join(spaceResDir, 'app.asar'));
+      const missingStage = path.join(root, 'missing-exe-stage');
+      rawFs.mkdirSync(missingStage, { recursive: true });
+      const missingStagedAsar = path.join(missingStage, 'payload.bin');
+      rawFs.copyFileSync(v110Asar, missingStagedAsar);
+      const missingReadyFile = path.join(root, 'boot-ready-missing.ok');
+      let missingExeExit = 0;
+      try {
+        execFileSync(
+          'powershell.exe',
+          ['-NoProfile', '-NonInteractive', '-EncodedCommand', encodedScript],
+          {
+            windowsHide: true,
+            env: {
+              ...process.env,
+              GUARD_UPD_SCRIPT_GZ: scriptGzB64,
+              GUARD_UPD_PID: '0',
+              GUARD_UPD_MODE: 'asar',
+              GUARD_UPD_APP_DIR: spaceAppDir,
+              GUARD_UPD_RES_DIR: spaceResDir,
+              GUARD_UPD_EXE_PATH: path.join(spaceAppDir, '不存在的可执行文件.exe'),
+              GUARD_UPD_FROM_VER: '1.0.0',
+              GUARD_UPD_TO_VER: '1.1.0',
+              GUARD_UPD_STAGED_ASAR: missingStagedAsar,
+              GUARD_UPD_STAGED_MMDB: '',
+              GUARD_UPD_STAGED_ZIP: '',
+              GUARD_UPD_ASAR_SHA256: sha256Hex(v110AsarRaw),
+              GUARD_UPD_STAGE_DIR: missingStage,
+              GUARD_UPD_READY_FILE: missingReadyFile,
+              GUARD_UPD_SKIP_RELAUNCH: '0',
+              GUARD_UPD_BOOT_CHECK_MS: '600',
+            },
+          }
+        );
+      } catch (e) {
+        missingExeExit = (e as { status?: number }).status ?? 1;
+      }
+      assert.equal(
+        missingExeExit,
+        2,
+        '重启新版本进程直接抛错时不得裸崩退出 1，必须走回滚分支返回状态码 2'
+      );
+      assert.equal(
+        (await computeFileSha256(path.join(spaceResDir, 'app.asar'))).sha256,
+        (await computeFileSha256(v100Asar)).sha256,
+        '重启新版本进程启动失败后必须自动将 app.asar 还原为旧版备份'
+      );
+
+      // 9i. 验证 quoteWindowsCommandLine 经由 Windows PowerShell 5.1 ProcessStartInfo(UseShellExecute=true) 启动子进程时参数零粘连、零丢失
+      const argvDumpScript = path.join(spaceAppDir, 'dump-argv.cjs');
+      const argvDumpOut = path.join(root, 'argv-dump.json');
+      fs.writeFileSync(
+        argvDumpScript,
+        `require("node:fs").writeFileSync(${JSON.stringify(argvDumpOut)}, JSON.stringify({ argv: process.argv.slice(2), cwd: process.cwd() }), "utf-8");`,
+        'utf-8'
+      );
+      const complexArgs = [
+        argvDumpScript,
+        'D:\\Code\\My [App] Dir\\',
+        '--updated-from=1.0.0',
+        `--update-ready-file=${path.join(spaceStageRoot, 'boot-ready-1.1.0-777.ok')}`,
+        '--note="quoted value"',
+        '',
+        '--elevated-relaunch',
+      ];
+      const testPsiPs = [
+        '$ProgressPreference = "SilentlyContinue"',
+        '$ErrorActionPreference = "Stop"',
+        '$psi = New-Object System.Diagnostics.ProcessStartInfo',
+        '$psi.FileName = $env:GUARD_TEST_EXE',
+        '$psi.WorkingDirectory = $env:GUARD_TEST_CWD',
+        '$psi.UseShellExecute = $true',
+        '$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden',
+        '$psi.Arguments = $env:GUARD_TEST_ARG_LINE',
+        '$p = [System.Diagnostics.Process]::Start($psi)',
+        'if ($p) { $p.WaitForExit(8000) | Out-Null }',
+      ].join('\r\n');
+      execFileSync(
+        resolveWindowsPowerShellExe(),
+        [
+          '-NoProfile',
+          '-NonInteractive',
+          '-WindowStyle',
+          'Hidden',
+          '-EncodedCommand',
+          Buffer.from(testPsiPs, 'utf16le').toString('base64'),
+        ],
+        {
+          stdio: 'ignore',
+          windowsHide: true,
+          env: {
+            ...process.env,
+            ELECTRON_RUN_AS_NODE: '1',
+            GUARD_TEST_EXE: runtimeNodeBin,
+            GUARD_TEST_CWD: spaceAppDir,
+            GUARD_TEST_ARG_LINE: quoteWindowsCommandLine(complexArgs.slice()),
+          },
+        }
+      );
+      const dumped = JSON.parse(fs.readFileSync(argvDumpOut, 'utf-8')) as {
+        argv: string[];
+        cwd: string;
+      };
+      assert.deepEqual(
+        dumped.argv,
+        complexArgs.slice(1),
+        '多元素参数（含空格、方括号、末尾反斜杠、空串、内嵌引号）经 ProcessStartInfo 传递后必须严格逐项还原且绝不粘连'
+      );
+      assert.equal(path.resolve(dumped.cwd), path.resolve(spaceAppDir));
     } finally {
       updater.stop();
       engine.stop();

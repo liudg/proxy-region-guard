@@ -24,7 +24,11 @@ import {
   shouldStartSilentlyInTray,
 } from './autoLaunch';
 import { TrayHealthManager } from './trayHealth';
-import { UpdaterService } from './updaterService';
+import {
+  quoteWindowsCommandLine,
+  resolveWindowsPowerShellExe,
+  UpdaterService,
+} from './updaterService';
 
 const ELEVATED_RELAUNCH_FLAG = '--elevated-relaunch';
 const IS_POST_UPDATE_BOOT = process.argv.some((a) => a.startsWith('--updated-from='));
@@ -72,16 +76,21 @@ function tryRelaunchAsWindowsAdmin(): boolean {
     userArgs.push(ELEVATED_RELAUNCH_FLAG);
 
     const psScript = [
+      '$ProgressPreference = "SilentlyContinue"',
       '$ErrorActionPreference = "Stop"',
-      '$exe = $env:GUARD_ELEVATE_EXE',
-      '$cwd = $env:GUARD_ELEVATE_CWD',
-      '$argList = @(ConvertFrom-Json $env:GUARD_ELEVATE_ARGS)',
-      'Start-Process -FilePath $exe -WorkingDirectory $cwd -ArgumentList $argList -Verb RunAs',
-    ].join('; ');
+      '$psi = New-Object System.Diagnostics.ProcessStartInfo',
+      '$psi.FileName = $env:GUARD_ELEVATE_EXE',
+      'if ($env:GUARD_ELEVATE_CWD) { $psi.WorkingDirectory = $env:GUARD_ELEVATE_CWD }',
+      '$psi.UseShellExecute = $true',
+      '$psi.Verb = "runas"',
+      'if ($env:GUARD_ELEVATE_ARG_LINE) { $psi.Arguments = $env:GUARD_ELEVATE_ARG_LINE }',
+      '[System.Diagnostics.Process]::Start($psi) | Out-Null',
+    ].join('\r\n');
+    const encodedElevate = Buffer.from(psScript, 'utf16le').toString('base64');
 
     execFileSync(
-      'powershell.exe',
-      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', psScript],
+      resolveWindowsPowerShellExe(),
+      ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-EncodedCommand', encodedElevate],
       {
         stdio: 'ignore',
         windowsHide: true,
@@ -90,7 +99,7 @@ function tryRelaunchAsWindowsAdmin(): boolean {
           ...process.env,
           GUARD_ELEVATE_EXE: process.execPath,
           GUARD_ELEVATE_CWD: process.cwd(),
-          GUARD_ELEVATE_ARGS: JSON.stringify(userArgs),
+          GUARD_ELEVATE_ARG_LINE: quoteWindowsCommandLine(userArgs),
         },
       }
     );
@@ -173,14 +182,86 @@ function getPreloadPath(): string {
 }
 
 function loadRendererRoute(win: BrowserWindow, hash?: string): void {
+  const handleLoadError = (err: unknown) => {
+    const code = (err as { code?: string })?.code || '';
+    const msg = err instanceof Error ? err.message : String(err);
+    if (code === 'ERR_ABORTED' || msg.includes('ERR_ABORTED') || msg.includes('(-3)')) {
+      return;
+    }
+    console.error('[Renderer Load Error]', err);
+  };
   const devUrl = process.env.VITE_DEV_SERVER_URL;
   if (devUrl) {
     const fullUrl = hash ? `${devUrl}#${hash}` : devUrl;
-    void win.loadURL(fullUrl);
+    void win.loadURL(fullUrl).catch(handleLoadError);
   } else {
     const htmlPath = path.join(__dirname, '../dist/index.html');
-    void win.loadFile(htmlPath, hash ? { hash } : undefined);
+    void win.loadFile(htmlPath, hash ? { hash } : undefined).catch(handleLoadError);
   }
+}
+
+function waitForPostUpdateRendererReady(
+  win: BrowserWindow,
+  timeoutMs = 4500
+): Promise<void> {
+  if (win.isDestroyed()) return Promise.resolve();
+  const wc = win.webContents;
+  if (!wc.isLoading() && wc.getURL() !== '') {
+    return Promise.resolve();
+  }
+
+  return new Promise<void>((resolve, reject) => {
+    let settled = false;
+    const cleanup = () => {
+      clearTimeout(timer);
+      if (!win.isDestroyed()) {
+        win.removeListener('closed', onClosed);
+        wc.removeListener('did-finish-load', onFinish);
+        wc.removeListener('did-fail-load', onFail);
+        wc.removeListener('render-process-gone', onGone);
+      }
+    };
+    const onFinish = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onClosed = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    const onFail = (
+      _event: Electron.Event,
+      errorCode: number,
+      errorDescription: string,
+      _validatedURL: string,
+      isMainFrame: boolean
+    ) => {
+      if (!isMainFrame || errorCode === -3 || settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error(`主窗口页面加载失败 (${errorCode}): ${errorDescription}`));
+    };
+    const onGone = (
+      _event: Electron.Event,
+      details: Electron.RenderProcessGoneDetails
+    ) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error(`渲染进程启动异常退出 (${details.reason})`));
+    };
+    const timer = setTimeout(onFinish, timeoutMs);
+    timer.unref?.();
+
+    win.once('closed', onClosed);
+    wc.once('did-finish-load', onFinish);
+    wc.on('did-fail-load', onFail);
+    wc.once('render-process-gone', onGone);
+  });
 }
 
 function createMainWindow(revealOnReady = true, initialHash?: string): void {
@@ -1136,12 +1217,24 @@ if (tryRelaunchAsWindowsAdmin()) {
       }
       setupTray();
 
-      await probeEngine.start();
+      // 更新重启启动时，在主进程核心服务、离线库、托盘与本地主界面加载就绪后立即写出握手标记，
+      // 避免被后续首次外网代理探测的慢网/断网超时（>12s）阻塞而误触发回滚
+      if (IS_POST_UPDATE_BOOT && mainWindow && !mainWindow.isDestroyed()) {
+        await waitForPostUpdateRendererReady(mainWindow);
+      }
       updaterService.startBackgroundSchedule(process.argv);
       if (IS_POST_UPDATE_BOOT) {
         postUpdateHandshakeDone = true;
         process.removeListener('uncaughtException', handlePostUpdateBootFatal);
         process.removeListener('unhandledRejection', handlePostUpdateBootFatal);
+      }
+
+      try {
+        await probeEngine.start();
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.error('[ProbeEngine Start Error]', err);
+        probeEngine.recordExternalLog('danger', `启动初期代理探测异常：${msg}`);
       }
 
       // 延迟执行计划任务/注册表自启状态校验，避免同步子进程阻塞主窗口首屏渲染
@@ -1154,6 +1247,9 @@ if (tryRelaunchAsWindowsAdmin()) {
           broadcastState(probeEngine.getSnapshot());
         }
       }, 1500).unref?.();
+    }).catch((err) => {
+      console.error('[App Startup Fatal]', err);
+      handlePostUpdateBootFatal(err);
     });
   }
 }
