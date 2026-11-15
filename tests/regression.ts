@@ -1,8 +1,8 @@
-import { app, nativeImage } from 'electron';
+import { app, nativeImage, Tray } from 'electron';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { spawn } from 'node:child_process';
+import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
 import { channel } from 'node:diagnostics_channel';
 import { ClientRequest } from 'node:http';
@@ -40,6 +40,21 @@ import {
 } from '../src/shared/countries';
 import { AppStateSnapshot, ClashProfileGroupOption, ProbeResult } from '../src/shared/types';
 import { createStatusTrayIcon, createWindowAppIcon } from '../electron/trayIcon';
+import {
+  AUTOSTART_ARG,
+  AUTOSTART_LOGON_DELAY,
+  buildScheduledTaskXml,
+  isLaunchedFromAutoStart,
+  shouldStartSilentlyInTray,
+} from '../electron/autoLaunch';
+import {
+  ELECTRON_FIRST_TRAY_UID,
+  parseTrayProbeStdout,
+  probeAndHealWindowsTray,
+  TrayHealthManager,
+  TrayWin32ProbeResult,
+  truncateTrayTooltipSafe,
+} from '../electron/trayHealth';
 import { countRunningClaudeProcesses } from '../electron/claudeController';
 import { runMihomoIntegration } from './mihomoIntegration';
 import { runClaudeVerificationRecoveryTests } from './claudeVerificationRecovery';
@@ -596,6 +611,389 @@ async function run(): Promise<void> {
       assert.equal(pixels[ring + 3], 255);
       if (status === 'ok') assert.ok(pixels[ring + 1] > pixels[ring + 2]);
       if (status === 'mismatch') assert.ok(pixels[ring + 2] > pixels[ring + 1]);
+    }
+  });
+
+  await check('开机自启静默托盘判定、计划任务延迟 XML 架构及托盘挂载自愈状态机准确无误', async () => {
+    const waitForCondition = async (
+      predicate: () => boolean,
+      label: string,
+      timeoutMs = 2500
+    ): Promise<void> => {
+      const deadline = Date.now() + timeoutMs;
+      while (Date.now() < deadline) {
+        if (predicate()) return;
+        await sleep(10);
+      }
+      assert.ok(predicate(), `等待条件超时：${label}`);
+    };
+
+    // 1. 启动参数判定：--autostart 与 --silent-tray 均应静默驻留托盘，手动启动与热更重启正常弹窗
+    assert.equal(isLaunchedFromAutoStart(['代理地区卫士.exe', AUTOSTART_ARG]), true);
+    assert.equal(isLaunchedFromAutoStart(['代理地区卫士.exe']), false);
+    assert.equal(shouldStartSilentlyInTray(['代理地区卫士.exe', AUTOSTART_ARG]), true);
+    assert.equal(
+      shouldStartSilentlyInTray(['electron.exe', '.', AUTOSTART_ARG, '--elevated-relaunch']),
+      true
+    );
+    assert.equal(shouldStartSilentlyInTray(['代理地区卫士.exe', '--silent-tray']), true);
+    assert.equal(shouldStartSilentlyInTray(['代理地区卫士.exe']), false);
+    assert.equal(shouldStartSilentlyInTray(['代理地区卫士.exe', '--updated-from=1.0.0']), false);
+
+    // 2. 计划任务 XML 校验：LogonTrigger 子节点顺序符合 XSD (Enabled -> UserId -> Delay)
+    const xmlWithUser = buildScheduledTaskXml(
+      {
+        execPath: 'C:\\Windows\\System32\\cmd.exe',
+        args: [AUTOSTART_ARG],
+        workingDir: 'C:\\Windows\\System32',
+      },
+      'TESTDOMAIN\\testuser'
+    );
+    const logonMatch = /<LogonTrigger>([\s\S]*?)<\/LogonTrigger>/.exec(xmlWithUser);
+    assert.ok(logonMatch, '应包含 LogonTrigger 节点');
+    const logonBody = logonMatch[1];
+    const enabledIdx = logonBody.indexOf('<Enabled>true</Enabled>');
+    const userIdx = logonBody.indexOf('<UserId>TESTDOMAIN\\testuser</UserId>');
+    const delayIdx = logonBody.indexOf(`<Delay>${AUTOSTART_LOGON_DELAY}</Delay>`);
+    assert.ok(
+      enabledIdx >= 0 && userIdx > enabledIdx && delayIdx > userIdx,
+      'LogonTrigger 节点顺序必须满足 XSD 约束'
+    );
+    assert.ok(xmlWithUser.includes('<RunLevel>HighestAvailable</RunLevel>'));
+    assert.ok(xmlWithUser.includes(`<Arguments>${AUTOSTART_ARG}</Arguments>`));
+
+    let isAdmin = false;
+    try {
+      execFileSync('fltmc.exe', [], { stdio: 'ignore', windowsHide: true, timeout: 1500 });
+      isAdmin = true;
+    } catch {
+      isAdmin = false;
+    }
+    if (isAdmin) {
+      const tempTaskName = `ProxyRegionGuard_XmlTest_${process.pid}`;
+      const tempXmlFile = path.join(dataDirectory, `${tempTaskName}.xml`);
+      const currentUserXml = buildScheduledTaskXml({
+        execPath: 'C:\\Windows\\System32\\cmd.exe',
+        args: ['/c', 'exit', '0'],
+        workingDir: 'C:\\Windows\\System32',
+      }).replace(
+        '<Enabled>true</Enabled>\r\n    <Hidden>false</Hidden>',
+        '<Enabled>false</Enabled>\r\n    <Hidden>false</Hidden>'
+      );
+      fs.writeFileSync(tempXmlFile, Buffer.from('\uFEFF' + currentUserXml, 'utf16le'));
+      try {
+        execFileSync('schtasks.exe', ['/Create', '/TN', tempTaskName, '/XML', tempXmlFile, '/F'], {
+          windowsHide: true,
+          stdio: 'ignore',
+          timeout: 5000,
+        });
+      } finally {
+        try {
+          execFileSync('schtasks.exe', ['/Delete', '/TN', tempTaskName, '/F'], {
+            windowsHide: true,
+            stdio: 'ignore',
+            timeout: 5000,
+          });
+        } catch {
+          // ignore cleanup
+        }
+        fs.rmSync(tempXmlFile, { force: true });
+      }
+    }
+
+    // 3. UTF-16 代理对安全截断、\0 空字符清洗与探测输出解析
+    assert.equal(truncateTrayTooltipSafe('正常\0带空字节', 127), '正常带空字节');
+    const prefix126 = '甲'.repeat(126);
+    const emojiOnBoundary = `${prefix126}🟢后续文本`; // '🟢' 占 index 126..127
+    const truncatedBoundary = truncateTrayTooltipSafe(emojiOnBoundary, 127);
+    assert.equal(truncatedBoundary.length, 126, '高代理项落在第 127 位时必须整对回退避免孤立半字');
+    const prefix125 = '乙'.repeat(125);
+    const emojiFits = `${prefix125}🟢后续文本`; // '🟢' 占 index 125..126，完整容纳于 127
+    assert.equal(truncateTrayTooltipSafe(emojiFits, 127), `${prefix125}🟢`);
+
+    assert.deepEqual(parseTrayProbeStdout('GUARD_TRAY_RESULT:1|1|14656|65812|1|1|1\r\n'), {
+      probeOk: true,
+      desktopInteractive: true,
+      taskbarReady: true,
+      explorerPid: 14656,
+      shellTrayHwnd: '65812',
+      hostFound: true,
+      iconAlive: true,
+      healed: true,
+    });
+    assert.equal(parseTrayProbeStdout('invalid-output'), null);
+
+    // 4. TrayHealthManager 状态机：
+    //    覆盖开机抢跑自愈、onHealed 同步重入 + 陈旧进程快照防误杀、在途 pendingRecheck 合并补检、
+    //    Explorer 重启/PID 复用恢复、重试耗尽慢轮询与新进程立即唤醒、隐藏窗口冷却判定
+    let alivePids = new Set<number>([4100]);
+    // 初始构造一个早于探测启动时刻的陈旧进程快照（其中只有旧进程，不含 4100），验证不会在 onHealed 同步重入时误清空 4100
+    let cachedSnapshot = {
+      entries: [{ imageName: 'explorer.exe', pid: 1099 }],
+      readAt: Date.now() - 5000,
+    };
+    const syncEvents: boolean[] = [];
+    const healedPids: number[] = [];
+    let exhaustedCallbackCount = 0;
+    let probeCalls = 0;
+    const queuedResults: Array<() => Promise<TrayWin32ProbeResult>> = [
+      // 第 1 次：开机瞬间任务栏未就绪
+      async () => ({
+        probeOk: true,
+        desktopInteractive: true,
+        taskbarReady: false,
+        explorerPid: 0,
+        shellTrayHwnd: '0',
+        hostFound: true,
+        iconAlive: false,
+        healed: false,
+      }),
+      // 第 2 次：SendMessageTimeout 假定在上一轮末异步生效，本轮 TryModifyTip 直接返回 iconAlive=true, healed=false，
+      // 由于处于 recoveringFromFailure 恢复期，仍必须按 effectiveHealed=true 全量同步菜单与记录日志
+      async () => ({
+        probeOk: true,
+        desktopInteractive: true,
+        taskbarReady: true,
+        explorerPid: 4100,
+        shellTrayHwnd: '1001',
+        hostFound: true,
+        iconAlive: true,
+        healed: false,
+      }),
+    ];
+
+    let mgr!: TrayHealthManager;
+    mgr = new TrayHealthManager({
+      isAutoStart: true,
+      getTooltip: () => '代理地区卫士 · 🟢 正常',
+      onSyncTray: (healed) => syncEvents.push(healed),
+      onHealed: (pid) => {
+        healedPids.push(pid);
+        // 模拟 main.ts 中 recordExternalLog -> emitState -> broadcastState -> checkContinuityFast 同步重入
+        mgr.checkContinuityFast();
+      },
+      onStartupRetriesExhausted: () => {
+        exhaustedCallbackCount++;
+      },
+      probeRunner: async () => {
+        probeCalls++;
+        const fn = queuedResults.shift();
+        if (fn) return fn();
+        return {
+          probeOk: true,
+          desktopInteractive: true,
+          taskbarReady: false,
+          explorerPid: 0,
+          shellTrayHwnd: '0',
+          hostFound: true,
+          iconAlive: false,
+          healed: false,
+        };
+      },
+      isPidAlive: (pid) => alivePids.has(pid),
+      getCachedProcessSnapshot: () => cachedSnapshot,
+      initialDelayMs: 10,
+      retryDelaysMs: [15, 20],
+      exhaustedPollIntervalMs: 80,
+      continuityIntervalMs: 0,
+      hideVerifyCooldownMs: 80,
+    });
+
+    try {
+      mgr.start();
+      await waitForCondition(
+        () => mgr.getVerifiedExplorerPid() === 4100,
+        '开机延迟就绪后自动重试并完成挂载验证（且不被陈旧进程表与同步重入误清空）'
+      );
+      assert.deepEqual(syncEvents, [true]);
+      assert.deepEqual(healedPids, [4100]);
+      assert.equal(exhaustedCallbackCount, 0);
+
+      // 模拟新鲜进程快照显示旧 PID 4100 已被 notepad.exe 复用，同时新 explorer.exe 为 8200
+      await sleep(5);
+      alivePids = new Set<number>([4100, 8200]);
+      cachedSnapshot = {
+        entries: [
+          { imageName: 'notepad.exe', pid: 4100 },
+          { imageName: 'explorer.exe', pid: 8200 },
+        ],
+        readAt: Date.now(),
+      };
+      queuedResults.push(async () => ({
+        probeOk: true,
+        desktopInteractive: true,
+        taskbarReady: true,
+        explorerPid: 8200,
+        shellTrayHwnd: '2002',
+        hostFound: true,
+        iconAlive: true,
+        healed: true,
+      }));
+      mgr.checkContinuityFast();
+      await waitForCondition(
+        () => mgr.getVerifiedExplorerPid() === 8200,
+        '旧 Explorer PID 被复用后自动重挂到新 Explorer'
+      );
+      assert.deepEqual(healedPids, [4100, 8200]);
+
+      // 测试在途探测期间并发触发 triggerCheckNow (pendingRecheck 不丢事件)
+      let releaseFirstInFlight!: () => void;
+      const firstInFlightGate = new Promise<void>((r) => {
+        releaseFirstInFlight = r;
+      });
+      let firstInFlightEntered = false;
+      alivePids = new Set<number>([8200, 8500]);
+      cachedSnapshot = {
+        entries: [{ imageName: 'explorer.exe', pid: 8500 }],
+        readAt: Date.now(),
+      };
+      queuedResults.push(
+        async () => {
+          firstInFlightEntered = true;
+          await firstInFlightGate;
+          // 首轮已完成自愈 (healed: true)，但因 pendingRecheck 交由第 2 轮复核；healed 标记必须跨轮保留不丢失
+          return {
+            probeOk: true,
+            desktopInteractive: true,
+            taskbarReady: true,
+            explorerPid: 8200,
+            shellTrayHwnd: '2002',
+            hostFound: true,
+            iconAlive: true,
+            healed: true,
+          };
+        },
+        async () => ({
+          probeOk: true,
+          desktopInteractive: true,
+          taskbarReady: true,
+          explorerPid: 8500,
+          shellTrayHwnd: '2500',
+          hostFound: true,
+          iconAlive: true,
+          healed: false,
+        })
+      );
+      const p1 = mgr.triggerCheckNow();
+      await waitForCondition(() => firstInFlightEntered, '进入首轮在途探测');
+      const p2 = mgr.triggerCheckNow(); // 在途期间再次请求，应置 pendingRecheck 并紧接跑第 2 轮
+      releaseFirstInFlight();
+      const finalInFlightRes = await Promise.all([p1, p2]);
+      assert.equal(finalInFlightRes[1].explorerPid, 8500);
+      assert.equal(mgr.getVerifiedExplorerPid(), 8500, '在途期间并发请求必须补跑最新探测结果');
+      assert.deepEqual(healedPids, [4100, 8200, 8500], '首轮在途 healed 状态跨轮交接后仍应触发 onHealed');
+
+      // 测试隐藏主窗口到托盘：冷却期内跳过复核，超过冷却期触发静默复核
+      const callsBeforeCooldownCheck = probeCalls;
+      mgr.ensureHealthyOnHideToTray();
+      await sleep(20);
+      assert.equal(probeCalls, callsBeforeCooldownCheck, '冷却期内关闭窗口不应重复派生子进程探测');
+
+      await sleep(75);
+      const syncLenBeforeCooldownRefresh = syncEvents.length;
+      queuedResults.push(async () => ({
+        probeOk: true,
+        desktopInteractive: true,
+        taskbarReady: true,
+        explorerPid: 8500,
+        shellTrayHwnd: '2500',
+        hostFound: true,
+        iconAlive: true,
+        healed: false,
+      }));
+      mgr.ensureHealthyOnHideToTray();
+      await waitForCondition(
+        () => syncEvents.length === syncLenBeforeCooldownRefresh + 1,
+        '超过冷却期关闭窗口应触发后台静默复核'
+      );
+      assert.equal(probeCalls, callsBeforeCooldownCheck + 1);
+      assert.equal(syncEvents[syncEvents.length - 1], false);
+
+      // 模拟同 PID 慢初始化：Explorer 进程 9300 已存在但任务栏在快速重试耗尽后才就绪，慢轮询必须自动恢复而非锁死
+      alivePids = new Set<number>();
+      cachedSnapshot = {
+        entries: [{ imageName: 'explorer.exe', pid: 9300 }],
+        readAt: Date.now() + 100,
+      };
+      const callsBeforeExhaust = probeCalls;
+      mgr.checkContinuityFast();
+      // 等待 1 次初检 + 2 次快速重试 (retryDelaysMs 长度 2) 全部耗尽进入慢轮询
+      await waitForCondition(
+        () => probeCalls >= callsBeforeExhaust + 3 && mgr.getVerifiedExplorerPid() === null,
+        '快速重试耗尽进入慢轮询待命'
+      );
+      alivePids = new Set<number>([9300]);
+      queuedResults.push(async () => ({
+        probeOk: true,
+        desktopInteractive: true,
+        taskbarReady: true,
+        explorerPid: 9300,
+        shellTrayHwnd: '3003',
+        hostFound: true,
+        iconAlive: true,
+        healed: true,
+      }));
+      await waitForCondition(
+        () => mgr.getVerifiedExplorerPid() === 9300,
+        '同 PID 慢启动任务栏在重试耗尽后仍可通过兜底慢轮询自动挂载'
+      );
+    } finally {
+      mgr.stop();
+    }
+
+    // 5. 首次启动重试耗尽回调与异常容错校验
+    let startupExhaustedArg: TrayWin32ProbeResult | null = null;
+    const exhaustMgr = new TrayHealthManager({
+      isAutoStart: true,
+      getTooltip: () => '异常容错测试\0',
+      onSyncTray: () => {},
+      onStartupRetriesExhausted: (lastRes) => {
+        startupExhaustedArg = lastRes;
+      },
+      probeRunner: async () => ({
+        probeOk: true,
+        desktopInteractive: true,
+        taskbarReady: false,
+        explorerPid: 0,
+        shellTrayHwnd: '0',
+        hostFound: true,
+        iconAlive: false,
+        healed: false,
+      }),
+      initialDelayMs: 5,
+      retryDelaysMs: [10],
+      exhaustedPollIntervalMs: 0,
+      continuityIntervalMs: 0,
+    });
+    try {
+      exhaustMgr.start();
+      await waitForCondition(() => startupExhaustedArg !== null, '首次启动重试耗尽应触发兜底回调');
+      assert.equal(startupExhaustedArg!.desktopInteractive, true);
+    } finally {
+      exhaustMgr.stop();
+    }
+
+    // 6. 真实 Electron Tray + Win32 P/Invoke 桥接端到端冒烟校验
+    const liveTray = new Tray(createStatusTrayIcon('ok'));
+    try {
+      const longEmojiTip = `${'代理地区卫士 · 🟢 状态正常\n'.repeat(10)}🔒198.51.100.1\0`;
+      liveTray.setToolTip(longEmojiTip.replace(/\0/g, ''));
+      const bridgeRes = await probeAndHealWindowsTray(
+        process.pid,
+        ELECTRON_FIRST_TRAY_UID,
+        longEmojiTip
+      );
+      assert.equal(bridgeRes.probeOk, true, 'Win32 P/Invoke 桥接脚本必须无错编译并输出结构化结果');
+      assert.equal(
+        bridgeRes.hostFound,
+        true,
+        'Win32 桥接必须准确识别当前进程的 Electron_NotifyIconHostWindow 消息宿主窗口'
+      );
+      if (bridgeRes.taskbarReady) {
+        assert.equal(bridgeRes.iconAlive, true, '桌面任务栏就绪时 uID=3 托盘图标必须在线可访问');
+      }
+    } finally {
+      liveTray.destroy();
     }
   });
 

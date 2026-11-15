@@ -4,15 +4,25 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 
-const AUTOSTART_ARG = '--autostart';
+export const AUTOSTART_ARG = '--autostart';
+export const SILENT_TRAY_ARG = '--silent-tray';
+export const AUTOSTART_LOGON_DELAY = 'PT5S';
 const REGISTRY_VALUE_NAME = 'ProxyRegionGuard';
 const SCHEDULED_TASK_NAME = 'ProxyRegionGuard';
 const RUN_REG_KEY = 'HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run';
 
-interface LaunchTarget {
+export interface LaunchTarget {
   execPath: string;
   args: string[];
   workingDir: string;
+}
+
+export function isLaunchedFromAutoStart(argv: readonly string[] = process.argv): boolean {
+  return argv.includes(AUTOSTART_ARG);
+}
+
+export function shouldStartSilentlyInTray(argv: readonly string[] = process.argv): boolean {
+  return argv.includes(SILENT_TRAY_ARG) || isLaunchedFromAutoStart(argv);
 }
 
 function escapeXml(raw: string): string {
@@ -53,8 +63,14 @@ function getCurrentWindowsUserPrincipal(): string {
   return username;
 }
 
-function buildScheduledTaskXml(target: LaunchTarget): string {
-  const userPrincipal = getCurrentWindowsUserPrincipal();
+export function buildScheduledTaskXml(
+  target: LaunchTarget,
+  userPrincipalOverride?: string
+): string {
+  const userPrincipal =
+    userPrincipalOverride !== undefined
+      ? userPrincipalOverride.trim()
+      : getCurrentWindowsUserPrincipal();
   const quotedCommand = `"${target.execPath}"`;
   const argsText = target.args.join(' ');
 
@@ -62,6 +78,7 @@ function buildScheduledTaskXml(target: LaunchTarget): string {
     ? `<UserId>${escapeXml(userPrincipal)}</UserId>`
     : '';
 
+  // 注意：Task Scheduler 1.2 XSD 严格要求 LogonTrigger 子元素顺序为 Enabled -> UserId -> Delay
   return [
     '<?xml version="1.0" encoding="UTF-16"?>',
     '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">',
@@ -69,6 +86,7 @@ function buildScheduledTaskXml(target: LaunchTarget): string {
     '    <LogonTrigger>',
     '      <Enabled>true</Enabled>',
     userIdNode ? `      ${userIdNode}` : '',
+    `      <Delay>${AUTOSTART_LOGON_DELAY}</Delay>`,
     '    </LogonTrigger>',
     '  </Triggers>',
     '  <Principals>',

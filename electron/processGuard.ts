@@ -60,6 +60,17 @@ const PROCESS_LIST_CACHE_TTL_MS = 800;
 let cachedProcList: { entries: RunningProcEntry[]; readAt: number } | null = null;
 let inflightProcListPromise: Promise<RunningProcEntry[]> | null = null;
 
+export interface CachedProcessSnapshot {
+  entries: RunningProcEntry[];
+  readAt: number;
+}
+
+export function getCachedRunningProcessesSnapshot(): CachedProcessSnapshot | null {
+  return cachedProcList
+    ? { entries: cachedProcList.entries, readAt: cachedProcList.readAt }
+    : null;
+}
+
 export function parseTasklistCsvOutput(
   stdout: Buffer | string | null | undefined
 ): RunningProcEntry[] {

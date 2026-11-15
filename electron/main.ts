@@ -19,8 +19,11 @@ import { ProbeEngine } from './probeEngine';
 import { createStatusTrayIcon, createWindowAppIcon } from './trayIcon';
 import {
   applyAutoLaunchSetting,
+  isLaunchedFromAutoStart,
   reconcileAutoLaunchOnStartup,
+  shouldStartSilentlyInTray,
 } from './autoLaunch';
+import { TrayHealthManager } from './trayHealth';
 import { UpdaterService } from './updaterService';
 
 const ELEVATED_RELAUNCH_FLAG = '--elevated-relaunch';
@@ -116,6 +119,7 @@ const ALERT_HIDDEN_DESTROY_DELAY_MS = 8000;
 let mainWindow: BrowserWindow | null = null;
 let alertWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
+let trayHealth: TrayHealthManager | null = null;
 let isQuitting = false;
 let isBootstrapped = false;
 
@@ -133,6 +137,7 @@ let alertLoadHooked = false;
 let alertUserDragged = false;
 let suppressAlertMoveTrack = false;
 let lastTrayMenuSignature = '';
+let latestTrayTooltip = '代理地区卫士 · 正在初始化...';
 
 function clearMainDestroyTimer(): void {
   if (mainDestroyTimer) {
@@ -149,6 +154,7 @@ function clearAlertDestroyTimer(): void {
 }
 
 function hideMainWindowToTray(): void {
+  trayHealth?.ensureHealthyOnHideToTray();
   if (!mainWindow || mainWindow.isDestroyed()) return;
   mainWindow.hide();
   clearMainDestroyTimer();
@@ -472,7 +478,8 @@ function notifyAlertRecovered(payload: AlertPayload): void {
 function setupTray(): void {
   const initialIcon = createStatusTrayIcon('checking');
   tray = new Tray(initialIcon);
-  tray.setToolTip('代理地区卫士 · 正在初始化...');
+  latestTrayTooltip = '代理地区卫士 · 正在初始化...';
+  tray.setToolTip(latestTrayTooltip);
 
   tray.on('click', () => {
     if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() && mainWindow.isFocused()) {
@@ -487,6 +494,46 @@ function setupTray(): void {
   });
 
   refreshTrayFromState(probeEngine.getSnapshot());
+
+  trayHealth?.stop();
+  trayHealth = new TrayHealthManager({
+    isAutoStart: isLaunchedFromAutoStart(process.argv),
+    getTooltip: () => latestTrayTooltip,
+    onSyncTray: (healed) => {
+      if (!tray || isQuitting) return;
+      if (healed) {
+        lastTrayMenuSignature = '';
+        refreshTrayFromState(probeEngine.getSnapshot());
+      } else {
+        tray.setToolTip(latestTrayTooltip);
+      }
+    },
+    onHealed: () => {
+      probeEngine?.recordExternalLog(
+        'info',
+        '检测到系统托盘延迟就绪或资源管理器重启，已自动恢复任务栏托盘图标'
+      );
+    },
+    onStartupRetriesExhausted: (lastRes) => {
+      if (
+        isQuitting ||
+        !shouldStartSilentlyInTray(process.argv) ||
+        !lastRes.probeOk ||
+        lastRes.iconAlive ||
+        !lastRes.desktopInteractive
+      ) {
+        return;
+      }
+      if (!mainWindow || mainWindow.isDestroyed()) {
+        probeEngine?.recordExternalLog(
+          'warn',
+          '系统托盘长时间未就绪，已自动打开主控制面板以防后台不可达'
+        );
+        showMainWindow();
+      }
+    },
+  });
+  trayHealth.start();
 }
 
 function refreshTrayFromState(state: AppStateSnapshot): void {
@@ -578,6 +625,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     .filter(Boolean)
     .join('\n');
 
+  latestTrayTooltip = tooltip;
   tray.setToolTip(tooltip);
 
   const probeValid = Boolean(
@@ -798,6 +846,8 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
         : '完全退出程序 (保持 Antigravity 运行)',
       click: () => {
         isQuitting = true;
+        trayHealth?.stop();
+        updaterService?.stop();
         probeEngine?.stop();
         app.quit();
       },
@@ -808,6 +858,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
 }
 
 function broadcastState(state: AppStateSnapshot): void {
+  trayHealth?.checkContinuityFast();
   refreshTrayFromState(state);
   if (mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible()) {
     mainWindow.webContents.send('guard:state-changed', state);
@@ -1015,6 +1066,8 @@ function registerIpcHandlers(): void {
       hideMainWindowToTray();
     } else {
       isQuitting = true;
+      trayHealth?.stop();
+      updaterService?.stop();
       probeEngine?.stop();
       app.quit();
     }
@@ -1056,6 +1109,7 @@ if (tryRelaunchAsWindowsAdmin()) {
         probeEngine,
         onQuitForUpdate: () => {
           isQuitting = true;
+          trayHealth?.stop();
           updaterService?.stop();
           probeEngine?.stop();
           app.quit();
@@ -1077,7 +1131,7 @@ if (tryRelaunchAsWindowsAdmin()) {
       registerIpcHandlers();
       isBootstrapped = true;
 
-      if (!process.argv.includes('--silent-tray')) {
+      if (!shouldStartSilentlyInTray(process.argv)) {
         createMainWindow(true);
       }
       setupTray();
@@ -1106,11 +1160,13 @@ if (tryRelaunchAsWindowsAdmin()) {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  trayHealth?.stop();
   updaterService?.stop();
   probeEngine?.stop();
 });
 
 app.on('will-quit', () => {
+  trayHealth?.stop();
   updaterService?.stop();
   probeEngine?.stop();
 });

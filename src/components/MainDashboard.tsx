@@ -2810,7 +2810,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>开机自动启动</strong>
-                  <p>登录 Windows 时自动运行本程序</p>
+                  <p>登录 Windows 时自动在系统托盘静默运行守护</p>
                 </div>
                 <input
                   type="checkbox"
