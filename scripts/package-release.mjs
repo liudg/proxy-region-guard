@@ -353,7 +353,7 @@ function findPidsInDirectory(targetDir) {
   if (process.platform !== 'win32' || !fs.existsSync(targetDir)) return [];
   try {
     const ps = [
-      '$prefix = ([System.IO.Path]::GetFullPath($env:GUARD_TARGET_DIR)).TrimEnd("\\") + "\\"',
+      '$prefix = (Get-Item -LiteralPath $env:GUARD_TARGET_DIR -Force).FullName.TrimEnd("\\") + "\\"',
       'Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([System.IO.Path]::GetFullPath($_.Path)).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $_.Id }',
     ].join('; ');
     const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {

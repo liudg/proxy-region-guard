@@ -783,6 +783,7 @@ async function run(): Promise<void> {
           ...probe,
           claudeTraceLoc: probe.countryCode,
           claudeTraceIp: probe.ip,
+          claudeTraceCheckedAt: Date.now(),
           regionMismatchDetail: null,
         };
         return;

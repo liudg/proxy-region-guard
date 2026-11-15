@@ -737,6 +737,21 @@ export async function runUpdaterRegressionTests(
       const stagedZipFailCopy = path.join(fullFailStage, 'release.zip.staged');
       fs.copyFileSync(fullZipPath, stagedZipFailCopy);
 
+      // 显式转换为 Windows 8.3 短路径（如 RUNNER~1 / FULL-Z~1），复现并回归防护 CI 环境 Get-ChildItem 长路径偏移 Bug
+      const toShortPathIfSupported = (p: string): string => {
+        try {
+          const out = execFileSync('cmd.exe', ['/d', '/c', `for %I in ("${p}") do @echo %~sI`], {
+            encoding: 'utf-8',
+            windowsHide: true,
+          }).trim();
+          return out && fs.existsSync(out) ? out : p;
+        } catch {
+          return p;
+        }
+      };
+      const shortFullTargetDir = toShortPathIfSupported(fullTargetDir);
+      const shortFullFailStage = toShortPathIfSupported(fullFailStage);
+
       let fullRollbackCode = 0;
       try {
         execFileSync(
@@ -749,17 +764,17 @@ export async function runUpdaterRegressionTests(
               GUARD_UPD_SCRIPT_GZ: scriptGzB64,
               GUARD_UPD_PID: '0',
               GUARD_UPD_MODE: 'full-zip',
-              GUARD_UPD_APP_DIR: fullTargetDir,
-              GUARD_UPD_RES_DIR: path.join(fullTargetDir, 'resources'),
+              GUARD_UPD_APP_DIR: shortFullTargetDir,
+              GUARD_UPD_RES_DIR: path.join(shortFullTargetDir, 'resources'),
               GUARD_UPD_EXE_PATH: crashCmd,
               GUARD_UPD_FROM_VER: '1.0.0',
               GUARD_UPD_TO_VER: '2.0.0',
               GUARD_UPD_STAGED_ASAR: '',
               GUARD_UPD_STAGED_MMDB: '',
-              GUARD_UPD_STAGED_ZIP: stagedZipFailCopy,
+              GUARD_UPD_STAGED_ZIP: path.join(shortFullFailStage, 'release.zip.staged'),
               GUARD_UPD_ZIP_SHA256: sha256Hex(fullZipRaw),
-              GUARD_UPD_STAGE_DIR: fullFailStage,
-              GUARD_UPD_READY_FILE: path.join(fullFailStage, 'boot-ready.ok'),
+              GUARD_UPD_STAGE_DIR: shortFullFailStage,
+              GUARD_UPD_READY_FILE: path.join(shortFullFailStage, 'boot-ready.ok'),
               GUARD_UPD_SKIP_RELAUNCH: '0',
               GUARD_UPD_BOOT_CHECK_MS: '600',
             },
