@@ -31,6 +31,12 @@ const api: GuardBridgeAPI = {
   terminateAntigravityNow: () => ipcRenderer.invoke('guard:terminate-antigravity'),
   browseAntigravityExe: () => ipcRenderer.invoke('guard:browse-antigravity-exe'),
 
+  checkForUpdates: () => ipcRenderer.invoke('guard:check-for-updates'),
+  downloadUpdate: () => ipcRenderer.invoke('guard:download-update'),
+  applyUpdateNow: (allowTerminateClaude?: boolean) =>
+    ipcRenderer.invoke('guard:apply-update', allowTerminateClaude),
+  openReleasePage: () => ipcRenderer.invoke('guard:open-release-page'),
+
   minimizeMain: () => ipcRenderer.send('window:minimize-main'),
   closeMain: () => ipcRenderer.send('window:close-main'),
   openMainFromAlert: () => ipcRenderer.send('window:open-main-from-alert'),
@@ -51,6 +57,17 @@ const api: GuardBridgeAPI = {
     ipcRenderer.on('guard:alert-data', handler);
     return () => {
       ipcRenderer.removeListener('guard:alert-data', handler);
+    };
+  },
+
+  onNavigateToUpdate: (cb: (opts: { confirmClaude?: boolean }) => void) => {
+    const handler = (
+      _event: Electron.IpcRendererEvent,
+      opts: { confirmClaude?: boolean }
+    ) => cb(opts || {});
+    ipcRenderer.on('guard:navigate-to-update', handler);
+    return () => {
+      ipcRenderer.removeListener('guard:navigate-to-update', handler);
     };
   },
 };

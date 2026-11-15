@@ -1,3 +1,4 @@
+import { app } from 'electron';
 import { EventEmitter } from 'node:events';
 import * as net from 'node:net';
 import { setTimeout as sleep } from 'node:timers/promises';
@@ -14,8 +15,10 @@ import {
   GuardStatus,
   LocaleSyncResult,
   ProbeResult,
+  UpdateStateSnapshot,
   WindowsLocaleState,
 } from '../src/shared/types';
+import { DEFAULT_GITHUB_RELEASES_PAGE_URL } from '../src/shared/updateManifest';
 import {
   getCountryNameZh,
   isValidIsoCountryCode,
@@ -209,6 +212,7 @@ export class ProbeEngine extends EventEmitter {
   private lastGuardFailSignature: string | null = null;
   private claudeReboundDuringProbe = false;
   private antigravityReboundDuringProbe = false;
+  private updateStateProvider: (() => UpdateStateSnapshot) | null = null;
   private targetVerifyCache = new Map<
     string,
     {
@@ -2374,6 +2378,94 @@ export class ProbeEngine extends EventEmitter {
     return null;
   }
 
+  public setUpdateStateProvider(provider: () => UpdateStateSnapshot): void {
+    this.updateStateProvider = provider;
+  }
+
+  public recordExternalLog(
+    level: GuardEventLog['level'],
+    message: string,
+    broadcast = true
+  ): void {
+    this.addLog(level, message);
+    if (broadcast) {
+      this.emitState();
+    }
+  }
+
+  public notifyExternalStateChanged(): void {
+    this.emitState();
+  }
+
+  public async isClaudeActiveForUpdateInterlock(): Promise<boolean> {
+    if (this.claudeRunning || this.claudeAuthorizedSession) {
+      return true;
+    }
+    const live = await countRunningClaudeProcesses(true);
+    if (live.running) {
+      this.claudeRunning = true;
+      this.claudeProcessCount = live.count;
+      this.claudeRunningPids = live.pids;
+      return true;
+    }
+    return false;
+  }
+
+  public async resolveUpdateDownloadProxies(
+    targetUrl?: string
+  ): Promise<Array<{ proxyUrl: string | null; label: string }>> {
+    if (targetUrl) {
+      try {
+        const parsed = new URL(targetUrl);
+        const h = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+        if (h === '127.0.0.1' || h === 'localhost' || h === '::1') {
+          return [{ proxyUrl: null, label: '本机回环直连' }];
+        }
+      } catch {
+        // ignore invalid url and fall through
+      }
+    }
+
+    const cfg = this.configStore.get();
+    if (cfg.proxyMode === 'direct') {
+      return [{ proxyUrl: null, label: '本机直连 / TUN' }];
+    }
+
+    const out: Array<{ proxyUrl: string | null; label: string }> = [];
+    const seen = new Set<string>();
+    const pushUnique = (proxyUrl: string | null, label: string) => {
+      const key = proxyUrl || '__DIRECT__';
+      if (seen.has(key)) return;
+      seen.add(key);
+      out.push({ proxyUrl, label });
+    };
+
+    if (cfg.proxyMode === 'manual') {
+      const scheme = cfg.manualProxy.protocol === 'socks5' ? 'socks5h' : 'http';
+      const host = formatHostForUrl(cfg.manualProxy.host);
+      pushUnique(
+        `${scheme}://${host}:${cfg.manualProxy.port}`,
+        `手动代理 (${host}:${cfg.manualProxy.port})`
+      );
+    }
+
+    const clash = this.clashMonitor.getRuntimeInfo();
+    if (clash.connected && clash.mixedPort) {
+      pushUnique(
+        `http://127.0.0.1:${clash.mixedPort}`,
+        `Clash 混合端口 (127.0.0.1:${clash.mixedPort})`
+      );
+    }
+
+    const sys = await this.getSystemProxyFresh(false);
+    if (sys.enabled && sys.proxyUrl) {
+      pushUnique(sys.proxyUrl, 'Windows 系统代理');
+    }
+
+    pushUnique(null, '本机直连 / TUN');
+    return out;
+  }
+
   public getSnapshot(): AppStateSnapshot {
     const clashInfo = this.clashMonitor.getRuntimeInfo();
     return {
@@ -2387,6 +2479,9 @@ export class ProbeEngine extends EventEmitter {
       clashInfo,
       claudeState: this.buildClaudeRuntimeState(clashInfo),
       antigravityState: this.buildAntigravityRuntimeState(clashInfo),
+      updateState: this.updateStateProvider
+        ? this.updateStateProvider()
+        : createFallbackUpdateStateSnapshot(),
       geoDbSource: this.geoIp.getSourceDescription(),
       logs: [...this.logs],
     };
@@ -3477,6 +3572,28 @@ export class ProbeEngine extends EventEmitter {
   private emitState(): void {
     this.emit('state-changed', this.getSnapshot());
   }
+}
+
+function createFallbackUpdateStateSnapshot(): UpdateStateSnapshot {
+  return {
+    currentVersion: app.getVersion() || '1.0.0',
+    electronVersion: process.versions.electron || '0.0.0',
+    isPackaged: app.isPackaged,
+    status: 'idle',
+    latestVersion: null,
+    publishedAt: null,
+    releaseNotes: null,
+    deliveryMode: null,
+    includeMmdbUpdate: false,
+    downloadTotalBytes: null,
+    downloadedBytes: 0,
+    progressPercent: null,
+    signatureVerified: false,
+    lastCheckedAt: null,
+    viaChannel: null,
+    error: null,
+    releasePageUrl: DEFAULT_GITHUB_RELEASES_PAGE_URL,
+  };
 }
 
 function parseTraceResponse(

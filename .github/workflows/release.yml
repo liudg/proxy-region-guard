@@ -1,0 +1,154 @@
+name: Release Build & Update Publish
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: '手动发版版本递增方式（日常本地打 v* Tag 推送即可自动触发，此处为网页备用入口）'
+        required: true
+        default: 'patch'
+        type: choice
+        options:
+          - patch
+          - minor
+          - major
+          - current
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-windows:
+    name: Build, Sign & Publish Windows Release
+    runs-on: windows-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository with full history & tags
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install project dependencies
+        run: npm ci
+
+      - name: Resolve version & prepare local package metadata
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_BUMP: ${{ inputs.bump }}
+          GH_REF_NAME: ${{ github.ref_name }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          if ($env:EVENT_NAME -eq "workflow_dispatch") {
+            if ($env:INPUT_BUMP -and ($env:INPUT_BUMP -ne "current")) {
+              npm version $env:INPUT_BUMP --no-git-tag-version | Out-Null
+            }
+            $pkg = Get-Content -Raw package.json | ConvertFrom-Json
+            $ver = $pkg.version.Trim()
+            $tag = "v$ver"
+          } else {
+            $ver = $env:GH_REF_NAME -replace '^v', ''
+            $tag = "v$ver"
+          }
+
+          $strictSemverPattern = '^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-((?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*)(?:\.(?:0|[1-9]\d*|\d*[a-zA-Z-][0-9a-zA-Z-]*))*))?$'
+          if ($ver -notmatch $strictSemverPattern) {
+            throw "严格 SemVer 版本号校验不通过: $ver"
+          }
+
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          Write-Host "Target Release: $tag (version=$ver)"
+
+      - name: Sync latest GeoLite2 Country offline IP database
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          npm install "@ip-location-db/geolite2-country-mmdb@latest" --no-save --ignore-scripts
+          $mmdbPkg = Get-Content -Raw node_modules/@ip-location-db/geolite2-country-mmdb/package.json | ConvertFrom-Json
+          Write-Host "Bundling latest @ip-location-db/geolite2-country-mmdb@$($mmdbPkg.version)"
+
+      - name: TypeScript static check
+        run: npx tsc --noEmit
+
+      - name: Run Windows regression & update verification suite
+        env:
+          GUARD_CI: '1'
+        run: npm test
+
+      - name: Generate structured Release Notes
+        env:
+          REL_TAG: ${{ steps.meta.outputs.tag }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          node scripts/generate-release-notes.mjs --tag $env:REL_TAG --out release/release-notes.md
+          Get-Content release/release-notes.md
+
+      - name: Package green distribution, ASAR hot-update & signed latest.json
+        env:
+          UPDATE_SIGNING_PRIVATE_KEY: ${{ secrets.UPDATE_SIGNING_PRIVATE_KEY }}
+          REL_VERSION: ${{ steps.meta.outputs.version }}
+          GH_REPO: ${{ github.repository }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          node scripts/package-release.mjs `
+            --version $env:REL_VERSION `
+            --repo $env:GH_REPO `
+            --notes-file release/release-notes.md `
+            --require-signature
+
+      - name: Commit & push release tag after build & signature verification (workflow_dispatch only)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_REF_NAME: ${{ github.ref_name }}
+          REL_TAG: ${{ steps.meta.outputs.tag }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          $status = git status --porcelain package.json package-lock.json
+          if ($status) {
+            git add package.json package-lock.json
+            git commit -m "chore(release): $($env:REL_TAG)"
+            git push origin "HEAD:refs/heads/$($env:GH_REF_NAME)"
+          }
+
+          $remoteTag = git ls-remote --tags origin "refs/tags/$($env:REL_TAG)"
+          if (-not $remoteTag) {
+            git tag -f $env:REL_TAG
+            git push origin "refs/tags/$($env:REL_TAG)"
+          }
+
+      - name: Publish assets to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.meta.outputs.tag }}
+          name: 代理地区卫士 ${{ steps.meta.outputs.tag }}
+          body_path: release/release-notes.md
+          draft: false
+          prerelease: ${{ contains(steps.meta.outputs.version, '-') }}
+          fail_on_unmatched_files: true
+          files: |
+            release/ProxyRegionGuard-v${{ steps.meta.outputs.version }}-win32-x64.zip
+            release/app-v${{ steps.meta.outputs.version }}.asar.gz
+            release/geolite2-country.mmdb.gz
+            release/latest.json

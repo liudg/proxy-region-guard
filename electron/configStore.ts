@@ -37,6 +37,8 @@ export const DEFAULT_CONFIG: AppConfig = {
   antigravityClashProfileName: null,
   antigravityDedicatedPort: 27898,
   antigravityExePath: '',
+  autoCheckUpdates: true,
+  useUpdateMirrorFallback: true,
 };
 
 function sanitizePatternList(raw: unknown): string[] {
@@ -153,6 +155,16 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
   const antigravityExePath =
     typeof raw.antigravityExePath === 'string' ? raw.antigravityExePath.trim() : '';
 
+  const autoCheckUpdates =
+    typeof raw.autoCheckUpdates === 'boolean'
+      ? raw.autoCheckUpdates
+      : DEFAULT_CONFIG.autoCheckUpdates;
+
+  const useUpdateMirrorFallback =
+    typeof raw.useUpdateMirrorFallback === 'boolean'
+      ? raw.useUpdateMirrorFallback
+      : DEFAULT_CONFIG.useUpdateMirrorFallback;
+
   return {
     defaultCountryCode: normalizedCode,
     defaultCountryName: normalizedCode ? getCountryNameZh(normalizedCode) : null,
@@ -201,6 +213,8 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     antigravityClashProfileName,
     antigravityDedicatedPort,
     antigravityExePath,
+    autoCheckUpdates,
+    useUpdateMirrorFallback,
   };
 }
 

@@ -46,6 +46,10 @@ export interface AppConfig {
   antigravityClashProfileName: string | null; // Antigravity 选定节点所属的 Clash 订阅组名称
   antigravityDedicatedPort: number;           // Antigravity 独立专属本地代理端口（默认 27898）
   antigravityExePath: string;                 // 自定义 Antigravity.exe 启动路径（留空则自动探测）
+
+  // 版本更新配置
+  autoCheckUpdates: boolean;                  // 启动与后台定时静默检查更新并预下载轻量增量包
+  useUpdateMirrorFallback: boolean;           // GitHub 直连与代理失败时允许经由镜像加速下载（强制公钥验签）
 }
 
 export interface WindowsLocaleState {
@@ -199,6 +203,44 @@ export interface AlertPayload {
   timestamp: number;
 }
 
+export type UpdateStatus =
+  | 'idle'
+  | 'checking'
+  | 'up-to-date'
+  | 'available'
+  | 'downloading'
+  | 'downloaded'
+  | 'applying'
+  | 'error';
+
+export type UpdateDeliveryMode = 'asar' | 'full-zip';
+
+export interface UpdateStateSnapshot {
+  currentVersion: string;
+  electronVersion: string;
+  isPackaged: boolean;
+  status: UpdateStatus;
+  latestVersion: string | null;
+  publishedAt: string | null;
+  releaseNotes: string | null;
+  deliveryMode: UpdateDeliveryMode | null;
+  includeMmdbUpdate: boolean;
+  downloadTotalBytes: number | null;
+  downloadedBytes: number;
+  progressPercent: number | null;
+  signatureVerified: boolean;
+  lastCheckedAt: number | null;
+  viaChannel: string | null;
+  error: string | null;
+  releasePageUrl: string;
+}
+
+export interface UpdateActionResult {
+  ok: boolean;
+  message: string;
+  state: AppStateSnapshot;
+}
+
 export interface AppStateSnapshot {
   status: GuardStatus;
   isChecking: boolean;
@@ -210,6 +252,7 @@ export interface AppStateSnapshot {
   clashInfo: ClashRuntimeInfo;
   claudeState: ClaudeRuntimeState;
   antigravityState: AntigravityRuntimeState;
+  updateState: UpdateStateSnapshot;
   geoDbSource: string;
   logs: GuardEventLog[];
 }
@@ -260,6 +303,11 @@ export interface GuardBridgeAPI {
   launchAntigravity: () => Promise<AntigravityLaunchResult>;
   terminateAntigravityNow: () => Promise<AntigravityLaunchResult>;
   browseAntigravityExe: () => Promise<AppStateSnapshot>;
+  // 版本更新控制
+  checkForUpdates: () => Promise<UpdateActionResult>;
+  downloadUpdate: () => Promise<UpdateActionResult>;
+  applyUpdateNow: (allowTerminateClaude?: boolean) => Promise<UpdateActionResult>;
+  openReleasePage: () => Promise<void>;
   // 窗口控制（主面板与自绘警告窗通用）
   minimizeMain: () => void;
   closeMain: () => void;
@@ -270,6 +318,7 @@ export interface GuardBridgeAPI {
   // 事件订阅
   onStateChanged: (cb: (state: AppStateSnapshot) => void) => () => void;
   onAlertData: (cb: (payload: AlertPayload) => void) => () => void;
+  onNavigateToUpdate: (cb: (opts: { confirmClaude?: boolean }) => void) => () => void;
 }
 
 declare global {

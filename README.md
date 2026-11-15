@@ -45,9 +45,24 @@ npm run build
 # 运行 Windows 回归检查
 npm test
 
-# 打包 Windows x64 绿色免安装发行版（输出至 release/代理地区卫士-win32-x64）
+# 打包 Windows x64 绿色免安装发行版与签名增量更新资产（输出至 release/）
 npm run package
+
+# 生成（或轮换）Ed25519 在线更新签名公私钥对
+npm run keygen
 ```
+
+## 自动发版与端内更新机制 (GitHub Actions)
+
+1. **首次配置签名私钥**：在仓库 `Settings -> Secrets and variables -> Actions` 中新建 Secret `UPDATE_SIGNING_PRIVATE_KEY`，填入本地 `.keys/update-signing-private.key`（由 `npm run keygen` 生成，已被 `.gitignore` 忽略）中的单行 Base64 私钥。
+2. **日常推送发版**：
+   ```powershell
+   # 自动递增版本号 (patch / minor / major) 并生成对应 v* 标签
+   npm version patch
+   git push origin main --follow-tags
+   ```
+   推送 `v*` 标签后，GitHub Actions ([release.yml](./.github/workflows/release.yml)) 将自动拉取最新 `GeoLite2-Country` 离线库、执行类型与回归验证、产出绿色完整包 (`ProxyRegionGuard-v*-win32-x64.zip`)、轻量热更包 (`app-v*.asar.gz`, 约 200KB) 与 Ed25519 签名清单 (`latest.json`) 并发布至 GitHub Releases；同时保留 GitHub Actions 网页手动触发 (`workflow_dispatch`) 备用入口。
+3. **客户端双模无感更新**：正式打包版支持启动静默检查与轻量 `app.asar` 增量包后台预下载（经由代理/直连/镜像多通道容错，全程强制内置 Ed25519 公钥与 SHA-256 验签）；当 Electron 基座升级时自动回退至完整包更新，并在 Claude 守护运行期实施安全确认互锁与启动异常自动回滚。
 
 回归检查使用临时配置目录、真实子进程和真实网络连接，验证配置保存失败、进程退出确认、状态判定、DNS 解析和图标生成。时区前置检查要求 Claude 已关闭；系统区域同步成功路径仅在当前区域与默认时区一致时执行。
 

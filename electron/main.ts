@@ -21,8 +21,21 @@ import {
   applyAutoLaunchSetting,
   reconcileAutoLaunchOnStartup,
 } from './autoLaunch';
+import { UpdaterService } from './updaterService';
 
 const ELEVATED_RELAUNCH_FLAG = '--elevated-relaunch';
+const IS_POST_UPDATE_BOOT = process.argv.some((a) => a.startsWith('--updated-from='));
+
+let postUpdateHandshakeDone = false;
+const handlePostUpdateBootFatal = (err: unknown) => {
+  if (postUpdateHandshakeDone) return;
+  console.error('[Updater Boot Fatal]', err);
+  app.exit(1);
+};
+if (IS_POST_UPDATE_BOOT) {
+  process.on('uncaughtException', handlePostUpdateBootFatal);
+  process.on('unhandledRejection', handlePostUpdateBootFatal);
+}
 
 function isRunningAsWindowsAdmin(): boolean {
   if (process.platform !== 'win32') return true;
@@ -110,6 +123,7 @@ let configStore!: ConfigStore;
 let geoIpService!: GeoIpService;
 let clashMonitor!: ClashMonitor;
 let probeEngine!: ProbeEngine;
+let updaterService!: UpdaterService;
 
 let latestAlertPayload: AlertPayload | null = null;
 let mainDestroyTimer: NodeJS.Timeout | null = null;
@@ -163,7 +177,7 @@ function loadRendererRoute(win: BrowserWindow, hash?: string): void {
   }
 }
 
-function createMainWindow(revealOnReady = true): void {
+function createMainWindow(revealOnReady = true, initialHash?: string): void {
   clearMainDestroyTimer();
   const curStatus = probeEngine ? probeEngine.getSnapshot().status : 'unset';
   const icon = createWindowAppIcon(curStatus);
@@ -189,7 +203,7 @@ function createMainWindow(revealOnReady = true): void {
     },
   });
 
-  loadRendererRoute(mainWindow);
+  loadRendererRoute(mainWindow, initialHash);
 
   if (revealOnReady) {
     let revealed = false;
@@ -244,6 +258,21 @@ function showMainWindow(): void {
   }
   mainWindow.show();
   mainWindow.focus();
+}
+
+function openUpdateCardInMainWindow(confirmClaude = false): void {
+  if (!isBootstrapped) return;
+  clearMainDestroyTimer();
+  if (!mainWindow || mainWindow.isDestroyed()) {
+    createMainWindow(true, confirmClaude ? 'update-confirm' : 'update');
+    return;
+  }
+  if (mainWindow.isMinimized()) {
+    mainWindow.restore();
+  }
+  mainWindow.show();
+  mainWindow.focus();
+  mainWindow.webContents.send('guard:navigate-to-update', { confirmClaude });
 }
 
 function hideAlertWindow(): void {
@@ -567,6 +596,13 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     (claudeValid ? state.claudeState.proxyCountryName : '') ||
     '';
 
+  const claudeActiveForUpdate =
+    state.claudeState.running || state.claudeState.authorizedSession;
+  const dlProgressBucket =
+    state.updateState.status === 'downloading'
+      ? String(Math.floor((state.updateState.progressPercent ?? 0) / 10))
+      : '';
+
   const menuSig = [
     state.status,
     clashChannelText,
@@ -578,12 +614,16 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     agText,
     state.claudeState.canLaunch ? '1' : '0',
     state.claudeState.running ? '1' : '0',
+    claudeActiveForUpdate ? '1' : '0',
     state.antigravityState.canLaunch ? '1' : '0',
     state.antigravityState.running ? '1' : '0',
     state.antigravityState.proxiedSession ? '1' : '0',
     canSyncLocale ? syncTargetName : '',
     state.isSyncingLocale ? '1' : '0',
     state.config.autoLaunch ? '1' : '0',
+    state.updateState.status,
+    state.updateState.latestVersion || '',
+    dlProgressBucket,
   ].join('|');
 
   if (menuSig === lastTrayMenuSignature) {
@@ -707,6 +747,48 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       },
     },
     {
+      label:
+        state.updateState.status === 'applying'
+          ? '🚀 正在重启并应用更新...'
+          : state.updateState.status === 'downloading'
+          ? `⏳ 正在下载新版本${
+              state.updateState.latestVersion ? ` v${state.updateState.latestVersion}` : ''
+            } (${state.updateState.progressPercent ?? 0}%)`
+          : state.updateState.status === 'checking'
+          ? '🔄 正在检查版本更新...'
+          : state.updateState.status === 'downloaded' && state.updateState.latestVersion
+          ? claudeActiveForUpdate
+            ? `✨ 新版本 v${state.updateState.latestVersion} 已就绪 (点击确认更新)`
+            : `✨ 立即重启更新至 v${state.updateState.latestVersion}`
+          : state.updateState.status === 'available' && state.updateState.latestVersion
+          ? `⬇️ 发现新版本 v${state.updateState.latestVersion} (点击查看)`
+          : `检查版本更新 (v${state.updateState.currentVersion})`,
+      enabled:
+        state.updateState.status !== 'checking' &&
+        state.updateState.status !== 'downloading' &&
+        state.updateState.status !== 'applying',
+      click: () => {
+        if (state.updateState.status === 'downloaded') {
+          if (claudeActiveForUpdate) {
+            openUpdateCardInMainWindow(true);
+            return;
+          }
+          void updaterService.applyDownloadedUpdate(false).then((res) => {
+            if (!res.ok) {
+              openUpdateCardInMainWindow(true);
+            }
+          });
+          return;
+        }
+        if (state.updateState.status === 'available') {
+          openUpdateCardInMainWindow(false);
+          return;
+        }
+        openUpdateCardInMainWindow(false);
+        void updaterService.checkForUpdates({ silent: false });
+      },
+    },
+    {
       label: '打开主控制面板',
       click: () => showMainWindow(),
     },
@@ -823,6 +905,20 @@ function registerIpcHandlers(): void {
     return probeEngine.getSnapshot();
   });
 
+  ipcMain.handle('guard:check-for-updates', () =>
+    updaterService.checkForUpdates({ silent: false })
+  );
+
+  ipcMain.handle('guard:download-update', () => updaterService.downloadUpdate());
+
+  ipcMain.handle('guard:apply-update', (_e, allowTerminateClaude?: boolean) =>
+    updaterService.applyDownloadedUpdate(Boolean(allowTerminateClaude))
+  );
+
+  ipcMain.handle('guard:open-release-page', () =>
+    updaterService.openReleasePageInBrowser()
+  );
+
   ipcMain.handle('guard:update-config', async (_e, partial: Partial<AppConfig>) => {
     const prevCfg = configStore.get();
     let nextCfg = await probeEngine.updateConfig(partial);
@@ -848,6 +944,10 @@ function registerIpcHandlers(): void {
 
     if (prevCfg.heartbeatIntervalSec !== nextCfg.heartbeatIntervalSec) {
       probeEngine.restartHeartbeatTimer();
+    }
+
+    if (prevCfg.autoCheckUpdates !== nextCfg.autoCheckUpdates) {
+      updaterService?.reconcileAutoCheckTimer(false);
     }
 
     const agChanged =
@@ -951,6 +1051,16 @@ if (tryRelaunchAsWindowsAdmin()) {
 
       clashMonitor = new ClashMonitor();
       probeEngine = new ProbeEngine(configStore, geoIpService, clashMonitor);
+      updaterService = new UpdaterService({
+        configStore,
+        probeEngine,
+        onQuitForUpdate: () => {
+          isQuitting = true;
+          updaterService?.stop();
+          probeEngine?.stop();
+          app.quit();
+        },
+      });
 
       probeEngine.on('state-changed', (state: AppStateSnapshot) => {
         broadcastState(state);
@@ -967,10 +1077,18 @@ if (tryRelaunchAsWindowsAdmin()) {
       registerIpcHandlers();
       isBootstrapped = true;
 
-      createMainWindow(true);
+      if (!process.argv.includes('--silent-tray')) {
+        createMainWindow(true);
+      }
       setupTray();
 
       await probeEngine.start();
+      updaterService.startBackgroundSchedule(process.argv);
+      if (IS_POST_UPDATE_BOOT) {
+        postUpdateHandshakeDone = true;
+        process.removeListener('uncaughtException', handlePostUpdateBootFatal);
+        process.removeListener('unhandledRejection', handlePostUpdateBootFatal);
+      }
 
       // 延迟执行计划任务/注册表自启状态校验，避免同步子进程阻塞主窗口首屏渲染
       setTimeout(() => {
@@ -988,10 +1106,12 @@ if (tryRelaunchAsWindowsAdmin()) {
 
 app.on('before-quit', () => {
   isQuitting = true;
+  updaterService?.stop();
   probeEngine?.stop();
 });
 
 app.on('will-quit', () => {
+  updaterService?.stop();
   probeEngine?.stop();
 });
 

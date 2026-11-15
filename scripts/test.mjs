@@ -15,7 +15,7 @@ try {
     platform: 'node',
     target: 'node20',
     format: 'cjs',
-    external: ['electron'],
+    external: ['electron', 'original-fs'],
   });
   const env = {
     ...process.env,
@@ -32,5 +32,5 @@ try {
   if (path.dirname(path.resolve(directory)) !== path.resolve(tmpdir())) {
     throw new Error('测试临时目录超出预期范围');
   }
-  await rm(directory, { recursive: true });
+  await rm(directory, { recursive: true, force: true, maxRetries: 5, retryDelay: 200 });
 }

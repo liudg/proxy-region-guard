@@ -9,7 +9,8 @@
     "test": "node scripts/test.mjs",
     "start": "npm run build && node scripts/launch.mjs",
     "launch": "node scripts/launch.mjs",
-    "package": "node scripts/package-release.mjs"
+    "package": "node scripts/package-release.mjs",
+    "keygen": "node scripts/keygen-update.mjs"
   },
   "dependencies": {
     "@ip-location-db/geolite2-country-mmdb": "^2.3.0",

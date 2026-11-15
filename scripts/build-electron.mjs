@@ -26,7 +26,7 @@ export function getElectronEsbuildOptions() {
     target: 'node20',
     format: 'cjs',
     outdir: outDir,
-    external: ['electron'],
+    external: ['electron', 'original-fs'],
     minify: true,
     sourcemap: false,
     logLevel: 'info',

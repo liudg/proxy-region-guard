@@ -20,10 +20,12 @@ yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 
-# Environment Variables
+# Environment Variables & Signing Keys
 .env
 .env.*
 !.env.example
+.keys/
+*.private.key
 
 # Editor & OS
 .idea/

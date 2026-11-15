@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   Activity,
   AlertTriangle,
@@ -11,6 +11,8 @@ import {
   Clock,
   Copy,
   Cpu,
+  Download,
+  ExternalLink,
   FolderOpen,
   Globe,
   History,
@@ -115,22 +117,68 @@ export const MainDashboard: React.FC = () => {
     text: string;
   } | null>(null);
 
+  // 版本更新二次确认（Claude 运行时）、本地重入锁与内联反馈
+  const [pendingUpdateConfirm, setPendingUpdateConfirm] = useState(false);
+  const [isApplyingUpdate, setIsApplyingUpdate] = useState(false);
+  const [updateFeedback, setUpdateFeedback] = useState<{
+    ok: boolean;
+    text: string;
+  } | null>(null);
+  const updateCardRef = useRef<HTMLElement | null>(null);
+  const pendingInitialUpdateScrollRef = useRef(false);
+
   useEffect(() => {
+    const initialHash = window.location.hash.replace(/^#/, '');
+    if (initialHash === 'update' || initialHash === 'update-confirm') {
+      setActiveTab('settings');
+      if (initialHash === 'update-confirm') {
+        setPendingUpdateConfirm(true);
+      }
+      pendingInitialUpdateScrollRef.current = true;
+      window.history.replaceState(
+        null,
+        '',
+        window.location.pathname + window.location.search
+      );
+    }
+
     void window.guardAPI
       .getState()
       .then((initial) => {
         setState(initial);
         syncFormFromConfig(initial.config);
+        if (pendingInitialUpdateScrollRef.current) {
+          pendingInitialUpdateScrollRef.current = false;
+          setTimeout(() => {
+            updateCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          }, 80);
+        }
       })
       .catch(() => {
         // ignore initial load error
       });
 
-    const unsub = window.guardAPI.onStateChanged((next) => {
+    const unsubState = window.guardAPI.onStateChanged((next) => {
       setState(next);
+      if (next.updateState.status !== 'applying') {
+        setIsApplyingUpdate(false);
+      }
     });
 
-    return unsub;
+    const unsubNav = window.guardAPI.onNavigateToUpdate(({ confirmClaude }) => {
+      if (confirmClaude) {
+        setPendingUpdateConfirm(true);
+      }
+      setActiveTab('settings');
+      setTimeout(() => {
+        updateCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 60);
+    });
+
+    return () => {
+      unsubState();
+      unsubNav();
+    };
   }, []);
 
   const syncFormFromConfig = (cfg: AppConfig) => {
@@ -169,10 +217,21 @@ export const MainDashboard: React.FC = () => {
   }, [state?.antigravityState.running, pendingAgConfirm]);
 
   useEffect(() => {
-    if (!state?.claudeState.running && pendingClaudeConfirm) {
+    const claudeActive = Boolean(
+      state?.claudeState.running || state?.claudeState.authorizedSession
+    );
+    if (!claudeActive && pendingClaudeConfirm) {
       setPendingClaudeConfirm(null);
     }
-  }, [state?.claudeState.running, pendingClaudeConfirm]);
+    if (!claudeActive && pendingUpdateConfirm) {
+      setPendingUpdateConfirm(false);
+    }
+  }, [
+    state?.claudeState.running,
+    state?.claudeState.authorizedSession,
+    pendingClaudeConfirm,
+    pendingUpdateConfirm,
+  ]);
 
   if (!state) {
     return (
@@ -194,6 +253,7 @@ export const MainDashboard: React.FC = () => {
     clashInfo,
     claudeState,
     antigravityState,
+    updateState,
     logs,
   } = state;
   const claudeVerificationError = getTargetServiceVerificationError(claudeState.nodeProbe);
@@ -622,6 +682,88 @@ export const MainDashboard: React.FC = () => {
     await updateConfigSafe({ protectedProcessPatterns: filtered }, 'global');
   };
 
+  const showTimedUpdateFeedback = (ok: boolean, text: string) => {
+    setUpdateFeedback({ ok, text });
+    setTimeout(() => {
+      setUpdateFeedback((cur) => (cur?.text === text ? null : cur));
+    }, 5500);
+  };
+
+  const jumpToUpdateCard = () => {
+    setActiveTab('settings');
+    setTimeout(() => {
+      updateCardRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    }, 60);
+  };
+
+  const handleCheckForUpdates = async () => {
+    setUpdateFeedback(null);
+    try {
+      const res = await window.guardAPI.checkForUpdates();
+      setState(res.state);
+      showTimedUpdateFeedback(res.ok, res.message);
+    } catch (err) {
+      showTimedUpdateFeedback(false, err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const handleDownloadUpdate = async () => {
+    setUpdateFeedback(null);
+    try {
+      const res = await window.guardAPI.downloadUpdate();
+      setState(res.state);
+      showTimedUpdateFeedback(res.ok, res.message);
+    } catch (err) {
+      showTimedUpdateFeedback(false, err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const executeApplyUpdate = async (allowTerminateClaude: boolean) => {
+    if (isApplyingUpdate || updateState.status === 'applying') {
+      return;
+    }
+    setIsApplyingUpdate(true);
+    setPendingUpdateConfirm(false);
+    setUpdateFeedback(null);
+    try {
+      const res = await window.guardAPI.applyUpdateNow(allowTerminateClaude);
+      setState(res.state);
+      if (!res.ok) {
+        setIsApplyingUpdate(false);
+      }
+      showTimedUpdateFeedback(res.ok, res.message);
+    } catch (err) {
+      setIsApplyingUpdate(false);
+      showTimedUpdateFeedback(false, err instanceof Error ? err.message : String(err));
+    }
+  };
+
+  const isClaudeActiveForUpdate =
+    claudeState.running || claudeState.authorizedSession;
+
+  const handleClickApplyUpdate = () => {
+    if (isApplyingUpdate || updateState.status === 'applying') {
+      return;
+    }
+    if (isClaudeActiveForUpdate) {
+      setPendingUpdateConfirm(true);
+      return;
+    }
+    void executeApplyUpdate(false);
+  };
+
+  const isUpdateBusy =
+    isApplyingUpdate ||
+    updateState.status === 'checking' ||
+    updateState.status === 'downloading' ||
+    updateState.status === 'applying';
+
+  const hasNewUpdate =
+    updateState.status === 'available' ||
+    updateState.status === 'downloading' ||
+    updateState.status === 'downloaded' ||
+    updateState.status === 'applying';
+
   const canLockCurrentProbe = Boolean(lastProbe && isValidIsoCountryCode(lastProbe.countryCode));
 
   const isCurrentAlreadyDefault =
@@ -769,8 +911,42 @@ export const MainDashboard: React.FC = () => {
           <span className={`brand-dot ${titlebarDotClass}`} />
           <span className="brand-name">代理地区卫士</span>
           <span className="brand-sub">Proxy Region Guard</span>
+          <span className="brand-version">v{updateState.currentVersion}</span>
         </div>
         <div className="titlebar-controls no-drag">
+          {updateState.status === 'downloaded' && updateState.latestVersion && (
+            <button
+              type="button"
+              className="titlebar-update-pill ready"
+              onClick={jumpToUpdateCard}
+              title={`新版本 v${updateState.latestVersion} 已验签就绪，点击前往更新`}
+            >
+              <Sparkles size={11} />
+              <span>新版 v{updateState.latestVersion} 已就绪</span>
+            </button>
+          )}
+          {updateState.status === 'downloading' && (
+            <button
+              type="button"
+              className="titlebar-update-pill downloading"
+              onClick={jumpToUpdateCard}
+              title="正在后台下载新版本更新包"
+            >
+              <RefreshCw className="spin" size={11} />
+              <span>更新下载 {updateState.progressPercent ?? 0}%</span>
+            </button>
+          )}
+          {updateState.status === 'available' && updateState.latestVersion && (
+            <button
+              type="button"
+              className="titlebar-update-pill available"
+              onClick={jumpToUpdateCard}
+              title={`发现新版本 v${updateState.latestVersion}，点击查看详情`}
+            >
+              <Download size={11} />
+              <span>发现 v{updateState.latestVersion}</span>
+            </button>
+          )}
           <button
             className="win-btn"
             onClick={() => window.guardAPI.minimizeMain()}
@@ -814,6 +990,13 @@ export const MainDashboard: React.FC = () => {
         >
           <Settings size={14} />
           <span>设置</span>
+          {hasNewUpdate && (
+            <span
+              className={`tab-status-dot ${
+                updateState.status === 'downloaded' ? 'running' : 'external'
+              }`}
+            />
+          )}
         </button>
         <button
           className={`nav-tab ${activeTab === 'logs' ? 'active' : ''}`}
@@ -2674,6 +2857,246 @@ export const MainDashboard: React.FC = () => {
                 )}
               </div>
             </section>
+
+            {/* 3. 版本与自动更新设置 */}
+            <section
+              ref={updateCardRef}
+              className={`panel-card update-card ${
+                updateState.status === 'downloaded'
+                  ? 'has-ready-update'
+                  : updateState.status === 'available'
+                  ? 'has-available-update'
+                  : ''
+              }`}
+            >
+              <div className="panel-card-header">
+                <div className="panel-title">
+                  <Sparkles size={15} />
+                  <span>版本与自动更新</span>
+                  <span className="mini-badge neutral">v{updateState.currentVersion}</span>
+                </div>
+                <div className="update-header-actions">
+                  <button
+                    type="button"
+                    className="btn-link-clear"
+                    onClick={() => void window.guardAPI.openReleasePage()}
+                    title="在浏览器中打开 GitHub Releases 页面"
+                  >
+                    <ExternalLink size={12} />
+                    <span>GitHub</span>
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-refresh"
+                    disabled={isUpdateBusy}
+                    onClick={() => void handleCheckForUpdates()}
+                  >
+                    <RefreshCw
+                      size={13}
+                      className={updateState.status === 'checking' ? 'spin' : ''}
+                    />
+                    <span>
+                      {updateState.status === 'checking' ? '正在检查...' : '检查更新'}
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              <div className="update-meta-summary">
+                <span>
+                  当前版本 <strong>v{updateState.currentVersion}</strong> · Electron{' '}
+                  {updateState.electronVersion}
+                  {!updateState.isPackaged && ' · 开发调试模式'}
+                </span>
+                {updateState.lastCheckedAt && (
+                  <span className="update-last-checked">
+                    上次检查 {formatTime(updateState.lastCheckedAt)}
+                  </span>
+                )}
+              </div>
+
+              {updateFeedback && (
+                <div className={`locale-feedback ${updateFeedback.ok ? 'ok' : 'err'}`}>
+                  {updateFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
+                  <span>{updateFeedback.text}</span>
+                </div>
+              )}
+
+              {updateState.status === 'error' && updateState.error && !updateFeedback && (
+                <div className="locale-feedback err">
+                  <AlertTriangle size={14} />
+                  <span>{updateState.error}</span>
+                </div>
+              )}
+
+              {hasNewUpdate && updateState.latestVersion && (
+                <div className="update-release-box">
+                  <div className="update-release-top">
+                    <div className="update-version-jump">
+                      <span className="ver-old">v{updateState.currentVersion}</span>
+                      <span className="ver-arrow">→</span>
+                      <span className="ver-new">v{updateState.latestVersion}</span>
+                    </div>
+                    <div className="update-badges-row">
+                      {updateState.deliveryMode && (
+                        <span className="update-tag mode">
+                          {updateState.deliveryMode === 'asar'
+                            ? `⚡ 增量热更 · ${formatBytes(updateState.downloadTotalBytes)}${
+                                updateState.includeMmdbUpdate ? ' (含新离线库)' : ''
+                              }`
+                            : `📦 完整包 · ${formatBytes(updateState.downloadTotalBytes)}`}
+                        </span>
+                      )}
+                      {updateState.signatureVerified && (
+                        <span className="update-tag verified">
+                          <ShieldCheck size={11} />
+                          <span>Ed25519 已验签</span>
+                        </span>
+                      )}
+                    </div>
+                  </div>
+
+                  {updateState.releaseNotes && (
+                    <div className="update-notes-box">
+                      {updateState.releaseNotes}
+                    </div>
+                  )}
+
+                  {updateState.status === 'downloading' && (
+                    <div className="update-progress-wrap">
+                      <div className="update-progress-track">
+                        <div
+                          className="update-progress-fill"
+                          style={{
+                            width: `${Math.max(2, updateState.progressPercent ?? 0)}%`,
+                          }}
+                        />
+                      </div>
+                      <div className="update-progress-meta">
+                        <span>正在下载并校验完整性...</span>
+                        <span>
+                          {updateState.progressPercent ?? 0}% (
+                          {formatBytes(updateState.downloadedBytes)} /{' '}
+                          {formatBytes(updateState.downloadTotalBytes)})
+                        </span>
+                      </div>
+                    </div>
+                  )}
+
+                  {pendingUpdateConfirm && isClaudeActiveForUpdate && (
+                    <div className="inline-confirm-bar">
+                      <div className="confirm-bar-text">
+                        <AlertTriangle size={15} />
+                        <span>
+                          Claude 正在受控守护运行中，重启更新将先安全终止当前 Claude 会话（保持 Antigravity 正常运行），并在完成替换后自动重新启动本程序。
+                        </span>
+                      </div>
+                      <div className="confirm-bar-actions">
+                        <button
+                          type="button"
+                          className="btn-confirm-danger"
+                          disabled={isApplyingUpdate || updateState.status === 'applying'}
+                          onClick={() => void executeApplyUpdate(true)}
+                        >
+                          确认终止 Claude 并立即更新
+                        </button>
+                        <button
+                          type="button"
+                          className="btn-confirm-cancel"
+                          disabled={isApplyingUpdate || updateState.status === 'applying'}
+                          onClick={() => setPendingUpdateConfirm(false)}
+                        >
+                          取消
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="update-action-row">
+                    {updateState.status === 'available' &&
+                      (updateState.isPackaged ? (
+                        <button
+                          type="button"
+                          className="btn-update-primary"
+                          disabled={isUpdateBusy}
+                          onClick={() => void handleDownloadUpdate()}
+                        >
+                          <Download size={14} />
+                          <span>
+                            下载更新包 ({formatBytes(updateState.downloadTotalBytes)})
+                          </span>
+                        </button>
+                      ) : (
+                        <button
+                          type="button"
+                          className="btn-update-primary"
+                          onClick={() => void window.guardAPI.openReleasePage()}
+                        >
+                          <ExternalLink size={14} />
+                          <span>前往 GitHub Release 下载正式包</span>
+                        </button>
+                      ))}
+
+                    {(updateState.status === 'downloaded' ||
+                      updateState.status === 'applying') && (
+                      <button
+                        type="button"
+                        className="btn-update-ready"
+                        disabled={isApplyingUpdate || updateState.status === 'applying'}
+                        onClick={handleClickApplyUpdate}
+                      >
+                        <Rocket size={14} />
+                        <span>
+                          {isApplyingUpdate || updateState.status === 'applying'
+                            ? '正在启动更新助手并重启...'
+                            : `立即重启并更新至 v${updateState.latestVersion}`}
+                        </span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+              )}
+
+              <div className="setting-row">
+                <div>
+                  <strong>自动检查并预下载轻量增量更新</strong>
+                  <p>
+                    启动与后台静默检查更新，发现增量热更包 (~200KB) 时自动下载并完成验签就绪，绝不自动重启
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="toggle-switch"
+                  checked={config.autoCheckUpdates}
+                  onChange={(e) =>
+                    void updateConfigSafe(
+                      { autoCheckUpdates: e.target.checked },
+                      'global'
+                    )
+                  }
+                />
+              </div>
+
+              <div className="setting-row no-border-bottom">
+                <div>
+                  <strong>GitHub 下载加速镜像兜底</strong>
+                  <p>
+                    当代理与直连访问 GitHub 超时时自动回退公开镜像（全程强制 Ed25519 公钥签名校验防篡改）
+                  </p>
+                </div>
+                <input
+                  type="checkbox"
+                  className="toggle-switch"
+                  checked={config.useUpdateMirrorFallback}
+                  onChange={(e) =>
+                    void updateConfigSafe(
+                      { useUpdateMirrorFallback: e.target.checked },
+                      'global'
+                    )
+                  }
+                />
+              </div>
+            </section>
           </div>
         )}
 
@@ -2720,6 +3143,15 @@ export const MainDashboard: React.FC = () => {
     </div>
   );
 };
+
+function formatBytes(bytes: number | null | undefined): string {
+  if (bytes === null || bytes === undefined || !Number.isFinite(bytes) || bytes <= 0) {
+    return '未知大小';
+  }
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
 
 function formatTime(ts: number): string {
   const d = new Date(ts);
