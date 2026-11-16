@@ -51,6 +51,13 @@ async function freePort(): Promise<number> {
   return port;
 }
 
+async function assertPortReleased(port: number): Promise<void> {
+  const listener = net.createServer();
+  listener.listen(port, '127.0.0.1');
+  await once(listener, 'listening');
+  await new Promise<void>((resolve, reject) => listener.close((error) => error ? reject(error) : resolve()));
+}
+
 function endpoint(directory: string): MihomoEndpoint {
   return JSON.parse(fs.readFileSync(path.join(directory, 'runtime.json'), 'utf8')).endpoint;
 }
@@ -209,12 +216,16 @@ async function run(): Promise<void> {
     } finally { await mihomoRequest(refEndpoint, '/configs', 'PATCH', { tun: { enable: false } }); }
   }
   await reference.shutdown();
+  await assertPortReleased(refPort);
   await monitor.refresh();
   assert.equal(monitor.getRuntimeInfo().tunEnabled, null);
   assert.equal(await getThrough(agPort, origin), nonce);
   console.log('通过：本地命名管道控制接口、未知 TUN 状态、参考内核退出后专属代理继续运行');
 
   await service.shutdown();
+  await assertPortReleased(claudePort);
+  await assertPortReleased(agPort);
+  console.log('通过：真实内核停止后，三个专属端口均可立即重新绑定');
   const owner = spawn(process.execPath, [process.argv[1]], { windowsHide: true, env: { ...process.env, GUARD_TEST_ROLE: 'owner' }, stdio: 'inherit' });
   assert.equal((await once(owner, 'exit'))[0], 0);
   const adoptedPid = JSON.parse(fs.readFileSync(path.join(kernelRoot, 'claude', 'runtime.json'), 'utf8')).pid;

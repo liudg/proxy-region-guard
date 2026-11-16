@@ -357,13 +357,17 @@ export class PrivateKernel extends EventEmitter {
     this.timer = null;
     const lease = this.lease;
     const child = this.child;
-    if (lease && alive(lease.pid)) {
-      if (child?.pid !== lease.pid) await this.verifyProcessIdentity(lease);
+    if (lease) {
+      if (alive(lease.pid) && child?.pid !== lease.pid) await this.verifyProcessIdentity(lease);
       this.child = null;
       this.booting = false;
-      process.kill(lease.pid);
-      for (let attempt = 0; attempt < 40 && alive(lease.pid); attempt++) await delay(100);
-      if (alive(lease.pid)) throw new Error('私有内核未能退出');
+      if (alive(lease.pid)) process.kill(lease.pid);
+      // Windows 结束进程后仍可能正在释放监听，重启必须等待专属端口关闭。
+      const deadline = Date.now() + 4000;
+      while (alive(lease.pid) || (this.saved && await isLocalPortListening(this.saved.port))) {
+        if (Date.now() >= deadline) throw new Error('私有内核退出或专属端口释放超时');
+        await delay(100);
+      }
     }
     this.child = null;
     this.booting = false;
