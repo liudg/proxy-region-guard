@@ -1201,7 +1201,9 @@ export class UpdaterService {
       this.isPackaged &&
       localAsarExists &&
       manifest.electronVersion === this.electronVersion &&
-      compareSemver(this.nativeShellVersion, manifest.minNativeShellVersion) >= 0;
+      compareSemver(this.nativeShellVersion, manifest.minNativeShellVersion) >= 0 &&
+      rawFs.existsSync(path.join(this.resourcesDir, 'mihomo', 'guard-mihomo.exe')) &&
+      (await computeFileSha256(path.join(this.resourcesDir, 'mihomo', 'guard-mihomo.exe'))).sha256 === manifest.mihomo.sha256;
 
     if (!canUseAsarHotUpdate && this.isPackaged) {
       return {
@@ -2107,7 +2109,13 @@ export class UpdaterService {
         updaterEnv.GUARD_UPD_WAIT_EXIT_ATTEMPTS = String(this.waitExitAttemptsOverride);
       }
 
-      await launchDetachedWindowsUpdater(encodedCommand, updaterEnv);
+      try {
+        await this.probeEngine.prepareForUpdate();
+        await launchDetachedWindowsUpdater(encodedCommand, updaterEnv);
+      } catch (error) {
+        await this.probeEngine.resumeAfterUpdateFailure();
+        throw error;
+      }
 
       const finalState = this.probeEngine.getSnapshot();
       if (this.quitTimer) {

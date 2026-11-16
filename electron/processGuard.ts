@@ -24,6 +24,7 @@ const CRITICAL_SYSTEM_SET = new Set<string>(CRITICAL_SYSTEM_PROCESSES);
 
 // 保护常见代理客户端与内核进程不被误配规则强杀（否则会导致网络彻底断联死循环）
 const PROTECTED_PROXY_INFRA_SET = new Set<string>([
+  'guard-mihomo.exe',
   'verge-mihomo.exe',
   'verge-mihomo-alpha.exe',
   'clash-verge-service.exe',

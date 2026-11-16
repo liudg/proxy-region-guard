@@ -106,6 +106,7 @@ export const AlertPopup: React.FC = () => {
   }
 
   const isRecovered = payload.alertType === 'recovered';
+  const isSystemWarning = payload.source === 'system';
   const isIpChange = payload.alertType === 'ip-change';
   const isDisconnect = payload.alertType === 'disconnect';
   const isVerificationUnavailable = payload.alertType === 'verification-unavailable';
@@ -114,11 +115,15 @@ export const AlertPopup: React.FC = () => {
 
   const cardClass = isRecovered
     ? 'alert-recovered'
-    : isDisconnect || isVerificationUnavailable
+    : isDisconnect || isVerificationUnavailable || isSystemWarning
     ? 'alert-disconnect'
     : 'alert-mismatch';
 
-  const titleText = isRecovered
+  const titleText = payload.alertType === 'tun-enabled'
+    ? '检测到 Clash Verge 已开启 TUN'
+    : payload.alertType === 'kernel-error'
+    ? '私有代理内核故障'
+    : isRecovered
     ? '代理与时区已恢复正常'
     : isUnauthorizedLaunch
     ? '已拦截外部启动 Claude！'
@@ -163,7 +168,11 @@ export const AlertPopup: React.FC = () => {
 
       {/* 核心地区对比区 */}
       <div className="alert-body">
-        {isVerificationUnavailable ? (
+        {isSystemWarning ? (
+          <div className="alert-disconnect-box">
+            <div className="disconnect-err-msg"><AlertTriangle size={18} /><span>{payload.errorDetail}</span></div>
+          </div>
+        ) : isVerificationUnavailable ? (
           <div className="alert-disconnect-box">
             <div className="disconnect-expect-line">
               <span>保护地区：</span>
@@ -348,13 +357,13 @@ export const AlertPopup: React.FC = () => {
               </div>
             )
           )}
-          <div className="alert-meta-item">
+          {!isSystemWarning && <div className="alert-meta-item">
             <span className="meta-k">触发原因：</span>
             <span className="meta-v alert-detail" title={payload.triggerReason}>
               {payload.activeNode ? `[${payload.activeNode}] · ` : ''}
               {payload.triggerReason}
             </span>
-          </div>
+          </div>}
         </div>
       </div>
 

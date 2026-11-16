@@ -11,12 +11,15 @@ if %errorlevel% neq 0 (
 )
 
 set NEED_BUILD=0
+call npm run prepare:core
+if errorlevel 1 exit /b 1
 if not exist "%~dp0dist\index.html" set NEED_BUILD=1
 if not exist "%~dp0dist-electron\main.js" set NEED_BUILD=1
 
 if "%NEED_BUILD%"=="1" (
   echo 检测到构建产物缺失，正在编译前后端资源...
   call npm run build
+  if errorlevel 1 exit /b 1
 )
 
 start "" "%~dp0node_modules\electron\dist\electron.exe" "%~dp0"

@@ -309,7 +309,7 @@ export function reconcileAutoLaunchOnStartup(configuredAutoLaunch: boolean): boo
         return false;
       }
 
-      if (configuredAutoLaunch || taskState === 'enabled' || hasRegistryRunValue()) {
+      if (configuredAutoLaunch) {
         // 同步最新可执行文件路径并自动将旧版失效的注册表 Run 键升级为最高权限计划任务
         return applyAutoLaunchSetting(true);
       }

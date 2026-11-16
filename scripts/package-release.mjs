@@ -129,12 +129,13 @@ function buildUpdateSignaturePayload(manifest) {
     : 'none';
 
   return [
-    'proxy-region-guard-update-v1',
+    'proxy-region-guard-update-v2',
     `schemaVersion=${manifest.schemaVersion}`,
     `version=${manifest.version.trim()}`,
     `publishedAt=${manifest.publishedAt.trim()}`,
     `electronVersion=${manifest.electronVersion.trim()}`,
     `minNativeShellVersion=${manifest.minNativeShellVersion.trim()}`,
+    `mihomo=${manifest.mihomo.version}|${manifest.mihomo.sha256.toLowerCase()}`,
     `asar=${[
       manifest.asar.name,
       manifest.asar.url,
@@ -596,6 +597,14 @@ async function main() {
     copyDirFiltered(path.join(rootDir, 'dist'), path.join(stageAsarSrcDir, 'dist'));
 
     const targetResourcesDir = path.join(stagedAppDir, 'resources');
+    const coreDir = path.join(rootDir, 'resources', 'mihomo');
+    const coreManifest = JSON.parse(fs.readFileSync(path.join(coreDir, 'manifest.json'), 'utf8'));
+    if (computeFileSha256Sync(path.join(coreDir, 'guard-mihomo.exe')).sha256 !== coreManifest.sha256) {
+      throw new Error('私有 Mihomo 文件校验失败，请执行 npm run prepare:core');
+    }
+    const bundledCoreDir = path.join(targetResourcesDir, 'mihomo');
+    fs.mkdirSync(bundledCoreDir, { recursive: true });
+    for (const file of ['guard-mihomo.exe', 'manifest.json']) fs.copyFileSync(path.join(coreDir, file), path.join(bundledCoreDir, file));
     const asarOutPath = path.join(targetResourcesDir, 'app.asar');
     const asar = await import('@electron/asar');
     await asar.createPackage(stageAsarSrcDir, asarOutPath);
@@ -652,11 +661,12 @@ async function main() {
     const releaseDownloadBase = `https://github.com/${repoSlug}/releases/download/v${appVersion}`;
 
     const unsignedManifest = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       version: appVersion,
       publishedAt: new Date().toISOString(),
       electronVersion,
       minNativeShellVersion,
+      mihomo: coreManifest,
       notes: String(releaseNotes || '').replace(/\r\n/g, '\n').trim(),
       asar: {
         name: asarGzName,

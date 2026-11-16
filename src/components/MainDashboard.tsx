@@ -48,6 +48,7 @@ import {
 } from '../shared/timezones';
 import { CountryFlag } from './CountryFlag';
 import { ClashNodeSelector } from './ClashNodeSelector';
+import { PrivateKernelStatus } from './PrivateKernelStatus';
 
 type ActiveTab = 'launcher' | 'monitor' | 'settings' | 'logs';
 type LauncherSubTab = 'antigravity' | 'claude';
@@ -391,11 +392,10 @@ export const MainDashboard: React.FC = () => {
       const selectedNode = nodeName.trim();
       const selectedProfileUid = profileUid?.trim() || next.config.antigravityClashProfileUid;
       const bindingMatched =
-        next.clashInfo.connected &&
-        next.clashInfo.antigravityPortListening &&
-        next.clashInfo.antigravityBoundNode === selectedNode &&
-        next.clashInfo.antigravityBoundProfileUid === selectedProfileUid &&
-        next.clashInfo.antigravityDedicatedPort === next.config.antigravityDedicatedPort;
+        next.privateChannels.antigravity.phase === 'ready' &&
+        next.privateChannels.antigravity.nodeName === selectedNode &&
+        next.privateChannels.antigravity.profileUid === selectedProfileUid &&
+        next.privateChannels.antigravity.port === next.config.antigravityDedicatedPort;
       if (!bindingMatched || next.antigravityState.nodeProbeError) {
         showTimedAgFeedback(
           false,
@@ -898,19 +898,11 @@ export const MainDashboard: React.FC = () => {
         : statusMeta.cls
       : statusMeta.cls;
 
-  const clashHeaderBadgeText = clashInfo.connected
-    ? `${
-        clashInfo.activeProfileName
-          ? `当前订阅: ${clashInfo.activeProfileName}`
-          : clashInfo.source
-      } · ${clashInfo.mode.toUpperCase()}`
-    : '未连接 Clash Verge';
+  const clashHeaderBadgeText = `${clashInfo.profileGroups.length} 个本地订阅 · ${clashInfo.availableNodes.length} 个节点`;
 
   const closeButtonTitle = config.closeToTray
     ? '隐藏到系统托盘'
-    : claudeState.running
-    ? '退出程序（将同时安全终止受控运行中的 Claude，保持 Antigravity 运行）'
-    : '退出程序（保持 Antigravity 运行）';
+    : '关闭管理界面（后台、私有代理和安全检查继续运行）';
 
   const renderUpdateReleaseBox = (inModal: boolean) => {
     if (!hasNewUpdate || !updateState.latestVersion) {
@@ -1386,13 +1378,13 @@ export const MainDashboard: React.FC = () => {
                     <div className="panel-title">
                       <Radio
                         size={15}
-                        className={clashInfo.connected ? 'pulse-green' : ''}
+                        className={state.privateChannels.antigravity.phase === 'ready' ? 'pulse-green' : ''}
                       />
-                      <span>1. 指定 Clash 专属代理节点（支持跨订阅组）</span>
+                      <span>1. Antigravity 私有代理节点</span>
                     </div>
                     <span
                       className={`mini-badge ${
-                        clashInfo.connected ? 'connected' : 'warn-badge'
+                        clashInfo.availableNodes.length ? 'connected' : 'warn-badge'
                       }`}
                     >
                       {clashHeaderBadgeText}
@@ -1405,15 +1397,17 @@ export const MainDashboard: React.FC = () => {
                     selectedNode={config.antigravityClashNode}
                     selectedProfileUid={config.antigravityClashProfileUid}
                     selectedProfileName={config.antigravityClashProfileName}
-                    boundProfileUid={clashInfo.antigravityBoundProfileUid}
-                    boundProfileName={clashInfo.antigravityBoundProfileName}
+                    boundProfileUid={state.privateChannels.antigravity.profileUid}
+                    boundProfileName={state.privateChannels.antigravity.profileName}
                     dedicatedPort={config.antigravityDedicatedPort}
-                    portListening={clashInfo.antigravityPortListening}
+                    portListening={state.privateChannels.antigravity.phase === 'ready'}
                     isSwitching={isSwitchingAgNode}
                     onSelectNode={(node, profUid) =>
                       void handleSelectAntigravityNode(node, profUid)
                     }
                   />
+                  <PrivateKernelStatus channel="antigravity" state={state.privateChannels.antigravity} onState={setState} />
+                  {state.clashInfo.catalogErrors.map((error) => <p className="private-kernel-error" key={error}>订阅读取失败：{error}</p>)}
                 </section>
 
                 {/* 2. Antigravity 纯代理启动主控卡 */}
@@ -1836,13 +1830,13 @@ export const MainDashboard: React.FC = () => {
                     <div className="panel-title">
                       <Radio
                         size={15}
-                        className={clashInfo.connected ? 'pulse-green' : ''}
+                        className={state.privateChannels.claude.phase === 'ready' ? 'pulse-green' : ''}
                       />
-                      <span>1. 指定 Clash 专属代理节点（支持跨订阅组）</span>
+                      <span>1. Claude 私有代理节点</span>
                     </div>
                     <span
                       className={`mini-badge ${
-                        clashInfo.connected ? 'connected' : 'warn-badge'
+                        clashInfo.availableNodes.length ? 'connected' : 'warn-badge'
                       }`}
                     >
                       {clashHeaderBadgeText}
@@ -1855,15 +1849,17 @@ export const MainDashboard: React.FC = () => {
                     selectedNode={config.selectedClashNode}
                     selectedProfileUid={config.selectedClashProfileUid}
                     selectedProfileName={config.selectedClashProfileName}
-                    boundProfileUid={clashInfo.boundProfileUid}
-                    boundProfileName={clashInfo.boundProfileName}
+                    boundProfileUid={state.privateChannels.claude.profileUid}
+                    boundProfileName={state.privateChannels.claude.profileName}
                     dedicatedPort={config.dedicatedProxyPort}
-                    portListening={clashInfo.dedicatedPortListening}
+                    portListening={state.privateChannels.claude.phase === 'ready'}
                     isSwitching={isSwitchingNode}
                     onSelectNode={(node, profUid) =>
                       void handleSelectClaudeNode(node, profUid)
                     }
                   />
+                  <PrivateKernelStatus channel="claude" state={state.privateChannels.claude} onState={setState} />
+                  {state.clashInfo.catalogErrors.map((error) => <p className="private-kernel-error" key={error}>订阅读取失败：{error}</p>)}
                 </section>
 
                 {/* 2. Claude 唯一启动入口 & 三重一致性校验主控卡 */}
@@ -3104,7 +3100,7 @@ export const MainDashboard: React.FC = () => {
               <div className="setting-row">
                 <div>
                   <strong>关闭窗口时最小化到托盘</strong>
-                  <p>隐藏至系统托盘继续后台守护，不退出程序</p>
+                  <p>开启时隐藏窗口，关闭时销毁窗口；后台代理和安全检查持续运行</p>
                 </div>
                 <input
                   type="checkbox"

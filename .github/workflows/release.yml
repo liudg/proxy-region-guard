@@ -45,6 +45,9 @@ jobs:
       - name: Install project dependencies
         run: npm ci
 
+      - name: Prepare private Mihomo core
+        run: npm run prepare:core
+
       - name: Resolve version & prepare local package metadata
         id: meta
         env:

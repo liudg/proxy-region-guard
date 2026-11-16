@@ -84,7 +84,9 @@ export interface ClashProfileGroupOption {
 
 export interface ClashRuntimeInfo {
   connected: boolean;
-  bindingVerificationError: string | null; // 非空表示尚无法确认专属绑定，不能据此判定绑定失效
+  error: string | null;
+  tunEnabled: boolean | null;
+  catalogErrors: string[];
   source: string;         // 例如: "Clash Verge (Pipe)" 或 "Clash (127.0.0.1:9097)"
   mode: string;           // rule / global / direct
   mixedPort: number | null;
@@ -94,16 +96,23 @@ export interface ClashRuntimeInfo {
   nodeChain: string[];    // 完整节点选择链，如 ["节点选择", "自动选择", "🇺🇸 美国 01"]
   availableNodes: ClashProxyNodeOption[];   // 汇总的所有可选具体节点列表
   profileGroups: ClashProfileGroupOption[]; // 按 Clash 订阅组分类的节点列表（含所有未激活订阅）
-  boundNode: string | null;                 // 当前 Claude 独立专属端口实际绑定的节点名
-  boundProfileUid: string | null;           // 当前绑定节点所属的订阅组 UID
-  boundProfileName: string | null;          // 当前绑定节点所属的订阅组名称
-  dedicatedPort: number | null;             // 当前 Claude 独立专属端口（如 27897）
-  dedicatedPortListening: boolean;          // Claude 独立专属端口是否已就绪监听
-  antigravityBoundNode: string | null;      // 当前 Antigravity 独立专属端口实际绑定的节点名
-  antigravityBoundProfileUid: string | null;  // 当前 Antigravity 绑定节点所属的订阅组 UID
-  antigravityBoundProfileName: string | null; // 当前 Antigravity 绑定节点所属的订阅组名称
-  antigravityDedicatedPort: number | null;  // 当前 Antigravity 独立专属端口（如 27898）
-  antigravityPortListening: boolean;        // Antigravity 独立专属端口是否已就绪监听
+}
+
+export type PrivateChannelId = 'claude' | 'antigravity';
+export interface PrivateChannelState {
+  phase: 'idle' | 'starting' | 'ready' | 'recovering' | 'error';
+  pid: number | null;
+  port: number | null;
+  nodeName: string | null;
+  profileUid: string | null;
+  profileName: string | null;
+  generation: number;
+  error: string | null;
+  verificationError: string | null;
+  sourceStatus: 'current' | 'changed' | 'missing' | 'unknown';
+  sourceError: string | null;
+  restartAttempts: number;
+  nextRetryAt: number | null;
 }
 
 export interface ProbeResult {
@@ -174,7 +183,7 @@ export interface GuardEventLog {
 }
 
 export interface AlertPayload {
-  source?: 'claude' | 'monitor';
+  source?: 'claude' | 'monitor' | 'system';
   alertType:
     | 'mismatch'
     | 'ip-change'
@@ -182,6 +191,8 @@ export interface AlertPayload {
     | 'locale-mismatch'
     | 'unauthorized-launch'
     | 'verification-unavailable'
+    | 'tun-enabled'
+    | 'kernel-error'
     | 'recovered';
   expectedCode: string | null;
   expectedName: string | null;
@@ -252,6 +263,7 @@ export interface AppStateSnapshot {
   lastProbe: ProbeResult | null;
   lastError: string | null;
   clashInfo: ClashRuntimeInfo;
+  privateChannels: Record<PrivateChannelId, PrivateChannelState>;
   claudeState: ClaudeRuntimeState;
   antigravityState: AntigravityRuntimeState;
   updateState: UpdateStateSnapshot;
@@ -305,6 +317,8 @@ export interface GuardBridgeAPI {
   launchAntigravity: () => Promise<AntigravityLaunchResult>;
   terminateAntigravityNow: () => Promise<AntigravityLaunchResult>;
   browseAntigravityExe: () => Promise<AppStateSnapshot>;
+  applyNodeUpdate: (channel: PrivateChannelId) => Promise<AppStateSnapshot>;
+  restartPrivateKernel: (channel: PrivateChannelId) => Promise<AppStateSnapshot>;
   // 版本更新控制
   checkForUpdates: () => Promise<UpdateActionResult>;
   downloadUpdate: () => Promise<UpdateActionResult>;

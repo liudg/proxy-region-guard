@@ -129,23 +129,7 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
     moved: false,
   });
 
-  const profileGroups: ClashProfileGroupOption[] = useMemo(() => {
-    if (clashInfo.profileGroups && clashInfo.profileGroups.length > 0) {
-      return clashInfo.profileGroups;
-    }
-    const concrete = clashInfo.availableNodes.filter((n) => !n.isGroup);
-    if (concrete.length === 0) return [];
-    return [
-      {
-        uid: '__runtime_active__',
-        name: clashInfo.activeProfileName || '当前运行配置',
-        type: 'runtime',
-        isActive: true,
-        nodeCount: concrete.length,
-        nodes: concrete,
-      },
-    ];
-  }, [clashInfo.profileGroups, clashInfo.availableNodes, clashInfo.activeProfileName]);
+  const profileGroups = clashInfo.profileGroups;
 
   // 预构建各订阅组节点的国家/地区识别结果与多维同义词检索索引
   const enrichedGroups: EnrichedProfileGroup[] = useMemo(() => {
@@ -623,9 +607,7 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
                 <span>
                   {totalNodeCount > 0
                     ? `点击搜索或选择任意订阅组的落地节点 (${profileGroups.length} 个订阅 · 共 ${totalNodeCount} 个)...`
-                    : clashInfo.connected
-                    ? '未扫描到可用具体节点...'
-                    : '未连接 Clash Verge Rev 控制接口...'}
+                    : '未读取到可用的 Clash Verge 本地订阅节点'}
                 </span>
               </div>
             )}

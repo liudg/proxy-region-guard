@@ -143,13 +143,13 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
       : null;
 
   const agPortNum = Number(raw.antigravityDedicatedPort);
-  let antigravityDedicatedPort =
+  const antigravityDedicatedPort =
     Number.isFinite(agPortNum) && agPortNum >= 1024 && agPortNum <= 65535
       ? Math.round(agPortNum)
       : DEFAULT_CONFIG.antigravityDedicatedPort;
 
   if (antigravityDedicatedPort === dedicatedProxyPort) {
-    antigravityDedicatedPort = dedicatedProxyPort === 27898 ? 27899 : 27898;
+    throw new Error('Claude 与 Antigravity 必须使用不同的专属端口');
   }
 
   const antigravityExePath =

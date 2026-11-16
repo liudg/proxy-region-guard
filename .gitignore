@@ -8,6 +8,7 @@ release/
 
 # Auto-synced GeoIP Databases (copied from node_modules during build)
 resources/*.mmdb
+resources/mihomo/
 
 # TypeScript & Vite Cache
 *.tsbuildinfo

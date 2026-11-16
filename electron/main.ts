@@ -16,6 +16,7 @@ import { ConfigStore } from './configStore';
 import { GeoIpService } from './geoipService';
 import { ClashMonitor } from './clashMonitor';
 import { ProbeEngine } from './probeEngine';
+import { PrivateProxyService } from './privateKernel';
 import { createStatusTrayIcon, createWindowAppIcon } from './trayIcon';
 import {
   applyAutoLaunchSetting,
@@ -136,6 +137,7 @@ let configStore!: ConfigStore;
 let geoIpService!: GeoIpService;
 let clashMonitor!: ClashMonitor;
 let probeEngine!: ProbeEngine;
+let privateProxies!: PrivateProxyService;
 let updaterService!: UpdaterService;
 
 let latestAlertPayload: AlertPayload | null = null;
@@ -479,6 +481,7 @@ function estimateTextLines(text: string | undefined | null, cjkPerLine: number):
 }
 
 function computeAlertWindowHeight(payload: AlertPayload): number {
+  if (payload.source === 'system') return Math.min(420, 170 + estimateTextLines(payload.errorDetail, 24) * 22);
   const hasKilled = Boolean(payload.killedProcesses && payload.killedProcesses.length > 0);
   const hasErr = Boolean(payload.killError);
   const hasIp = Boolean(payload.actualIp || (payload.alertType === 'ip-change' && payload.expectedIp));
@@ -618,7 +621,7 @@ function notifyAlertRecovered(payload: AlertPayload): void {
     !alertWindow ||
     alertWindow.isDestroyed() ||
     !alertWindow.isVisible() ||
-    latestAlertPayload?.source === 'claude'
+    latestAlertPayload?.source !== payload.source
   ) {
     return;
   }
@@ -720,7 +723,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     : 'Clash: 未连接';
 
   const profilePrefix =
-    state.config.selectedClashProfileName || state.clashInfo.boundProfileName;
+    state.config.selectedClashProfileName || state.privateChannels.claude.profileName;
   const effectiveClaudeIp =
     state.claudeState.lockedSessionIp ||
     state.claudeState.nodeProbe?.claudeTraceIp ||
@@ -737,7 +740,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     : '';
 
   const agProfilePrefix =
-    state.config.antigravityClashProfileName || state.clashInfo.antigravityBoundProfileName;
+    state.config.antigravityClashProfileName || state.privateChannels.antigravity.profileName;
   const agNodeText = state.config.antigravityClashNode
     ? `Antigravity节点: ${agProfilePrefix ? `${agProfilePrefix} / ` : ''}${state.config.antigravityClashNode}`
     : '';
@@ -1014,15 +1017,10 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       click: () => showMainWindow(),
     },
     {
-      label: state.claudeState.running
-        ? '完全退出程序 (将终止 Claude，保持 Antigravity 运行)'
-        : '完全退出程序 (保持 Antigravity 运行)',
+      label: '关闭管理界面（后台继续运行）',
       click: () => {
-        isQuitting = true;
-        trayHealth?.stop();
-        updaterService?.stop();
-        probeEngine?.stop();
-        app.quit();
+        mainWindow?.destroy();
+        mainWindow = null;
       },
     },
   ]);
@@ -1039,6 +1037,12 @@ function broadcastState(state: AppStateSnapshot): void {
 }
 
 function registerIpcHandlers(): void {
+  const privateChannel = (value: unknown): 'claude' | 'antigravity' => {
+    if (value !== 'claude' && value !== 'antigravity') throw new Error('私有代理通道无效');
+    return value;
+  };
+  ipcMain.handle('guard:apply-node-update', (_event, channel: unknown) => probeEngine.applyNodeUpdate(privateChannel(channel)));
+  ipcMain.handle('guard:restart-private-kernel', (_event, channel: unknown) => probeEngine.restartPrivateKernel(privateChannel(channel)));
   ipcMain.handle('guard:get-state', () => probeEngine.getSnapshot());
 
   ipcMain.handle('guard:check-now', (_e, reason?: string) =>
@@ -1147,7 +1151,7 @@ function registerIpcHandlers(): void {
     const prevCfg = configStore.get();
     let nextCfg = await probeEngine.updateConfig(partial);
 
-    if (!nextCfg.monitorAlertEnabled && latestAlertPayload?.source !== 'claude') {
+    if (!nextCfg.monitorAlertEnabled && latestAlertPayload?.source === 'monitor') {
       hideAlertWindow();
     }
 
@@ -1238,11 +1242,8 @@ function registerIpcHandlers(): void {
     if (configStore.get().closeToTray) {
       hideMainWindowToTray();
     } else {
-      isQuitting = true;
-      trayHealth?.stop();
-      updaterService?.stop();
-      probeEngine?.stop();
-      app.quit();
+      mainWindow?.destroy();
+      mainWindow = null;
     }
   });
 
@@ -1276,7 +1277,9 @@ if (tryRelaunchAsWindowsAdmin()) {
       await geoIpService.init(appRoot);
 
       clashMonitor = new ClashMonitor();
-      probeEngine = new ProbeEngine(configStore, geoIpService, clashMonitor);
+      privateProxies = new PrivateProxyService(path.join(app.getPath('userData'), 'private-proxies'),
+        path.join(app.isPackaged ? process.resourcesPath : path.join(appRoot, 'resources'), 'mihomo'));
+      probeEngine = new ProbeEngine(configStore, geoIpService, clashMonitor, privateProxies);
       updaterService = new UpdaterService({
         configStore,
         probeEngine,
@@ -1293,11 +1296,8 @@ if (tryRelaunchAsWindowsAdmin()) {
       probeEngine.on('state-changed', (state: AppStateSnapshot) => {
         broadcastState(state);
         const isClashProxyChannelReady = Boolean(
-          state.clashInfo.connected &&
-            ((state.clashInfo.mixedPort &&
-              state.clashInfo.mode?.trim().toLowerCase() !== 'direct') ||
-              state.clashInfo.antigravityPortListening ||
-              state.clashInfo.dedicatedPortListening)
+          (state.clashInfo.connected && state.clashInfo.mixedPort && state.clashInfo.mode !== 'direct') ||
+            state.privateChannels.antigravity.phase === 'ready' || state.privateChannels.claude.phase === 'ready'
         );
         if (!wasClashProxyChannelReady && isClashProxyChannelReady) {
           updaterService?.notifyNetworkReady(Date.now());

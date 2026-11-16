@@ -28,11 +28,12 @@ export interface SignedExtractedAssetEntry extends SignedAssetEntry {
 }
 
 export interface UpdateReleaseManifest {
-  schemaVersion: 1;
+  schemaVersion: 2;
   version: string;
   publishedAt: string;
   electronVersion: string;
   minNativeShellVersion: string;
+  mihomo: { version: string; sha256: string };
   notes: string;
   asar: SignedExtractedAssetEntry;
   mmdb?: SignedExtractedAssetEntry;
@@ -158,12 +159,13 @@ export function buildUpdateSignaturePayload(
     : 'none';
 
   return [
-    'proxy-region-guard-update-v1',
+    'proxy-region-guard-update-v2',
     `schemaVersion=${manifest.schemaVersion}`,
     `version=${manifest.version.trim()}`,
     `publishedAt=${manifest.publishedAt.trim()}`,
     `electronVersion=${manifest.electronVersion.trim()}`,
     `minNativeShellVersion=${manifest.minNativeShellVersion.trim()}`,
+    `mihomo=${manifest.mihomo.version}|${manifest.mihomo.sha256.toLowerCase()}`,
     `asar=${[
       manifest.asar.name,
       manifest.asar.url,
@@ -215,7 +217,7 @@ export function validateUpdateManifestStructure(
     throw new Error('更新清单格式无效：根节点不是对象');
   }
   const obj = raw as Record<string, unknown>;
-  if (obj.schemaVersion !== 1) {
+  if (obj.schemaVersion !== 2) {
     throw new Error(`不支持的更新清单版本 (schemaVersion=${String(obj.schemaVersion)})，请手动下载最新版`);
   }
 
@@ -300,15 +302,19 @@ export function validateUpdateManifestStructure(
   };
 
   const asar = validateExtractedAsset(obj.asar, 'asar');
+  const core = obj.mihomo as { version?: unknown; sha256?: unknown } | undefined;
+  const coreVersion = typeof core?.version === 'string' ? normalizeSemverString(core.version) : null;
+  if (!coreVersion || !isValidSha256Hex(core?.sha256)) throw new Error('更新清单缺少合法的私有 Mihomo 版本和文件摘要');
   const mmdb = obj.mmdb ? validateExtractedAsset(obj.mmdb, 'mmdb') : undefined;
   const fullZip = validateBaseAsset(obj.fullZip, 'fullZip');
 
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     version,
     publishedAt,
     electronVersion,
     minNativeShellVersion,
+    mihomo: { version: coreVersion, sha256: core!.sha256!.toString().toLowerCase() },
     notes,
     asar,
     ...(mmdb ? { mmdb } : {}),

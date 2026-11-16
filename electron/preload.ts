@@ -47,6 +47,8 @@ const api: GuardBridgeAPI = {
   launchAntigravity: () => ipcRenderer.invoke('guard:launch-antigravity'),
   terminateAntigravityNow: () => ipcRenderer.invoke('guard:terminate-antigravity'),
   browseAntigravityExe: () => ipcRenderer.invoke('guard:browse-antigravity-exe'),
+  applyNodeUpdate: (channel) => ipcRenderer.invoke('guard:apply-node-update', channel),
+  restartPrivateKernel: (channel) => ipcRenderer.invoke('guard:restart-private-kernel', channel),
 
   checkForUpdates: () => ipcRenderer.invoke('guard:check-for-updates'),
   downloadUpdate: () => ipcRenderer.invoke('guard:download-update'),
