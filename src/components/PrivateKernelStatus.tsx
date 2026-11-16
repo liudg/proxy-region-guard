@@ -23,14 +23,13 @@ export const PrivateKernelStatus: React.FC<{
       {state.nodeName && <button className="btn-secondary" disabled={busy || state.phase === 'starting' || state.phase === 'recovering'}
         onClick={() => void action(false)}>重新启动内核</button>}
     </div>
-    {state.phase === 'recovering' && <p>自动恢复已尝试 {state.restartAttempts} 次，最多三次。</p>}
+    {state.phase === 'recovering' && <p>自动恢复中（{state.restartAttempts}/3）</p>}
     {state.sourceStatus === 'changed' && <div className="private-kernel-status-row">
-      <span>订阅中的节点配置已经更新，当前继续使用保存的副本。</span>
+      <span>订阅节点已更新，当前仍用旧副本</span>
       <button className="btn-secondary" disabled={busy || state.phase === 'starting' || state.phase === 'recovering'} onClick={() => void action(true)}>应用节点更新</button>
     </div>}
-    {state.sourceStatus === 'missing' && state.nodeName && <p>订阅或节点已经移除，当前继续使用保存的副本。</p>}
-    {state.sourceStatus === 'unknown' && state.sourceError && <p>无法检查订阅更新：{state.sourceError}</p>}
-    {channel === 'claude' && state.nodeName && <p>重新启动内核或应用更新会终止 Claude，完成校验后需要重新启动 Claude。</p>}
+    {state.sourceStatus === 'missing' && state.nodeName && <p>原节点已移除，当前仍用旧副本</p>}
+    {state.sourceStatus === 'unknown' && state.sourceError && <p>订阅检查失败：{state.sourceError}</p>}
     {(error || state.error || state.verificationError) && <p role="alert" className="private-kernel-error">{error || state.error || state.verificationError}</p>}
   </div>;
 };

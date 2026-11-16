@@ -850,11 +850,11 @@ export const MainDashboard: React.FC = () => {
   const livePatternCheck = patternInput.trim() ? inspectProcessPattern(patternInput) : null;
 
   const installTypeLabel = {
-    'msix-alias': 'MSIX 官方执行别名 (推荐)',
-    'msix-direct': 'MSIX 应用包直连',
-    squirrel: '独立安装包',
-    custom: '手动指定路径',
-    'not-found': '未找到安装路径',
+    'msix-alias': 'MSIX 别名',
+    'msix-direct': 'MSIX 直连',
+    squirrel: '独立版',
+    custom: '自定义路径',
+    'not-found': '未找到路径',
   }[claudeState.installType];
 
   const agInstallTypeLabel = {
@@ -1893,7 +1893,7 @@ export const MainDashboard: React.FC = () => {
                       {claudeState.verificationFailure ? (
                         <>
                           <Clock size={17} />
-                          <span>地区校验暂时不可用 · 后台复核中</span>
+                          <span>地区校验中断 · 后台复核中</span>
                         </>
                       ) : claudeState.running ? (
                         <>
@@ -1912,7 +1912,7 @@ export const MainDashboard: React.FC = () => {
                         !claudeState.nodeProbeError ? (
                         <>
                           <RefreshCw className="spin" size={17} />
-                          <span>正在验证所选节点出口与环境...</span>
+                          <span>正在校验节点与环境...</span>
                         </>
                       ) : (
                         <>
@@ -1948,15 +1948,15 @@ export const MainDashboard: React.FC = () => {
                           {claudeState.verificationFailure.reason}
                         </strong>
                         <p>
-                          首次失败 {formatTime(claudeState.verificationFailure.startedAt)} ·
-                          持续至 {formatTime(claudeState.verificationFailure.deadlineAt)} 仍未恢复将终止 Claude 并提醒。
+                          {formatTime(claudeState.verificationFailure.startedAt)} 起异常 ·{' '}
+                          {formatTime(claudeState.verificationFailure.deadlineAt)} 前未恢复将终止 Claude
                         </p>
                         <small>
                           {claudeState.lockedSessionIp
-                            ? `🔒 锁定会话 IP：${claudeState.lockedSessionIp} · `
+                            ? `🔒 ${claudeState.lockedSessionIp} · `
                             : ''}
-                          最后成功校验：{claudeState.lastVerificationSuccessAt
-                            ? formatTime(claudeState.lastVerificationSuccessAt) : '暂无成功记录'}
+                          上次通过：{claudeState.lastVerificationSuccessAt
+                            ? formatTime(claudeState.lastVerificationSuccessAt) : '无'}
                         </small>
                       </div>
                     </div>
@@ -1997,44 +1997,46 @@ export const MainDashboard: React.FC = () => {
                                 className="ellipsis text-danger"
                                 title={claudeState.nodeProbe.regionMismatchDetail}
                               >
-                                ⚠️ 实际识别:{' '}
-                                Claude={claudeState.nodeProbe.claudeTraceLoc}
+                                ⚠️ Claude 识别: {claudeState.nodeProbe.claudeTraceLoc}
                               </small>
                             ) : claudeVerificationError ? (
-                              <small className="text-danger">{claudeVerificationError}</small>
+                              <small
+                                className="ellipsis text-danger"
+                                title={claudeVerificationError}
+                              >
+                                {claudeVerificationError}
+                              </small>
                             ) : claudeState.running && claudeState.lockedSessionIp ? (
                               <small
                                 className="ellipsis"
-                                title={`已锁定会话出口 IP: ${claudeState.lockedSessionIp}${
+                                title={`锁定出口 IP: ${claudeState.lockedSessionIp}${
                                   claudeState.nodeProbe.claudeTraceIp &&
                                   claudeState.nodeProbe.claudeTraceIp !== claudeState.nodeProbe.ip
-                                    ? ` · 常规回显 IP: ${claudeState.nodeProbe.ip}`
+                                    ? ` · 常规 IP: ${claudeState.nodeProbe.ip}`
                                     : ''
-                                } (${claudeState.nodeProbe.latencyMs} ms)`}
+                                } (${claudeState.nodeProbe.latencyMs}ms)`}
                               >
-                                🔒 锁定会话 IP: {claudeState.lockedSessionIp} ·{' '}
-                                {claudeState.nodeProbe.latencyMs} ms
+                                🔒 {claudeState.lockedSessionIp} ·{' '}
+                                {claudeState.nodeProbe.latencyMs}ms
                               </small>
                             ) : (
                               <small
                                 className="ellipsis"
-                                title={`Claude 实际出口 IP: ${
+                                title={`Claude 出口 IP: ${
                                   claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip
                                 }${
                                   claudeState.nodeProbe.claudeTraceIp &&
                                   claudeState.nodeProbe.claudeTraceIp !== claudeState.nodeProbe.ip
-                                    ? ` · 常规回显 IP: ${claudeState.nodeProbe.ip} (同国 AI 分流)`
+                                    ? ` · 常规 IP: ${claudeState.nodeProbe.ip} (同国分流)`
                                     : ''
-                                } (${claudeState.nodeProbe.latencyMs} ms)`}
+                                } (${claudeState.nodeProbe.latencyMs}ms)`}
                               >
-                                Claude IP:{' '}
                                 {claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip}
                                 {claudeState.nodeProbe.claudeTraceIp &&
                                 claudeState.nodeProbe.claudeTraceIp !== claudeState.nodeProbe.ip
-                                  ? ' (AI分流)'
+                                  ? ' (分流)'
                                   : ''}{' '}
-                                · {claudeState.nodeProbe.latencyMs} ms
-                                {' · 目标服务地区校验通过'}
+                                · {claudeState.nodeProbe.latencyMs}ms
                               </small>
                             )}
                           </>
@@ -2042,15 +2044,18 @@ export const MainDashboard: React.FC = () => {
                           <>
                             <strong className="text-warn">
                               {!config.selectedClashNode
-                                ? '未选定节点'
+                                ? '未选节点'
                                 : claudeState.isProbingNode
-                                ? '正在探测节点...'
+                                ? '探测中...'
                                 : '节点未连通'}
                             </strong>
-                            <small>
+                            <small
+                              className="ellipsis"
+                              title={claudeState.nodeProbeError || undefined}
+                            >
                               {config.selectedClashNode
-                                ? claudeState.nodeProbeError || '请检查节点连通性'
-                                : '请先在上方下拉框选择节点'}
+                                ? claudeState.nodeProbeError || '请检查连通性'
+                                : '请先选择节点'}
                             </small>
                           </>
                         )}
@@ -2078,9 +2083,7 @@ export const MainDashboard: React.FC = () => {
                           </strong>
                         </div>
                         <small>
-                          {claudeState.winRegionMatched
-                            ? '与指定代理一致'
-                            : '与代理地区不符！'}
+                          {claudeState.winRegionMatched ? '与代理一致' : '与代理不符'}
                         </small>
                       </div>
                     </div>
@@ -2106,9 +2109,7 @@ export const MainDashboard: React.FC = () => {
                           {winLocale.timeZoneDisplayName}
                         </strong>
                         <small>
-                          {claudeState.winTimeZoneMatched
-                            ? '与指定代理一致'
-                            : '与代理时区不符！'}
+                          {claudeState.winTimeZoneMatched ? '与代理一致' : '与代理不符'}
                         </small>
                       </div>
                     </div>
@@ -2136,8 +2137,8 @@ export const MainDashboard: React.FC = () => {
                             />
                             <span>
                               {isSyncingLocale
-                                ? '正在同步系统时区与区域...'
-                                : `一键同步系统时区与区域至 [${claudeState.proxyCountryName}]`}
+                                ? '正在同步...'
+                                : `一键同步至 [${claudeState.proxyCountryName}]`}
                             </span>
                           </button>
                         )}
@@ -2151,12 +2152,12 @@ export const MainDashboard: React.FC = () => {
                         <AlertTriangle size={15} />
                         <span>
                           {pendingClaudeConfirm.type === 'switch-node'
-                            ? `Claude 正在运行中，切换节点至 [${
+                            ? `切换至 [${
                                 pendingClaudeConfirm.nodeName || '未绑定'
-                              }] 将先安全终止当前 Claude 会话，待新节点通过三重校验后可重新启动。`
+                              }] 将先终止 Claude，新节点校验通过后可重启。`
                             : pendingClaudeConfirm.type === 'change-port'
-                            ? `Claude 正在运行中，修改专属端口为 ${pendingClaudeConfirm.port} 将先终止当前 Claude 会话。`
-                            : '确定要立即终止全部 Claude 关联进程并回收启动授权锁吗？'}
+                            ? `修改端口为 ${pendingClaudeConfirm.port} 将先终止当前 Claude。`
+                            : '确定立即终止全部 Claude 进程？'}
                         </span>
                       </div>
                       <div className="confirm-bar-actions">
@@ -2178,9 +2179,9 @@ export const MainDashboard: React.FC = () => {
                           }}
                         >
                           {pendingClaudeConfirm.type === 'switch-node'
-                            ? '确认切换并终止 Claude'
+                            ? '确认切换'
                             : pendingClaudeConfirm.type === 'change-port'
-                            ? '确认修改端口'
+                            ? '确认修改'
                             : '确认终止'}
                         </button>
                         <button
@@ -2213,15 +2214,15 @@ export const MainDashboard: React.FC = () => {
                       {isLaunchingClaude ? (
                         <>
                           <RefreshCw className="spin" size={16} />
-                          <span>正在校验环境并拉起 Claude...</span>
+                          <span>正在校验并启动 Claude...</span>
                         </>
                       ) : (
                         <>
                           <Play size={16} />
                           <span>
                             {claudeState.running
-                              ? '重新激活 / 唤起 Claude Desktop'
-                              : '安全启动 Claude Desktop（唯一入口）'}
+                              ? '重新唤起 Claude Desktop'
+                              : '安全启动 Claude Desktop'}
                           </span>
                         </>
                       )}
@@ -2231,7 +2232,7 @@ export const MainDashboard: React.FC = () => {
                       <button
                         className="btn-kill-claude"
                         onClick={handleTerminateClaude}
-                        title="立即强杀全部 Claude 关联进程并回收启动锁"
+                        title="立即终止全部 Claude 进程"
                       >
                         <Square size={14} />
                         <span>终止 Claude</span>
@@ -2242,9 +2243,10 @@ export const MainDashboard: React.FC = () => {
                   {claudeState.nodeProbe && (
                     <div className="hero-footer-meta">
                       <span className="ellipsis" title={claudeState.nodeProbe.viaChannel}>
-                        独立监控通道：{claudeState.nodeProbe.viaChannel}
+                        专属通道：127.0.0.1:{config.dedicatedProxyPort}
+                        {config.selectedClashNode ? ` · ${config.selectedClashNode}` : ''}
                       </span>
-                      <span>更新于 {formatTime(claudeState.nodeProbe.checkedAt)}</span>
+                      <span>{formatTime(claudeState.nodeProbe.checkedAt)} 更新</span>
                     </div>
                   )}
 
@@ -2282,8 +2284,8 @@ export const MainDashboard: React.FC = () => {
                     </div>
                     <div className="collapsible-header-right">
                       <span className="mini-badge neutral">
-                        {config.claudeExclusiveGuard ? '唯一入口拦截' : '拦截已关'} ·{' '}
-                        {config.claudeLockExitIp ? 'IP锁定开启' : 'IP锁定已关'} · 127.0.0.1:
+                        {config.claudeExclusiveGuard ? '唯一入口' : '允许外启'} ·{' '}
+                        {config.claudeLockExitIp ? '锁IP' : '不锁IP'} · 127.0.0.1:
                         {config.dedicatedProxyPort} · {installTypeLabel}
                       </span>
                       <span className="collapse-chevron">
@@ -2301,7 +2303,7 @@ export const MainDashboard: React.FC = () => {
                       <div className="setting-row">
                         <div>
                           <strong>仅允许从本面板启动 Claude</strong>
-                          <p>拦截桌面、开始菜单等外部直接启动，防止未校验环境裸奔</p>
+                          <p>拦截外部直接启动，防止绕过环境校验</p>
                         </div>
                         <input
                           type="checkbox"
@@ -2318,10 +2320,8 @@ export const MainDashboard: React.FC = () => {
 
                       <div className="setting-row">
                         <div>
-                          <strong>锁定会话出口 IP（变更即强杀）</strong>
-                          <p>
-                            锁定会话启动时 claude.ai 识别的真实出口 IP；运行期发生任何 IP 漂移（含同国换 IP、IPv4/IPv6 切换）立即 0 秒强杀进程树。动态轮换住宅代理可按需关闭。
-                          </p>
+                          <strong>锁定会话出口 IP</strong>
+                          <p>运行期出口 IP 变动立即强杀；动态住宅代理可关闭</p>
                         </div>
                         <input
                           type="checkbox"
@@ -2339,9 +2339,7 @@ export const MainDashboard: React.FC = () => {
                       <div className="setting-row">
                         <div>
                           <strong>Claude 保护终止提醒</strong>
-                          <p>
-                            出口 IP 漂移、地区或时区不一致时立即 0 秒强杀并置顶弹窗提醒；请求暂时失败期间静默复核，持续 30 秒未恢复时终止并提醒。
-                          </p>
+                          <p>IP、地区或时区异常立即强杀并弹窗；校验中断超 30 秒同样终止</p>
                         </div>
                         <span className="mini-badge connected" style={{ flexShrink: 0 }}>
                           始终开启
@@ -2350,7 +2348,7 @@ export const MainDashboard: React.FC = () => {
 
                       <div className="claude-exe-path-box">
                         <div className="exe-path-header">
-                          <span>专属代理监听端口：</span>
+                          <span>专属监听端口：</span>
                         </div>
                         <div className="exe-path-row">
                           <code className="exe-path-code">127.0.0.1 :</code>
@@ -2395,7 +2393,7 @@ export const MainDashboard: React.FC = () => {
                             title={claudeState.detectedExePath || '未检测到 Claude.exe'}
                           >
                             {claudeState.detectedExePath ||
-                              '未检测到 Claude Desktop，请点击右侧手动选择'}
+                              '未检测到客户端，请点击右侧选择'}
                           </code>
                           <button
                             className="btn-save-inline"

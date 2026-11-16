@@ -2105,25 +2105,25 @@ export class ProbeEngine extends EventEmitter {
 
     let launchBlockReason: string | null = null;
     if (!this.claudeDetectedExe) {
-      launchBlockReason = '未检测到 Claude Desktop 安装路径，请手动指定 Claude.exe';
+      launchBlockReason = '未检测到客户端路径，请手动指定 Claude.exe';
     } else if (!cfg.selectedClashNode) {
-      launchBlockReason = '请先在上方选择要为 Claude 绑定的 Clash 代理节点';
+      launchBlockReason = '请先选择代理节点';
     } else if (kernel.phase !== 'ready') {
-      launchBlockReason = kernel.error || 'Claude 私有内核尚未就绪';
+      launchBlockReason = kernel.error || '私有代理内核未就绪';
     } else if (kernel.verificationError) {
       launchBlockReason = kernel.verificationError;
     } else if (this.claudeIsProbing && !this.claudeNodeProbe && !this.claudeNodeProbeError) {
-      launchBlockReason = '正在独立验证 Claude 所选节点的真实出口 IP 与归属地...';
+      launchBlockReason = '正在校验节点出口与地区...';
     } else if (this.claudeNodeProbeError || !proxyCountryCode) {
-      launchBlockReason = `Claude 节点出口探测异常：${
-        this.claudeNodeProbeError || '未获取到有效出口国家'
+      launchBlockReason = `出口探测异常：${
+        this.claudeNodeProbeError || '未获取到有效国家'
       }`;
     } else if (verificationError) {
-      launchBlockReason = `目标服务地区校验未通过：${verificationError}`;
+      launchBlockReason = `地区校验未通过：${verificationError}`;
     } else if (!winRegionMatched) {
-      launchBlockReason = `系统区域 [${this.winLocale.regionName} (${this.winLocale.regionCode})] 与 Claude 节点出口 [${proxyCountryName} (${proxyCountryCode})] 不一致，请点击下方一键同步`;
+      launchBlockReason = `系统区域（${this.winLocale.regionName}）与节点地区（${proxyCountryName}）不一致`;
     } else if (!winTimeZoneMatched) {
-      launchBlockReason = `系统时区 [${this.winLocale.timeZoneDisplayName}] 与 Claude 节点出口 [${proxyCountryName} (${proxyCountryCode})] 不一致，请点击下方一键同步`;
+      launchBlockReason = `系统时区与节点地区（${proxyCountryName}）不一致`;
     }
 
     return {

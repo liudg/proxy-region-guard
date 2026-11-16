@@ -606,8 +606,8 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
                 <Search size={14} className="placeholder-search-icon" />
                 <span>
                   {totalNodeCount > 0
-                    ? `点击搜索或选择任意订阅组的落地节点 (${profileGroups.length} 个订阅 · 共 ${totalNodeCount} 个)...`
-                    : '未读取到可用的 Clash Verge 本地订阅节点'}
+                    ? '搜索或选择代理节点...'
+                    : '未读取到本地订阅节点'}
                 </span>
               </div>
             )}
@@ -639,7 +639,7 @@ export const ClashNodeSelector: React.FC<ClashNodeSelectorProps> = ({
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
               onKeyDown={handleKeyDown}
-              placeholder="支持中英文国家/缩写/多词组合搜索，如: 美国 vless / jp 01..."
+              placeholder="搜索国家、缩写或协议，如 美国 vless / jp 01..."
             />
             {searchQuery && (
               <button
