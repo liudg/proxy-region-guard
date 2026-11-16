@@ -291,6 +291,39 @@ export class ClashMonitor extends EventEmitter {
     };
   }
 
+  public isChannelGraceMasked(channelId: DedicatedChannelId): boolean {
+    return channelId === 'claude' ? this.claudeInGraceMask : this.agInGraceMask;
+  }
+
+  public hasRecentConfigActivityOrGrace(now = Date.now()): boolean {
+    return now < this.rebindGraceUntil || this.hasRecentConfigFileActivity(now);
+  }
+
+  public async waitForPendingConfigReload(maxWaitMs = 1200): Promise<void> {
+    const deadline = Date.now() + maxWaitMs;
+    while (
+      !this.stopped &&
+      Date.now() < deadline &&
+      (this.configWatchDebounceTimer !== null ||
+        (this.isTicking && this.hasRecentConfigActivityOrGrace()))
+    ) {
+      await new Promise((r) => setTimeout(r, 50));
+    }
+    const remainingMs = deadline - Date.now();
+    if (!this.stopped && remainingMs > 0) {
+      let queueTimeout: NodeJS.Timeout | null = null;
+      await Promise.race([
+        this.listenerApplyQueue,
+        new Promise<void>((resolve) => {
+          queueTimeout = setTimeout(resolve, remainingMs);
+        }),
+      ]);
+      if (queueTimeout) {
+        clearTimeout(queueTimeout);
+      }
+    }
+  }
+
   public start(
     initialClaudeNode: string | null = null,
     claudePort = 27897,
@@ -579,7 +612,9 @@ export class ClashMonitor extends EventEmitter {
           const debounceMs = lower === 'profiles.yaml' ? 550 : 420;
           this.configWatchDebounceTimer = setTimeout(() => {
             this.configWatchDebounceTimer = null;
-            this.scheduleNextTick(0);
+            if (!this.stopped) {
+              void this.tick();
+            }
           }, debounceMs);
         }
       });
@@ -698,9 +733,13 @@ export class ClashMonitor extends EventEmitter {
           }
           const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
           const nodeAliveInKernel = Boolean(proxiesMap[expectedInternal]);
-          const portAlive = nodeAliveInKernel
+          let portAlive = nodeAliveInKernel
             ? await isLocalPortListening(slot.desiredPort)
             : false;
+          if (!portAlive && nodeAliveInKernel && slot.boundPort === slot.desiredPort) {
+            await new Promise((r) => setTimeout(r, 120));
+            portAlive = await isLocalPortListening(slot.desiredPort, 800);
+          }
           const desiredProfileMatches =
             !slot.desiredProfileUid ||
             !slot.boundProfileUid ||
@@ -1064,7 +1103,12 @@ export class ClashMonitor extends EventEmitter {
         if (!slot.desiredNodeName) return false;
         const expectedInternal = slot.boundInternalProxyName || slot.internalProxyName;
         if (!proxiesMap[expectedInternal]) return false;
-        return isLocalPortListening(slot.desiredPort);
+        if (await isLocalPortListening(slot.desiredPort)) return true;
+        if (slot.boundPort === slot.desiredPort) {
+          await new Promise((r) => setTimeout(r, 100));
+          return isLocalPortListening(slot.desiredPort, 800);
+        }
+        return false;
       };
 
       const [wasClaudeAliveInKernel, wasAgAliveInKernel] = await Promise.all([
@@ -1302,10 +1346,10 @@ export class ClashMonitor extends EventEmitter {
 
       const [claudeListening, antigravityListening] = await Promise.all([
         slotOutcome.claude.shouldBind
-          ? waitPortListening(claudeSlot.desiredPort, 1500)
+          ? waitPortListening(claudeSlot.desiredPort, 2200)
           : Promise.resolve(false),
         slotOutcome.antigravity.shouldBind
-          ? waitPortListening(agSlot.desiredPort, 1500)
+          ? waitPortListening(agSlot.desiredPort, 2200)
           : Promise.resolve(false),
       ]);
 
@@ -1371,13 +1415,13 @@ export class ClashMonitor extends EventEmitter {
       );
       if (previousClaudeDefinition !== claudeSlot.boundDefinition) {
         this.emit('claude-clash-ready', true);
-      } else if (claudeSlot.desiredNodeName && !wasClaudeAliveInKernel && claudeListening) {
-        this.emit('claude-listener-rebound');
+      } else if (claudeSlot.desiredNodeName && claudeListening) {
+        this.emit('claude-listener-rebound', { wasAliveInKernel: wasClaudeAliveInKernel });
       }
       if (previousAgDefinition !== agSlot.boundDefinition) {
         this.emit('antigravity-clash-ready', true);
-      } else if (agSlot.desiredNodeName && !wasAgAliveInKernel && antigravityListening) {
-        this.emit('antigravity-listener-rebound');
+      } else if (agSlot.desiredNodeName && antigravityListening) {
+        this.emit('antigravity-listener-rebound', { wasAliveInKernel: wasAgAliveInKernel });
       }
 
       const allSlotsSatisfied =
@@ -2958,7 +3002,7 @@ function formatControllerErrorBody(body: string): string {
   return `: ${detail.replace(/\s+/g, ' ').slice(0, 512)}`;
 }
 
-export function isLocalPortListening(port: number, timeoutMs = 220): Promise<boolean> {
+export function isLocalPortListening(port: number, timeoutMs = 600): Promise<boolean> {
   return new Promise((resolve) => {
     const sock = new net.Socket();
     let done = false;
@@ -2979,12 +3023,13 @@ export function isLocalPortListening(port: number, timeoutMs = 220): Promise<boo
 async function waitPortListening(port: number, maxWaitMs: number): Promise<boolean> {
   const deadline = Date.now() + maxWaitMs;
   while (Date.now() < deadline) {
-    if (await isLocalPortListening(port, 180)) {
+    const attemptTimeout = Math.max(100, Math.min(350, deadline - Date.now()));
+    if (await isLocalPortListening(port, attemptTimeout)) {
       return true;
     }
-    await new Promise((r) => setTimeout(r, 80));
+    await new Promise((r) => setTimeout(r, 70));
   }
-  return isLocalPortListening(port, 200);
+  return isLocalPortListening(port, 350);
 }
 
 function getFileVersion(filePath: string): string | null {

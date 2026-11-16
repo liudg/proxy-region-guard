@@ -3,8 +3,22 @@ import { ClaudeVerificationFailure } from '../src/shared/types';
 export const CLAUDE_VERIFICATION_RETRY_MS = 5000;
 export const CLAUDE_VERIFICATION_DEADLINE_MS = 30000;
 
+export function normalizeVerificationFailureSignature(reason: string): string {
+  return reason
+    .trim()
+    .replace(/^Claude 专属节点出口不可达\s*\((.*)\)$/s, '$1')
+    .replace(/https?:\/\/[^\s：)]+?(?:：|:\s+)/gi, '<probe-url>:')
+    .replace(/\s+/g, ' ');
+}
+
+export interface VerificationFailureRecordResult {
+  shouldLog: boolean;
+  stateChanged: boolean;
+}
+
 export class ClaudeVerificationRecovery {
   private failure: ClaudeVerificationFailure | null = null;
+  private loggedSignatures = new Set<string>();
   private retryTimer: NodeJS.Timeout | null = null;
   private deadlineTimer: NodeJS.Timeout | null = null;
   private retryInProgress = false;
@@ -20,16 +34,24 @@ export class ClaudeVerificationRecovery {
     return this.failure ? { ...this.failure } : null;
   }
 
-  recordFailure(reason: string): boolean {
+  recordFailure(reason: string): VerificationFailureRecordResult {
+    const nextSignature = normalizeVerificationFailureSignature(reason);
     if (this.failure) {
-      const changed = this.failure.reason !== reason;
+      const reasonChanged = this.failure.reason !== reason;
+      const sigIsNew = !this.loggedSignatures.has(nextSignature);
       this.failure.reason = reason;
-      return changed;
+      this.loggedSignatures.add(nextSignature);
+      return {
+        shouldLog: sigIsNew,
+        stateChanged: reasonChanged,
+      };
     }
 
     const startedAt = Date.now();
     const failure = { startedAt, deadlineAt: startedAt + this.deadlineMs, reason };
     this.failure = failure;
+    this.loggedSignatures.clear();
+    this.loggedSignatures.add(nextSignature);
     this.deadlineTimer = setTimeout(() => {
       if (this.failure !== failure) return;
       const expired = { ...failure };
@@ -43,12 +65,16 @@ export class ClaudeVerificationRecovery {
         this.retryInProgress = false;
       });
     }, this.retryMs);
-    return true;
+    return {
+      shouldLog: true,
+      stateChanged: true,
+    };
   }
 
   clear(): ClaudeVerificationFailure | null {
     const previous = this.snapshot;
     this.failure = null;
+    this.loggedSignatures.clear();
     if (this.retryTimer) clearInterval(this.retryTimer);
     if (this.deadlineTimer) clearTimeout(this.deadlineTimer);
     this.retryTimer = null;

@@ -13,8 +13,10 @@ import {
 import {
   CLAUDE_VERIFICATION_DEADLINE_MS,
   CLAUDE_VERIFICATION_RETRY_MS,
+  normalizeVerificationFailureSignature,
 } from '../electron/claudeVerificationRecovery';
-import { ProbeEngine } from '../electron/probeEngine';
+import { formatNetworkErrorMessage } from '../electron/netClient';
+import { isLocalProxyRefusedError, ProbeEngine } from '../electron/probeEngine';
 import { ConfigStore } from '../electron/configStore';
 import { terminateProtectedProcesses } from '../electron/processGuard';
 import { AlertPayload, ProbeResult } from '../src/shared/types';
@@ -36,22 +38,45 @@ export async function runClaudeVerificationRecoveryTests(
   assert.equal(getTargetServiceVerificationError(recoveredProbe), null);
   assert.ok(recoveredProbe.claudeTraceCheckedAt);
 
-  let firstRequestFailedAt = 0;
-  let requestFailures = 0;
-  const failedExit = await runtime.probeOnceViaChannel(
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED 127.0.0.1:27897', 'http://127.0.0.1:27897'), true);
+  assert.equal(isLocalProxyRefusedError('https://ipv4.icanhazip.com：connect ECONNREFUSED 127.0.0.1:27897', 'http://127.0.0.1:27897'), true);
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED ::1:27897', 'http://localhost:27897'), true);
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED [::1]:27897', 'http://[::1]:27897'), true);
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED 127.0.0.1:80', 'http://127.0.0.1'), true);
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED', 'http://127.0.0.1:27897'), true);
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED 203.0.113.5:443', 'http://127.0.0.1:27897'), false);
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED 203.0.113.5:27897', 'http://127.0.0.1:27897'), false);
+  assert.equal(isLocalProxyRefusedError('https://example.com:27897/trace：connect ECONNREFUSED 203.0.113.5:443', 'http://127.0.0.1:27897'), false);
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED 2606:4700:7890::1:443', 'http://127.0.0.1:7890'), false);
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED 203.0.113.5:443', 'http://127.0.0.1'), false);
+  assert.equal(isLocalProxyRefusedError('connect ECONNREFUSED 127.0.0.1:9999', 'http://127.0.0.1:27897'), false);
+
+  const emptyMsgAgg = Object.assign(
+    new AggregateError(
+      [new Error('connect ECONNREFUSED ::1:27897'), new Error('connect ECONNREFUSED 127.0.0.1:27897')],
+      ''
+    ),
+    { code: 'ECONNREFUSED' }
+  );
+  const formattedAgg = formatNetworkErrorMessage(emptyMsgAgg);
+  assert.match(formattedAgg, /ECONNREFUSED 127\.0\.0\.1:27897/);
+  assert.equal(isLocalProxyRefusedError(formattedAgg, 'http://localhost:27897'), true);
+
+  let localRefusedCalls = 0;
+  const failedLocalExit = await runtime.probeOnceViaChannel(
     'http://127.0.0.1:1',
-    '运行期出口检测',
+    '运行期本地端口未监听短路检测',
     4500,
     '探测超时',
-    (reason: string) => {
-      firstRequestFailedAt ||= Date.now();
-      requestFailures++;
+    (reason: string, meta: { localProxyRefused: boolean }) => {
+      localRefusedCalls++;
+      assert.equal(meta.localProxyRefused, true);
       assert.match(reason, /https:\/\//);
     }
   );
-  assert.equal(failedExit.result, null);
-  assert.ok(requestFailures > 1);
-  assert.ok(firstRequestFailedAt <= Date.now());
+  assert.equal(failedLocalExit.result, null);
+  assert.equal(failedLocalExit.localProxyRefused, true);
+  assert.equal(localRefusedCalls, 1, '本地代理端口 ECONNREFUSED 应立即短路，不重复轮询其余远端 URL');
 
   const proxyServer = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
@@ -70,6 +95,25 @@ export async function runClaudeVerificationRecoveryTests(
   });
   await new Promise<void>((resolve) => proxyServer.listen(0, '127.0.0.1', resolve));
   const testPort = (proxyServer.address() as net.AddressInfo).port;
+
+  let firstRequestFailedAt = 0;
+  let requestFailures = 0;
+  const failedExit = await runtime.probeOnceViaChannel(
+    `http://127.0.0.1:${testPort}`,
+    '运行期出口检测',
+    4500,
+    '探测超时',
+    (reason: string, meta: { localProxyRefused: boolean }) => {
+      firstRequestFailedAt ||= Date.now();
+      requestFailures++;
+      assert.equal(meta.localProxyRefused, false);
+      assert.match(reason, /https:\/\//);
+    }
+  );
+  assert.equal(failedExit.result, null);
+  assert.equal(failedExit.localProxyRefused, false);
+  assert.ok(requestFailures > 1, '本地代理端口正常监听但远端隧道异常时应依次尝试全部回退探测源');
+  assert.ok(firstRequestFailedAt <= Date.now());
 
   const executableName = `guard-recovery-child-${process.pid}.exe`;
   const executable = path.join(directory, executableName);
@@ -605,6 +649,326 @@ export async function runClaudeVerificationRecoveryTests(
       assert.equal(jsonV6Probe.result?.ip, '2606:4700:4700::beef');
       store.update({ customProbeUrl: `http://127.0.0.1:${testPort}/trace` });
       console.log('通过：外部会话基线严格等待启动后新发起的探测轮次，忽略启动前在途旧探测结果且 plain-ip IPv6 统一规范化');
+
+      // Case 7: 本地专属端口瞬态 ECONNREFUSED 自动重绑静默自愈（0 误报日志）与多探测源失败去重合并
+      const sig1 = normalizeVerificationFailureSignature(
+        'Claude 专属节点 [iNetS / JP10] (127.0.0.1:27897)：https://ipv4.icanhazip.com/cdn-cgi/trace：socket hang up'
+      );
+      const sig2 = normalizeVerificationFailureSignature(
+        'Claude 专属节点 [iNetS / JP10] (127.0.0.1:27897)：https://cp.cloudflare.com/cdn-cgi/trace：socket hang up'
+      );
+      const sigWrapped = normalizeVerificationFailureSignature(
+        'Claude 专属节点出口不可达 (Claude 专属节点 [iNetS / JP10] (127.0.0.1:27897)：https://icanhazip.com：socket hang up)'
+      );
+      const sigCustomPort = normalizeVerificationFailureSignature(
+        'Claude 专属节点 [iNetS / JP10] (127.0.0.1:27897)：https://probe.example.com:8443/trace：socket hang up'
+      );
+      assert.equal(sig1, sig2);
+      assert.equal(sig1, sigWrapped);
+      assert.equal(sig1, sigCustomPort, '带端口探测 URL 归一化后应与标准探测 URL 合并签名');
+
+      runtime.claudeVerificationRecovery.clear();
+      const dedupLogsBefore = engine.getSnapshot().logs.length;
+      runtime.recordClaudeVerificationFailure(
+        'Claude 专属节点 [iNetS / JP10] (127.0.0.1:27897)：https://probe.example.com:8443/trace：HTTP 状态码 502'
+      );
+      runtime.recordClaudeVerificationFailure(
+        'Claude 专属节点 [iNetS / JP10] (127.0.0.1:27897)：https://ipv4.icanhazip.com/cdn-cgi/trace：socket hang up'
+      );
+      // 再次交替回 502 与 socket hang up，Set 去重不得重复刷屏
+      runtime.recordClaudeVerificationFailure(
+        'Claude 专属节点 [iNetS / JP10] (127.0.0.1:27897)：https://cp.cloudflare.com/cdn-cgi/trace：HTTP 状态码 502'
+      );
+      runtime.recordClaudeVerificationFailure(
+        'Claude 专属节点出口不可达 (Claude 专属节点 [iNetS / JP10] (127.0.0.1:27897)：https://icanhazip.com：socket hang up)'
+      );
+      assert.equal(
+        engine.getSnapshot().logs.length,
+        dedupLogsBefore + 2,
+        '同一复核窗口内 A-B-A 交替错误与多 URL 回退对每种错误签名至多记录 1 条警告日志'
+      );
+      runtime.claudeVerificationRecovery.clear();
+
+      // 模拟运行期专属端口在 firstPass 瞬间因内核重载闪断 (ECONNREFUSED)，随后自动恢复监听并静默通过，不刷任何警告日志
+      const rebindServer = http.createServer((_req, res) => {
+        res.writeHead(200, { 'Content-Type': 'text/plain' });
+        res.end(`ip=${recoveredProbe.ip}\nloc=${recoveredProbe.countryCode}\n`);
+      });
+      await new Promise<void>((resolve) => rebindServer.listen(0, '127.0.0.1', resolve));
+      const rebindPort = (rebindServer.address() as net.AddressInfo).port;
+      const origConfigureDedicated = runtime.clashMonitor.configureDedicatedNode.bind(
+        runtime.clashMonitor
+      );
+      const origProbeOnce = runtime.probeOnceViaChannel.bind(runtime);
+      try {
+        store.update({
+          selectedClashNode: '运行期测试节点',
+          selectedClashProfileUid: 'test-uid',
+          dedicatedProxyPort: rebindPort,
+          customProbeUrl: `http://127.0.0.1:${rebindPort}/trace`,
+          claudeLockExitIp: true,
+          claudeExclusiveGuard: true,
+        });
+        markClaudeLaunchedByGuard(rebindPort);
+        runtime.claudeRunning = true;
+        runtime.claudeAuthorizedSession = true;
+        runtime.claudeSessionInitialIp = initialTraceIp;
+        runtime.claudeExternalBaselinePending = false;
+        runtime.clashMonitor.info = {
+          ...runtime.clashMonitor.getRuntimeInfo(),
+          connected: true,
+          bindingVerificationError: null,
+          dedicatedPortListening: true,
+          boundNode: '运行期测试节点',
+          boundProfileUid: 'test-uid',
+          dedicatedPort: rebindPort,
+        };
+        runtime.verifyTargetServiceRegion = async (
+          _pUrl: string | null,
+          probeObj: ProbeResult,
+          targetApp: 'claude' | 'antigravity'
+        ) => {
+          if (targetApp !== 'claude') return;
+          probeObj.claudeTraceLoc = recoveredProbe.countryCode;
+          probeObj.claudeTraceIp = initialTraceIp;
+          probeObj.claudeTraceCheckedAt = Date.now();
+          probeObj.regionMismatchDetail = null;
+        };
+
+        // 场景 A: 端口在巡检前已被 Clash 重载清空（dedicatedPortListening 仍滞后为 true），configureDedicatedNode 自动重绑恢复
+        await new Promise<void>((resolve) => rebindServer.close(() => resolve()));
+        let configureCalled = 0;
+        runtime.clashMonitor.configureDedicatedNode = async () => {
+          configureCalled++;
+          await new Promise<void>((resolve) => rebindServer.listen(rebindPort, '127.0.0.1', resolve));
+          return {
+            ok: true,
+            listening: true,
+            rebound: true,
+            profileUid: 'test-uid',
+            profileName: '测试订阅',
+          };
+        };
+
+        const logsBeforePreHeal = engine.getSnapshot().logs.filter((l) =>
+          l.message.includes('地区校验暂时不可用')
+        ).length;
+        const preHealSnap = await engine.probeClaudeNodeNow('Claude 运行期心跳巡检');
+        const logsAfterPreHeal = preHealSnap.logs.filter((l) =>
+          l.message.includes('地区校验暂时不可用')
+        ).length;
+        assert.equal(configureCalled, 1);
+        assert.equal(logsAfterPreHeal, logsBeforePreHeal, '前置端口探活自动重绑成功不应产生任何地区校验不可用警告');
+        assert.equal(preHealSnap.claudeState.verificationFailure, null);
+        assert.ok(preHealSnap.claudeState.nodeProbe);
+
+        // 场景 B: 前置探活通过后，firstPass 发起瞬间撞上对端重载导致 ECONNREFUSED，且重绑在 firstPass 返回前已完成（无 reboundBefore 事件）
+        let simulateFirstPassRefusedOnce = true;
+        runtime.probeOnceViaChannel = async (
+          pUrl: string | null,
+          via: string,
+          tMs: number,
+          defErr?: string,
+          onFail?: (r: string, meta: { localProxyRefused: boolean }) => void
+        ) => {
+          if (simulateFirstPassRefusedOnce) {
+            simulateFirstPassRefusedOnce = false;
+            const err = `https://ipv4.icanhazip.com：connect ECONNREFUSED 127.0.0.1:${rebindPort}`;
+            onFail?.(err, { localProxyRefused: true });
+            return { result: null, errMsg: err, localProxyRefused: true };
+          }
+          return origProbeOnce(pUrl, via, tMs, defErr, onFail);
+        };
+
+        const logsBeforeMidHeal = engine.getSnapshot().logs.filter((l) =>
+          l.message.includes('地区校验暂时不可用')
+        ).length;
+        const midHealSnap = await engine.probeClaudeNodeNow('Claude 运行期心跳巡检');
+        const logsAfterMidHeal = midHealSnap.logs.filter((l) =>
+          l.message.includes('地区校验暂时不可用')
+        ).length;
+        assert.equal(simulateFirstPassRefusedOnce, false);
+        assert.equal(logsAfterMidHeal, logsBeforeMidHeal, 'firstPass 瞬态本地 ECONNREFUSED 自动重试恢复不应刷出警告日志');
+        assert.equal(midHealSnap.claudeState.verificationFailure, null);
+        assert.ok(midHealSnap.claudeState.nodeProbe);
+
+        // 场景 C: 二阶段 verifyTargetServiceRegion 瞬态本地 ECONNREFUSED 自动重试恢复（0 误报）
+        let phase2FailOnce = true;
+        runtime.verifyTargetServiceRegion = async (
+          _pUrl: string | null,
+          probeObj: ProbeResult,
+          targetApp: 'claude' | 'antigravity'
+        ) => {
+          if (targetApp !== 'claude') return;
+          if (phase2FailOnce) {
+            phase2FailOnce = false;
+            probeObj.claudeTraceLoc = undefined;
+            probeObj.claudeTraceIp = undefined;
+            probeObj.claudeTraceError = `https://claude.ai/cdn-cgi/trace：connect ECONNREFUSED 127.0.0.1:${rebindPort}`;
+            return;
+          }
+          probeObj.claudeTraceLoc = recoveredProbe.countryCode;
+          probeObj.claudeTraceIp = initialTraceIp;
+          probeObj.claudeTraceCheckedAt = Date.now();
+          probeObj.claudeTraceError = undefined;
+          probeObj.regionMismatchDetail = null;
+        };
+        const logsBeforePhase2Heal = engine.getSnapshot().logs.filter((l) =>
+          l.message.includes('地区校验暂时不可用')
+        ).length;
+        const phase2HealSnap = await engine.probeClaudeNodeNow('Claude 运行期心跳巡检');
+        const logsAfterPhase2Heal = phase2HealSnap.logs.filter((l) =>
+          l.message.includes('地区校验暂时不可用')
+        ).length;
+        assert.equal(phase2FailOnce, false);
+        assert.equal(logsAfterPhase2Heal, logsBeforePhase2Heal, '二阶段瞬态本地 ECONNREFUSED 重试恢复不应刷警告日志');
+        assert.equal(phase2HealSnap.claudeState.verificationFailure, null);
+        assert.equal(getTargetServiceVerificationError(phase2HealSnap.claudeState.nodeProbe), null);
+
+        // 场景 D: 双通道同时绑定且空闲时，wasAliveInKernel=true 的顺带重载事件绝不跨通道拉起新探测（防断网无限活锁）
+        let unwantedAgProbes = 0;
+        const origProbeAg = engine.probeAntigravityNodeNow.bind(engine);
+        (engine as any).probeAntigravityNodeNow = async () => {
+          unwantedAgProbes++;
+          return engine.getSnapshot();
+        };
+        try {
+          store.update({
+            antigravityClashNode: 'AG-Test-Node',
+            antigravityClashProfileUid: 'test-uid',
+            antigravityDedicatedPort: rebindPort + 1 > 65530 ? rebindPort - 1 : rebindPort + 1,
+          });
+          runtime.antigravityNodeProbe = null;
+          runtime.antigravityNodeProbeError = '模拟断网探测失败';
+          runtime.clashMonitor.info = {
+            ...runtime.clashMonitor.getRuntimeInfo(),
+            antigravityPortListening: true,
+          };
+          runtime.clashMonitor.emit('antigravity-listener-rebound', { wasAliveInKernel: true });
+          await sleep(320);
+          assert.equal(unwantedAgProbes, 0, 'wasAliveInKernel=true 的对端重载不得触发跨通道重测活锁');
+        } finally {
+          (engine as any).probeAntigravityNodeNow = origProbeAg;
+          store.update({ antigravityClashNode: null, antigravityClashProfileUid: null });
+        }
+
+        // 场景 E: 已实测确认 IP 漂移时即使 claudePendingProbe 非空也必须立即 break 0 秒强杀，且在途 skipSafety=true 遇心跳自动升级为安全强制
+        const driftPendingTree = await spawnClaudeTreeForCase('pending-drift-kill');
+        try {
+          alerts.length = 0;
+          runtime.claudeVerificationRecovery.clear();
+          markClaudeLaunchedByGuard(rebindPort);
+          runtime.claudeRunning = true;
+          runtime.claudeAuthorizedSession = true;
+          runtime.claudeSessionInitialIp = initialTraceIp;
+          runtime.claudeExternalBaselinePending = false;
+
+          let notifyEnteredGate!: () => void;
+          const enteredGate = new Promise<void>((r) => {
+            notifyEnteredGate = r;
+          });
+          let releaseGate!: () => void;
+          const gate = new Promise<void>((r) => {
+            releaseGate = r;
+          });
+          let traceCallNum = 0;
+          runtime.verifyTargetServiceRegion = async (
+            _pUrl: string | null,
+            probeObj: ProbeResult,
+            targetApp: 'claude' | 'antigravity'
+          ) => {
+            if (targetApp !== 'claude') return;
+            traceCallNum++;
+            if (traceCallNum === 1) {
+              notifyEnteredGate();
+              await gate;
+              probeObj.claudeTraceLoc = recoveredProbe.countryCode;
+              probeObj.claudeTraceIp = driftedTraceIp;
+              probeObj.claudeTraceCheckedAt = Date.now();
+              probeObj.regionMismatchDetail = null;
+            } else {
+              // 若错误进入第 2 轮 continue，将覆盖回原 IP 造成漏杀！
+              probeObj.claudeTraceLoc = recoveredProbe.countryCode;
+              probeObj.claudeTraceIp = initialTraceIp;
+              probeObj.claudeTraceCheckedAt = Date.now();
+              probeObj.regionMismatchDetail = null;
+            }
+          };
+
+          // 以 skipSafetyEnforcement=true 启动在途探测，随后收到心跳升级安全强制并排入一个手动重测请求
+          const inFlightSkip = engine.probeClaudeNodeNow('启动前遗留在途探测', true);
+          await enteredGate;
+          void engine.probeClaudeNodeNow('Claude 运行期心跳巡检', false);
+          void engine.probeClaudeNodeNow('排队中的手动重测', false);
+          assert.equal(runtime.claudeActiveProbeSkipSafety, false, '运行期心跳合并时必须立即解除在途 skipSafety');
+          assert.ok(runtime.claudePendingProbe, '应存在排队中的 claudePendingProbe');
+
+          releaseGate();
+          await inFlightSkip;
+          await driftPendingTree.procExited;
+          assert.equal(traceCallNum, 1, '实测确认 IP 漂移后必须立即中断循环强杀，禁止执行 pending 第 2 轮覆盖结果');
+          assert.equal(alerts.length, 1);
+          assert.equal(alerts[0].alertType, 'ip-change');
+          assert.equal(alerts[0].actualIp, driftedTraceIp);
+        } finally {
+          await driftPendingTree.cleanup();
+        }
+
+        // 场景 F (反向安全红线): 持续性本地端口 ECONNREFUSED（含高频 rebound 事件干扰）绝不无限自旋，首轮即启动复核并在到期后强杀进程树
+        const persistentRefusedTree = await spawnClaudeTreeForCase('persistent-refused-kill');
+        try {
+          alerts.length = 0;
+          runtime.claudeVerificationRecovery.clear();
+          markClaudeLaunchedByGuard(rebindPort);
+          runtime.claudeRunning = true;
+          runtime.claudeAuthorizedSession = true;
+          runtime.claudeSessionInitialIp = initialTraceIp;
+          runtime.claudeExternalBaselinePending = false;
+
+          runtime.probeOnceViaChannel = async (
+            _pUrl: string | null,
+            _via: string,
+            _tMs: number,
+            _defErr?: string,
+            onFail?: (r: string, meta: { localProxyRefused: boolean }) => void
+          ) => {
+            // 每次探测均模拟外部高频重载事件置位 claudeReboundDuringProbe 且本地端口持续拒绝连接
+            runtime.clashMonitor.emit('claude-listener-rebound', { wasAliveInKernel: false });
+            const err = `https://ipv4.icanhazip.com：connect ECONNREFUSED 127.0.0.1:${rebindPort}`;
+            onFail?.(err, { localProxyRefused: true });
+            return { result: null, errMsg: err, localProxyRefused: true };
+          };
+
+          const persistentAlertPromise = once(engine, 'trigger-alert') as Promise<[AlertPayload]>;
+          const failSnap = await engine.probeClaudeNodeNow('Claude 运行期心跳巡检');
+          // 无论是否已超极短测试 deadlineMs (360ms)，首轮 probeClaudeNodeNow 必在有限步内退出（不死循环），且触发复核或到期强杀
+          const [persistentAlert] = await persistentAlertPromise;
+          await persistentRefusedTree.procExited;
+          assert.ok(
+            failSnap.claudeState.verificationFailure !== null || alerts.length >= 1,
+            '持续本地 ECONNREFUSED 首轮即须进入后台复核或已完成到期强杀'
+          );
+          assert.equal(persistentAlert.source, 'claude');
+          assert.equal(persistentAlert.alertType, 'verification-unavailable');
+          assert.match(persistentAlert.errorDetail || '', /ECONNREFUSED/);
+          assert.ok(
+            persistentAlert.killedProcesses?.some((item) =>
+              item.includes(persistentRefusedTree.exeName)
+            )
+          );
+        } finally {
+          await persistentRefusedTree.cleanup();
+        }
+
+        console.log('通过：本地专属端口瞬态 ECONNREFUSED 自愈、二阶段恢复、防跨通道活锁、IP 漂移防覆盖及持续故障强杀全链路验证通过');
+      } finally {
+        runtime.clashMonitor.configureDedicatedNode = origConfigureDedicated;
+        runtime.probeOnceViaChannel = origProbeOnce;
+        await new Promise<void>((resolve) => {
+          if (rebindServer.listening) rebindServer.close(() => resolve());
+          else resolve();
+        });
+      }
     } finally {
       runtime.verifyTargetServiceRegion = origVerifyTarget;
       runtime.claudeRunning = false;

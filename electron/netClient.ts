@@ -119,6 +119,28 @@ export function resolveSafeRedirectUrl(
   return nextUrl.toString();
 }
 
+export function formatNetworkErrorMessage(err: unknown): string {
+  if (err instanceof Error) {
+    const trimmed = err.message.trim();
+    if (trimmed) return trimmed;
+    const aggErrors = (err as Error & { errors?: unknown[] }).errors;
+    if (Array.isArray(aggErrors) && aggErrors.length > 0) {
+      const subMessages = aggErrors
+        .map((item) =>
+          item instanceof Error ? item.message.trim() : String(item || '').trim()
+        )
+        .filter(Boolean);
+      if (subMessages.length > 0) {
+        return subMessages.join('; ');
+      }
+    }
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code) return `connect ${code}`;
+    return err.name || '网络连接异常';
+  }
+  return String(err || '网络连接异常').trim() || '网络连接异常';
+}
+
 export async function requestTextViaProxy(
   targetUrl: string,
   proxyUrl: string | null,
@@ -138,7 +160,7 @@ export async function requestTextViaProxy(
       allowLocalhost
     );
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err);
+    const msg = formatNetworkErrorMessage(err);
     const remainingMs = deadlineAt - Date.now();
     const isTransientProxySocketDisconnect =
       Boolean(proxyUrl) &&
@@ -197,7 +219,12 @@ async function requestTextViaProxyOnce(
       settled = true;
       clearTimeout(hardDeadline);
       if (err) {
-        reject(err);
+        const normalizedErr = err.message.trim()
+          ? err
+          : Object.assign(new Error(formatNetworkErrorMessage(err)), {
+              code: (err as NodeJS.ErrnoException).code,
+            });
+        reject(normalizedErr);
       } else {
         resolve(body ?? '');
       }
