@@ -8,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import * as yaml from 'js-yaml';
 import { PrivateChannelId, PrivateChannelState } from '../src/shared/types';
 import { MihomoEndpoint, mihomoRequest, isLocalPortListening } from './mihomoClient';
-import { NodeSnapshot, SubscriptionCatalog, snapshotFingerprint } from './subscriptionCatalog';
+import { NodeSnapshot, SubscriptionCatalog, readYaml, snapshotFingerprint } from './subscriptionCatalog';
 import { requestTextViaProxy } from './netClient';
 
 const execute = promisify(execFile);
@@ -65,17 +65,55 @@ export class PrivateKernel extends EventEmitter {
   public getSnapshot(): NodeSnapshot | null { return this.saved ? structuredClone(this.saved.snapshot) : null; }
   private publish(): void { this.emit('state', this.getState()); }
 
-  private async verifyProcessIdentity(lease: Lease): Promise<void> {
+  private async verifyProcessIdentity(lease: Pick<Lease, 'pid' | 'revision'>): Promise<void> {
     const result = await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      'Get-CimInstance Win32_Process -Filter ("ProcessId=" + $env:GUARD_KERNEL_PID) | Select-Object ExecutablePath,CommandLine | ConvertTo-Json -Compress'],
+      '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ErrorActionPreference = "Stop"; Get-CimInstance Win32_Process -Filter ("ProcessId=" + $env:GUARD_KERNEL_PID) | Select-Object ExecutablePath,CommandLine | ConvertTo-Json -Compress'],
     { windowsHide: true, env: { ...process.env, GUARD_KERNEL_PID: String(lease.pid) }, timeout: 5000 });
-    const identity = JSON.parse(result.stdout);
+    const identity = result.stdout.trim() ? JSON.parse(result.stdout) : null;
+    if (!identity) throw new Error('私有内核进程已退出');
+    if (!identity.ExecutablePath || !identity.CommandLine) throw new Error('无法读取私有内核进程身份，请检查进程访问权限');
     const configuration = path.join(this.directory, lease.revision, 'config.yaml');
-    if (!identity || String(identity.ExecutablePath).toLowerCase() !== this.executable.toLowerCase() ||
+    if (String(identity.ExecutablePath).toLowerCase() !== this.executable.toLowerCase() ||
         !String(identity.CommandLine).toLowerCase().includes(configuration.toLowerCase())) {
       throw new Error('私有内核进程身份不匹配');
     }
   }
+
+  private async findExistingLease(): Promise<Lease | null> {
+    const leasePath = path.join(this.directory, 'runtime.json');
+    if (fs.existsSync(leasePath)) {
+      const lease = JSON.parse(fs.readFileSync(leasePath, 'utf8')) as Lease;
+      if (!Number.isInteger(lease.pid) || lease.pid <= 0) throw new Error('私有内核进程记录无效');
+      if (alive(lease.pid)) {
+        if (!this.saved || lease.revision !== this.saved.revision ||
+            path.resolve(lease.executable).toLowerCase() !== path.resolve(this.executable).toLowerCase()) {
+          throw new Error('已有私有内核与保存的配置版本不一致');
+        }
+        await this.verifyProcessIdentity(lease);
+        return lease;
+      }
+    }
+    if (!this.saved || !await isLocalPortListening(this.saved.port)) return null;
+
+    const result = await execute('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8; $ErrorActionPreference = "Stop"; @(Get-NetTCPConnection -State Listen -LocalAddress 127.0.0.1 -LocalPort $env:GUARD_KERNEL_PORT | Select-Object -ExpandProperty OwningProcess -Unique) | ConvertTo-Json -Compress'],
+    { windowsHide: true, env: { ...process.env, GUARD_KERNEL_PORT: String(this.saved.port) }, timeout: 10000 });
+    const owners: unknown = result.stdout.trim() ? JSON.parse(result.stdout) : [];
+    const pids = Array.isArray(owners) ? owners : [owners];
+    if (pids.length !== 1 || !Number.isInteger(pids[0]) || pids[0] <= 0) throw new Error('无法确定专属端口的唯一监听进程');
+    await this.verifyProcessIdentity({ pid: pids[0], revision: this.saved.revision });
+    const configuration = readYaml(path.join(this.directory, this.saved.revision, 'config.yaml'));
+    const pipePath = configuration['external-controller-pipe'];
+    const secret = configuration.secret;
+    if (configuration['mixed-port'] !== this.saved.port || typeof pipePath !== 'string' ||
+        !pipePath.startsWith(`\\\\.\\pipe\\proxy-region-guard-${this.channel}-`) || typeof secret !== 'string' || !secret) {
+      throw new Error('私有内核控制接口配置无效');
+    }
+    const lease: Lease = { pid: pids[0], executable: this.executable, revision: this.saved.revision, endpoint: { pipePath, secret } };
+    atomicJson(leasePath, lease);
+    return lease;
+  }
+
   private serial<T>(operation: () => Promise<T>): Promise<T> {
     const pending = this.queue.then(operation);
     this.queue = pending.then(() => undefined, () => undefined);
@@ -103,22 +141,17 @@ export class PrivateKernel extends EventEmitter {
       const { fingerprint, ...definition } = saved.snapshot;
       if (snapshotFingerprint(definition) !== fingerprint) throw new Error('私有节点副本校验失败');
       this.setSelection(saved);
-      const leasePath = path.join(this.directory, 'runtime.json');
-      if (fs.existsSync(leasePath)) {
-        const lease = JSON.parse(fs.readFileSync(leasePath, 'utf8')) as Lease;
-        if (alive(lease.pid)) {
-          if (lease.revision !== saved.revision || path.resolve(lease.executable) !== path.resolve(this.executable)) throw new Error('已有私有内核与保存的配置版本不一致');
-          await this.verifyProcessIdentity(lease);
-          this.lease = lease;
-          this.state.pid = lease.pid;
-          await this.verifyListener();
-          await this.verifyForwarding();
-          this.state.phase = 'ready';
-          this.publish();
-          this.emit('ready');
-          this.scheduleHealth();
-          return;
-        }
+      const lease = await this.findExistingLease();
+      if (lease) {
+        this.lease = lease;
+        this.state.pid = lease.pid;
+        await this.verifyListener();
+        await this.verifyForwarding();
+        this.state.phase = 'ready';
+        this.publish();
+        this.emit('ready');
+        this.scheduleHealth();
+        return;
       }
       await this.startProcess();
     } catch (error) { this.fail(error); }
@@ -355,10 +388,11 @@ export class PrivateKernel extends EventEmitter {
   private async stopProcess(): Promise<void> {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
-    const lease = this.lease;
+    const lease = this.lease || await this.findExistingLease();
     const child = this.child;
     if (lease) {
       if (alive(lease.pid) && child?.pid !== lease.pid) await this.verifyProcessIdentity(lease);
+      this.lease = lease;
       this.child = null;
       this.booting = false;
       if (alive(lease.pid)) process.kill(lease.pid);

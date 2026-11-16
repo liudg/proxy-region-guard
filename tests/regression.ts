@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as http from 'node:http';
 import * as net from 'node:net';
-import { spawn, execFileSync } from 'node:child_process';
+import { spawn, execFileSync, ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
@@ -27,14 +27,15 @@ assert.ok(process.env.GUARD_TEST_DATA);
 const root = process.env.GUARD_TEST_DATA;
 fs.mkdirSync(root, { recursive: true });
 app.setPath('userData', root);
-const core = path.resolve('resources/mihomo');
-const kernelRoot = path.join(root, 'kernels');
+const core = path.join(root, '中文内核 文件');
+const kernelRoot = path.join(root, '代理地区卫士', '内核 配置');
 const referenceRoot = path.join(root, 'reference');
 let service: PrivateProxyService | undefined;
 let reference: PrivateKernel | undefined;
 let server: http.Server | undefined;
 let stream: http.IncomingMessage | undefined;
 let monitor: ClashMonitor | undefined;
+let neighbor: ChildProcess | undefined;
 const sockets = new Set<net.Socket>();
 
 async function until(test: () => boolean, timeout = 30000): Promise<void> {
@@ -77,6 +78,14 @@ async function getThrough(port: number, url: string): Promise<string> {
 }
 
 async function run(): Promise<void> {
+  if (process.env.GUARD_TEST_ROLE === 'neighbor') {
+    server = http.createServer((_request, response) => response.end('同端口服务'));
+    server.listen(Number(process.env.GUARD_TEST_PORT), '127.0.0.2');
+    await once(server, 'listening');
+    process.send!('ready');
+    assert.equal((await once(process, 'message'))[0], 'stop');
+    return;
+  }
   if (process.env.GUARD_TEST_ROLE === 'owner') {
     service = new PrivateProxyService(kernelRoot, core);
     await service.restore();
@@ -84,6 +93,7 @@ async function run(): Promise<void> {
     app.exit(0);
     return;
   }
+  fs.cpSync(path.resolve('resources/mihomo'), core, { recursive: true });
   const store = new ConfigStore();
   await validateLegacyMigration(root);
   validateSnapshots(root);
@@ -229,17 +239,59 @@ async function run(): Promise<void> {
   const owner = spawn(process.execPath, [process.argv[1]], { windowsHide: true, env: { ...process.env, GUARD_TEST_ROLE: 'owner' }, stdio: 'inherit' });
   assert.equal((await once(owner, 'exit'))[0], 0);
   const adoptedPid = JSON.parse(fs.readFileSync(path.join(kernelRoot, 'claude', 'runtime.json'), 'utf8')).pid;
+  const runtimeFile = path.join(kernelRoot, 'claude', 'runtime.json');
+  const originalRuntime = fs.readFileSync(runtimeFile, 'utf8');
+  const otherPid = JSON.parse(fs.readFileSync(path.join(kernelRoot, 'antigravity', 'runtime.json'), 'utf8')).pid;
+  const wrongRuntime = JSON.stringify({ ...JSON.parse(originalRuntime), pid: otherPid });
+  fs.writeFileSync(runtimeFile, wrongRuntime);
   service = new PrivateProxyService(kernelRoot, core);
-  await service.restore();
-  assert.equal(service.channels.claude.getState().pid, adoptedPid);
-  assert.equal(await getThrough(claudePort, origin), nonce);
-  console.log('通过：管理进程退出后内核保持运行，重新启动接管原进程与保存的副本');
-
-  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', path.resolve('tests/suspendKernel.ps1'),
-    '-KernelPid', String(adoptedPid), '-ExpectedExecutable', verifyCore(core)], { windowsHide: true, stdio: 'pipe' });
-  await assert.rejects(service.channels.claude.checkReady(), /超时/);
+  try {
+    await service.restore();
+    assert.equal(service.channels.claude.getState().phase, 'error');
+    assert.match(service.channels.claude.getState().error!, /身份不匹配/);
+    await assert.rejects(service.channels.claude.restart(), /身份不匹配/);
+    assert.equal(fs.readFileSync(runtimeFile, 'utf8'), wrongRuntime);
+    assert.equal(await getThrough(claudePort, origin), nonce);
+    assert.equal(await getThrough(agPort, origin), nonce);
+  } finally { fs.writeFileSync(runtimeFile, originalRuntime); }
   await service.channels.claude.restart();
   assert.notEqual(service.channels.claude.getState().pid, adoptedPid);
+  assert.equal(await getThrough(claudePort, origin), nonce);
+  console.log('通过：身份不匹配时保留进程记录和真实监听，修复记录后手动重启成功');
+  await service.shutdown();
+
+  const recoveryOwner = spawn(process.execPath, [process.argv[1]], { windowsHide: true, env: { ...process.env, GUARD_TEST_ROLE: 'owner' }, stdio: 'inherit' });
+  assert.equal((await once(recoveryOwner, 'exit'))[0], 0);
+  const recoveredPid = JSON.parse(fs.readFileSync(runtimeFile, 'utf8')).pid;
+  fs.unlinkSync(runtimeFile);
+  neighbor = spawn(process.execPath, [process.argv[1]], {
+    windowsHide: true,
+    env: { ...process.env, GUARD_TEST_ROLE: 'neighbor', GUARD_TEST_PORT: String(claudePort) },
+    stdio: ['ignore', 'inherit', 'inherit', 'ipc'],
+  });
+  const neighborReady = await Promise.race([
+    once(neighbor, 'message', { signal: AbortSignal.timeout(15000) }),
+    once(neighbor, 'exit').then(([code]) => { throw new Error(`同端口测试服务提前退出：${code}`); }),
+  ]);
+  assert.equal(neighborReady[0], 'ready');
+  service = new PrivateProxyService(kernelRoot, core);
+  await service.restore();
+  assert.equal(service.channels.claude.getState().phase, 'ready', service.channels.claude.getState().error!);
+  assert.equal(service.channels.claude.getState().pid, recoveredPid);
+  assert.equal(JSON.parse(fs.readFileSync(runtimeFile, 'utf8')).pid, recoveredPid);
+  assert.equal(await getThrough(claudePort, origin), nonce);
+  assert.equal(await getThrough(agPort, `http://127.0.0.2:${claudePort}`), '同端口服务');
+  const neighborExit = once(neighbor, 'exit');
+  neighbor.send('stop');
+  assert.equal((await neighborExit)[0], 0);
+  neighbor = undefined;
+  console.log('通过：中文及空格路径下恢复丢失的进程记录，其他地址的同端口服务保持正常');
+
+  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', path.resolve('tests/suspendKernel.ps1'),
+    '-KernelPid', String(recoveredPid), '-ExpectedExecutable', verifyCore(core)], { windowsHide: true, stdio: 'pipe' });
+  await assert.rejects(service.channels.claude.checkReady(), /超时/);
+  await service.channels.claude.restart();
+  assert.notEqual(service.channels.claude.getState().pid, recoveredPid);
   assert.equal(await getThrough(claudePort, origin), nonce);
   console.log('通过：接管内核的真实进程挂起后，控制接口超时仍可手动重启');
 
@@ -269,6 +321,11 @@ async function run(): Promise<void> {
 
 async function cleanup(): Promise<void> {
   monitor?.stop(); stream?.destroy();
+  if (neighbor && neighbor.exitCode === null && neighbor.signalCode === null) {
+    const exited = once(neighbor, 'exit');
+    neighbor.kill();
+    await exited;
+  }
   await Promise.all([service?.shutdown(), reference?.shutdown()]);
   for (const socket of sockets) socket.destroy();
   if (server) await new Promise<void>((resolve) => server!.close(() => resolve()));
@@ -278,6 +335,6 @@ app.whenReady().then(run).then(async () => {
   if (process.env.GUARD_TEST_ROLE !== 'owner') await cleanup();
 }).then(() => app.exit(0)).catch(async (error) => {
   console.error(error);
-  await cleanup();
-  app.exit(1);
+  try { await cleanup(); }
+  finally { app.exit(1); }
 });
