@@ -25,6 +25,7 @@ import {
   shouldStartSilentlyInTray,
 } from './autoLaunch';
 import { TrayHealthManager } from './trayHealth';
+import { configureAppUserData } from './appIdentity';
 import {
   quoteWindowsCommandLine,
   resolveWindowsPowerShellExe,
@@ -32,6 +33,7 @@ import {
 } from './updaterService';
 
 const ELEVATED_RELAUNCH_FLAG = '--elevated-relaunch';
+configureAppUserData();
 const IS_POST_UPDATE_BOOT = process.argv.some((a) => a.startsWith('--updated-from='));
 
 let postUpdateHandshakeDone = false;
@@ -1016,12 +1018,10 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       label: '打开主控制面板',
       click: () => showMainWindow(),
     },
+    { type: 'separator' },
     {
-      label: '关闭管理界面（后台继续运行）',
-      click: () => {
-        mainWindow?.destroy();
-        mainWindow = null;
-      },
+      label: '退出代理地区卫士',
+      click: () => app.quit(),
     },
   ]);
 
@@ -1373,6 +1373,8 @@ app.on('will-quit', () => {
   trayHealth?.stop();
   updaterService?.stop();
   probeEngine?.stop();
+  tray?.destroy();
+  tray = null;
 });
 
 app.on('window-all-closed', () => {
