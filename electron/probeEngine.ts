@@ -2447,18 +2447,36 @@ export class ProbeEngine extends EventEmitter {
         `${scheme}://${host}:${cfg.manualProxy.port}`,
         `手动代理 (${host}:${cfg.manualProxy.port})`
       );
+      return out;
     }
 
     const clash = this.clashMonitor.getRuntimeInfo();
-    if (clash.connected && clash.mixedPort) {
+    const isClashGlobalDirect = clash.mode?.trim().toLowerCase() === 'direct';
+    if (clash.connected && clash.mixedPort && !isClashGlobalDirect) {
       pushUnique(
         `http://127.0.0.1:${clash.mixedPort}`,
         `Clash 混合端口 (127.0.0.1:${clash.mixedPort})`
       );
     }
+    if (clash.connected && clash.antigravityPortListening && clash.antigravityDedicatedPort) {
+      pushUnique(
+        `http://127.0.0.1:${clash.antigravityDedicatedPort}`,
+        `Antigravity 专属代理端口 (127.0.0.1:${clash.antigravityDedicatedPort})`
+      );
+    }
+    if (clash.connected && clash.dedicatedPortListening && clash.dedicatedPort) {
+      pushUnique(
+        `http://127.0.0.1:${clash.dedicatedPort}`,
+        `Claude 专属代理端口 (127.0.0.1:${clash.dedicatedPort})`
+      );
+    }
 
     const sys = await this.getSystemProxyFresh(false);
-    if (sys.enabled && sys.proxyUrl) {
+    const clashDirectMixedUrl =
+      clash.connected && isClashGlobalDirect && clash.mixedPort
+        ? `http://127.0.0.1:${clash.mixedPort}`
+        : null;
+    if (sys.enabled && sys.proxyUrl && sys.proxyUrl !== clashDirectMixedUrl) {
       pushUnique(sys.proxyUrl, 'Windows 系统代理');
     }
 
@@ -3580,6 +3598,7 @@ function createFallbackUpdateStateSnapshot(): UpdateStateSnapshot {
     electronVersion: process.versions.electron || '0.0.0',
     isPackaged: app.isPackaged,
     status: 'idle',
+    hasUpdate: false,
     latestVersion: null,
     publishedAt: null,
     releaseNotes: null,
@@ -3590,6 +3609,7 @@ function createFallbackUpdateStateSnapshot(): UpdateStateSnapshot {
     progressPercent: null,
     signatureVerified: false,
     lastCheckedAt: null,
+    lastSuccessfulCheckAt: null,
     viaChannel: null,
     error: null,
     releasePageUrl: DEFAULT_GITHUB_RELEASES_PAGE_URL,

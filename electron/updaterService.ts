@@ -32,8 +32,10 @@ import {
 
 const rawFs = getRawFs();
 
-const AUTO_CHECK_INITIAL_DELAY_MS = 8000;
-const AUTO_CHECK_INTERVAL_MS = 6 * 60 * 60 * 1000; // 每 6 小时静默复查一次
+const DEFAULT_STARTUP_CHECK_DELAY_MS = 4000;
+const DEFAULT_STARTUP_RETRY_DELAY_MS = 20000;
+const DEFAULT_WINDOW_SHOW_COOLDOWN_MS = 30 * 60 * 1000; // 唤起窗口按需检查 30 分钟冷却
+const DEFAULT_ERROR_RETRY_COOLDOWN_MS = 2 * 60 * 1000;  // 失败态唤起窗口 2 分钟冷却重试
 const MANIFEST_FETCH_TIMEOUT_MS = 12000;
 const ASAR_DOWNLOAD_TIMEOUT_MS = 180000;
 const FULL_ZIP_DOWNLOAD_TIMEOUT_MS = 15 * 60 * 1000;
@@ -69,6 +71,10 @@ export interface UpdaterServiceOptions {
   targetPidOverride?: number;
   bootHandshakeTimeoutMsOverride?: number;
   waitExitAttemptsOverride?: number;
+  startupCheckDelayMsOverride?: number;
+  startupRetryDelayMsOverride?: number;
+  windowShowCooldownMsOverride?: number;
+  errorRetryCooldownMsOverride?: number;
 }
 
 export function resolveWindowsPowerShellExe(): string {
@@ -752,6 +758,10 @@ export class UpdaterService {
   private readonly targetPidOverride?: number;
   private readonly bootHandshakeTimeoutMs: number;
   private readonly waitExitAttemptsOverride?: number;
+  private readonly startupCheckDelayMs: number;
+  private readonly startupRetryDelayMs: number;
+  private readonly windowShowCooldownMs: number;
+  private readonly errorRetryCooldownMs: number;
 
   private status: UpdateStatus = 'idle';
   private cachedManifest: UpdateReleaseManifest | null = null;
@@ -762,11 +772,17 @@ export class UpdaterService {
   private progressPercent: number | null = null;
   private signatureVerified = false;
   private lastCheckedAt: number | null = null;
+  private lastSuccessfulCheckAt: number | null = null;
+  private lastAttemptAt: number | null = null;
+  private lastAttemptSucceeded = false;
   private viaChannel: string | null = null;
   private lastError: string | null = null;
 
   private startupTimer: NodeJS.Timeout | null = null;
-  private periodicTimer: NodeJS.Timeout | null = null;
+  private startupRetryTimer: NodeJS.Timeout | null = null;
+  private initialized = false;
+  private startupCheckFailedAt: number | null = null;
+  private startupRetryUsed = false;
   private bakCleanupTimer: NodeJS.Timeout | null = null;
   private quitTimer: NodeJS.Timeout | null = null;
   private checkPromise: Promise<UpdateActionResult> | null = null;
@@ -800,6 +816,14 @@ export class UpdaterService {
     this.bootHandshakeTimeoutMs =
       options.bootHandshakeTimeoutMsOverride ?? DEFAULT_BOOT_HANDSHAKE_TIMEOUT_MS;
     this.waitExitAttemptsOverride = options.waitExitAttemptsOverride;
+    this.startupCheckDelayMs =
+      options.startupCheckDelayMsOverride ?? DEFAULT_STARTUP_CHECK_DELAY_MS;
+    this.startupRetryDelayMs =
+      options.startupRetryDelayMsOverride ?? DEFAULT_STARTUP_RETRY_DELAY_MS;
+    this.windowShowCooldownMs =
+      options.windowShowCooldownMsOverride ?? DEFAULT_WINDOW_SHOW_COOLDOWN_MS;
+    this.errorRetryCooldownMs =
+      options.errorRetryCooldownMsOverride ?? DEFAULT_ERROR_RETRY_COOLDOWN_MS;
     this.nativeShellVersion =
       normalizeSemverString(options.nativeShellVersionOverride) || this.readNativeShellVersion();
 
@@ -824,12 +848,25 @@ export class UpdaterService {
     return '1.0.0';
   }
 
+  private hasVerifiedUpdate(): boolean {
+    if (!this.cachedManifest || !this.signatureVerified) {
+      return false;
+    }
+    try {
+      return compareSemver(this.cachedManifest.version, this.currentVersion) > 0;
+    } catch {
+      return false;
+    }
+  }
+
   public getSnapshot(): UpdateStateSnapshot {
+    const hasUpdate = this.hasVerifiedUpdate();
     return {
       currentVersion: this.currentVersion,
       electronVersion: this.electronVersion,
       isPackaged: this.isPackaged,
       status: this.status,
+      hasUpdate,
       latestVersion: this.cachedManifest?.version || null,
       publishedAt: this.cachedManifest?.publishedAt || null,
       releaseNotes: this.cachedManifest?.notes || null,
@@ -840,26 +877,143 @@ export class UpdaterService {
       progressPercent: this.progressPercent,
       signatureVerified: this.signatureVerified,
       lastCheckedAt: this.lastCheckedAt,
+      lastSuccessfulCheckAt: this.lastSuccessfulCheckAt,
       viaChannel: this.viaChannel,
       error: this.lastError,
       releasePageUrl: this.releasePageUrl,
     };
   }
 
-  public startBackgroundSchedule(argv: string[] = process.argv): void {
-    this.handlePostUpdateStartupFlags(argv);
-    this.reconcileAutoCheckTimer(true);
-  }
-
-  public stop(): void {
+  private clearStartupTimer(): void {
     if (this.startupTimer) {
       clearTimeout(this.startupTimer);
       this.startupTimer = null;
     }
-    if (this.periodicTimer) {
-      clearInterval(this.periodicTimer);
-      this.periodicTimer = null;
+  }
+
+  private clearStartupRetryTimer(): void {
+    if (this.startupRetryTimer) {
+      clearTimeout(this.startupRetryTimer);
+      this.startupRetryTimer = null;
     }
+  }
+
+  public initialize(argv: string[] = process.argv): void {
+    this.initialized = true;
+    this.handlePostUpdateStartupFlags(argv);
+    this.clearStartupTimer();
+    this.clearStartupRetryTimer();
+    this.startupCheckFailedAt = null;
+    this.startupRetryUsed = false;
+
+    if (!this.configStore.get().autoCheckUpdates) {
+      return;
+    }
+
+    this.startupTimer = setTimeout(() => {
+      void this.runStartupAutoCheck();
+    }, this.startupCheckDelayMs);
+    this.startupTimer.unref?.();
+  }
+
+  private async runStartupAutoCheck(): Promise<void> {
+    this.startupTimer = null;
+    if (!this.configStore.get().autoCheckUpdates) {
+      return;
+    }
+    const res = await this.checkForUpdates({ silent: true });
+    if (!res.ok && this.lastSuccessfulCheckAt === null && !this.startupRetryUsed) {
+      this.startupCheckFailedAt = Date.now();
+      this.clearStartupRetryTimer();
+      this.startupRetryTimer = setTimeout(() => {
+        this.startupRetryTimer = null;
+        if (
+          this.startupRetryUsed ||
+          this.lastSuccessfulCheckAt !== null ||
+          !this.configStore.get().autoCheckUpdates
+        ) {
+          return;
+        }
+        this.startupRetryUsed = true;
+        void this.checkForUpdates({ silent: true });
+      }, this.startupRetryDelayMs);
+      this.startupRetryTimer.unref?.();
+    }
+  }
+
+  public notifyNetworkReady(readyTimestamp?: number): void {
+    if (
+      this.startupCheckFailedAt === null ||
+      this.startupRetryUsed ||
+      this.lastSuccessfulCheckAt !== null
+    ) {
+      return;
+    }
+    if (readyTimestamp !== undefined && readyTimestamp <= this.startupCheckFailedAt) {
+      return;
+    }
+    if (!this.configStore.get().autoCheckUpdates) {
+      return;
+    }
+    this.clearStartupRetryTimer();
+    this.startupRetryUsed = true;
+    void this.checkForUpdates({ silent: true });
+  }
+
+  public async notifyWindowShown(): Promise<UpdateActionResult | null> {
+    if (!this.initialized || !this.configStore.get().autoCheckUpdates) {
+      return null;
+    }
+    // 启动初期定时器尚未触发时交由启动检查统一执行，避免在代理探测初始化前抢跑
+    if (this.startupTimer !== null) {
+      return null;
+    }
+    if (
+      this.applyingInProgress ||
+      this.status === 'applying' ||
+      this.checkPromise ||
+      this.downloadPromise
+    ) {
+      return null;
+    }
+
+    const now = Date.now();
+
+    // 最近一次检查或预下载尝试失败：统一遵守 errorRetryCooldownMs（默认 2 分钟）短冷却节流，
+    // 防止满 30 分钟后处于离线/超时环境时每次切换窗口都触发无节流请求风暴
+    if (!this.lastAttemptSucceeded) {
+      if (
+        this.lastAttemptAt !== null &&
+        now - this.lastAttemptAt < this.errorRetryCooldownMs
+      ) {
+        return null;
+      }
+      return this.checkForUpdates({ silent: true });
+    }
+
+    // 最近一次尝试已成功：严格遵循 windowShowCooldownMs（默认 30 分钟）长冷却节流
+    if (
+      this.lastSuccessfulCheckAt !== null &&
+      now - this.lastSuccessfulCheckAt < this.windowShowCooldownMs
+    ) {
+      return null;
+    }
+
+    return this.checkForUpdates({ silent: true });
+  }
+
+  public handleAutoCheckConfigChanged(enabled: boolean): void {
+    if (!enabled) {
+      this.clearStartupTimer();
+      this.clearStartupRetryTimer();
+      return;
+    }
+    void this.notifyWindowShown();
+  }
+
+  public stop(): void {
+    this.clearStartupTimer();
+    this.clearStartupRetryTimer();
     if (this.bakCleanupTimer) {
       clearTimeout(this.bakCleanupTimer);
       this.bakCleanupTimer = null;
@@ -868,44 +1022,6 @@ export class UpdaterService {
       clearTimeout(this.quitTimer);
       this.quitTimer = null;
     }
-  }
-
-  public reconcileAutoCheckTimer(isInitialBoot = false): void {
-    if (this.startupTimer) {
-      clearTimeout(this.startupTimer);
-      this.startupTimer = null;
-    }
-    if (this.periodicTimer) {
-      clearInterval(this.periodicTimer);
-      this.periodicTimer = null;
-    }
-
-    if (!this.isPackaged || !this.configStore.get().autoCheckUpdates) {
-      return;
-    }
-
-    if (isInitialBoot) {
-      this.startupTimer = setTimeout(() => {
-        this.startupTimer = null;
-        if (this.configStore.get().autoCheckUpdates) {
-          void this.checkForUpdates({ silent: true });
-        }
-      }, AUTO_CHECK_INITIAL_DELAY_MS);
-      this.startupTimer.unref?.();
-    }
-
-    this.periodicTimer = setInterval(() => {
-      if (!this.configStore.get().autoCheckUpdates) return;
-      if (
-        this.status === 'downloaded' ||
-        this.status === 'downloading' ||
-        this.status === 'applying'
-      ) {
-        return;
-      }
-      void this.checkForUpdates({ silent: true });
-    }, AUTO_CHECK_INTERVAL_MS);
-    this.periodicTimer.unref?.();
   }
 
   private handlePostUpdateStartupFlags(argv: string[]): void {
@@ -1189,7 +1305,7 @@ export class UpdaterService {
   public async checkForUpdates(
     opts: { silent?: boolean } = {}
   ): Promise<UpdateActionResult> {
-    if (this.applyingInProgress || this.status === 'applying') {
+    if (this.applyingInProgress || (this.status as UpdateStatus) === 'applying') {
       return {
         ok: false,
         message: '正在准备重启应用更新...',
@@ -1215,7 +1331,7 @@ export class UpdaterService {
   }
 
   private async executeCheckForUpdates(silent: boolean): Promise<UpdateActionResult> {
-    if (this.applyingInProgress || this.status === 'applying') {
+    if (this.applyingInProgress || (this.status as UpdateStatus) === 'applying') {
       return {
         ok: false,
         message: '正在准备重启应用更新...',
@@ -1223,25 +1339,41 @@ export class UpdaterService {
       };
     }
 
+    const prevStatus = this.status;
     const prevManifest = this.cachedManifest;
     const prevSigVerified = this.signatureVerified;
     const prevDeliveryMode = this.deliveryMode;
     const prevIncludeMmdb = this.includeMmdbUpdate;
     const prevTotalBytes = this.downloadTotalBytes;
+    const prevProgressPercent = this.progressPercent;
     const prevChannel = this.viaChannel;
+    const prevLastError = this.lastError;
+    const prevHadVerifiedUpdate =
+      Boolean(prevManifest && prevSigVerified) &&
+      compareSemver(prevManifest!.version, this.currentVersion) > 0;
 
-    this.status = 'checking';
-    this.lastError = null;
-    this.emitUpdateState();
+    // 当已有验签就绪/可用的新版本且本次仅为后台静默复查时，保持原视觉状态不降级为 checking，
+    // 消除右上角标志闪烁并确保用户在静默复查期间随时可点击「立即重启并更新」
+    const preserveVisualStatusDuringSilentCheck =
+      silent &&
+      prevHadVerifiedUpdate &&
+      (prevStatus === 'downloaded' || prevStatus === 'available');
+    if (!preserveVisualStatusDuringSilentCheck) {
+      this.status = 'checking';
+      this.lastError = null;
+      this.emitUpdateState();
+    }
 
     const attempts = await this.buildDownloadAttempts(this.manifestUrl, true);
     let verifiedManifest: UpdateReleaseManifest | null = null;
     let usedChannel = '';
-    let sawSignatureFailure = false;
+    let sawSecurityRejection = false;
+    let securityRejectionText = '';
     let sawStaleMirrorOnly = false;
     let lastErrText = '无法连接更新服务器';
 
-    for (const attempt of attempts) {
+    for (let idx = 0; idx < attempts.length; idx++) {
+      const attempt = attempts[idx];
       try {
         const rawText = await requestTextViaProxy(
           attempt.url,
@@ -1252,13 +1384,56 @@ export class UpdaterService {
           this.allowLocalhostForTest
         );
         const parsedJson = JSON.parse(rawText) as unknown;
-        const manifest = validateUpdateManifestStructure(
-          parsedJson,
-          this.allowLocalhostForTest
-        );
+        const looksLikeManifestObject =
+          Boolean(parsedJson) &&
+          typeof parsedJson === 'object' &&
+          !Array.isArray(parsedJson) &&
+          ('schemaVersion' in (parsedJson as Record<string, unknown>) ||
+            'asar' in (parsedJson as Record<string, unknown>) ||
+            'fullZip' in (parsedJson as Record<string, unknown>) ||
+            'signature' in (parsedJson as Record<string, unknown>));
+
+        let manifest: UpdateReleaseManifest;
+        try {
+          manifest = validateUpdateManifestStructure(
+            parsedJson,
+            this.allowLocalhostForTest
+          );
+        } catch (structErr) {
+          const structMsg =
+            structErr instanceof Error ? structErr.message : String(structErr);
+          const rawSchemaVer = looksLikeManifestObject
+            ? (parsedJson as Record<string, unknown>).schemaVersion
+            : undefined;
+          const isUnsupportedFutureSchema =
+            typeof rawSchemaVer === 'number' && rawSchemaVer > 1;
+          if (looksLikeManifestObject && !isUnsupportedFutureSchema) {
+            sawSecurityRejection = true;
+            securityRejectionText = `更新清单安全校验未通过，已拦截可疑数据（${structMsg}）`;
+            lastErrText = securityRejectionText;
+            if (idx < attempts.length - 1) {
+              this.probeEngine.recordExternalLog(
+                'warn',
+                `通道 [${attempt.label}] 返回异常更新清单已被安全拦截（${structMsg}），正在切换备用通道`,
+                false
+              );
+            }
+            continue;
+          }
+          throw structErr;
+        }
+
         if (!verifyUpdateManifestSignature(manifest, this.publicKey)) {
-          sawSignatureFailure = true;
-          lastErrText = '更新清单 Ed25519 数字签名校验不通过，已拦截不可信数据';
+          sawSecurityRejection = true;
+          securityRejectionText = '更新清单 Ed25519 数字签名校验失败，已拒绝加载以防篡改';
+          lastErrText = securityRejectionText;
+          if (idx < attempts.length - 1) {
+            this.probeEngine.recordExternalLog(
+              'warn',
+              `通道 [${attempt.label}] 更新清单 Ed25519 签名校验失败，已拦截并切换备用通道`,
+              false
+            );
+          }
           continue;
         }
         // 防镜像陈旧缓存回退：若本地已持有更高版本验签清单，拒绝被滞后的镜像清单降级覆盖
@@ -1280,57 +1455,129 @@ export class UpdaterService {
       }
     }
 
-    this.lastCheckedAt = Date.now();
-
-    if (!verifiedManifest && sawStaleMirrorOnly && prevManifest && prevSigVerified) {
-      verifiedManifest = prevManifest;
-      usedChannel = prevChannel || '本地已缓存最新清单';
+    if (this.applyingInProgress || (this.status as UpdateStatus) === 'applying') {
+      return {
+        ok: false,
+        message: '正在准备重启应用更新...',
+        state: this.probeEngine.getSnapshot(),
+      };
     }
 
+    const checkedNow = Date.now();
+    this.lastCheckedAt = checkedNow;
+    this.lastAttemptAt = checkedNow;
+
     if (!verifiedManifest) {
-      // 若此前已有通过完整验签的本地就绪包且本次仅因断网/超时重查失败，保留已就绪可安装状态
-      if (
-        !sawSignatureFailure &&
-        this.isPackaged &&
-        prevManifest &&
-        prevSigVerified &&
-        prevDeliveryMode &&
-        compareSemver(prevManifest.version, this.currentVersion) > 0 &&
-        (await this.isStagedUpdateAlreadyVerified(
-          prevManifest,
-          prevDeliveryMode,
-          prevIncludeMmdb
-        ))
-      ) {
+      this.lastAttemptSucceeded = false;
+
+      // 1) 签名伪造或清单资产地址篡改属于最高优先级安全异常：无条件清空缓存并告警（绝不被陈旧镜像覆盖）
+      if (sawSecurityRejection) {
+        this.cachedManifest = null;
+        this.signatureVerified = false;
+        this.deliveryMode = null;
+        this.includeMmdbUpdate = false;
+        this.downloadTotalBytes = null;
+        this.downloadedBytes = 0;
+        this.progressPercent = null;
+        this.status = 'error';
+        this.lastError =
+          securityRejectionText || '更新清单 Ed25519 数字签名校验失败，已拒绝加载以防篡改';
+        this.probeEngine.recordExternalLog('danger', this.lastError, false);
+        this.emitUpdateState();
+        return {
+          ok: false,
+          message: this.lastError,
+          state: this.probeEngine.getSnapshot(),
+        };
+      }
+
+      // 2) 纯网络故障或镜像缓存滞后（sawStaleMirrorOnly）时，若此前已验签发现新版本，保持状态粘性
+      if ((prevHadVerifiedUpdate || sawStaleMirrorOnly) && prevManifest && prevSigVerified) {
+        if (compareSemver(prevManifest.version, this.currentVersion) <= 0) {
+          this.cachedManifest = prevManifest;
+          this.signatureVerified = true;
+          this.status = 'up-to-date';
+          this.lastError = silent ? null : `检查更新失败：${lastErrText}`;
+          this.emitUpdateState();
+          return {
+            ok: false,
+            message: `检查更新失败：${lastErrText}`,
+            state: this.probeEngine.getSnapshot(),
+          };
+        }
+
+        const stagedPrevValid =
+          this.isPackaged && prevDeliveryMode
+            ? await this.isStagedUpdateAlreadyVerified(
+                prevManifest,
+                prevDeliveryMode,
+                prevIncludeMmdb
+              )
+            : false;
+        if (this.applyingInProgress || (this.status as UpdateStatus) === 'applying') {
+          return {
+            ok: false,
+            message: '正在准备重启应用更新...',
+            state: this.probeEngine.getSnapshot(),
+          };
+        }
+        if (stagedPrevValid) {
+          this.cachedManifest = prevManifest;
+          this.signatureVerified = true;
+          this.deliveryMode = prevDeliveryMode;
+          this.includeMmdbUpdate = prevIncludeMmdb;
+          this.downloadTotalBytes = prevTotalBytes;
+          this.downloadedBytes = prevTotalBytes ?? 0;
+          this.progressPercent = 100;
+          this.viaChannel = prevChannel;
+          this.status = 'downloaded';
+          this.lastError = silent
+            ? null
+            : `联网刷新失败（${lastErrText}），本地已验签就绪的 v${prevManifest.version} 仍可直接重启更新`;
+          this.emitUpdateState();
+          return {
+            ok: false,
+            message: `联网刷新失败（${lastErrText}），本地已验签就绪的 v${prevManifest.version} 仍可直接重启更新`,
+            state: this.probeEngine.getSnapshot(),
+          };
+        }
+
         this.cachedManifest = prevManifest;
         this.signatureVerified = true;
         this.deliveryMode = prevDeliveryMode;
         this.includeMmdbUpdate = prevIncludeMmdb;
         this.downloadTotalBytes = prevTotalBytes;
-        this.downloadedBytes = prevTotalBytes ?? 0;
-        this.progressPercent = 100;
+        this.downloadedBytes = 0;
+        this.progressPercent = prevStatus === 'available' ? prevProgressPercent : 0;
         this.viaChannel = prevChannel;
-        this.status = 'downloaded';
-        this.lastError = null;
+        this.status = prevStatus === 'error' ? 'error' : 'available';
+        this.lastError = silent
+          ? prevStatus === 'error'
+            ? prevLastError
+            : null
+          : `联网刷新失败（${lastErrText}），已保留新版本 v${prevManifest.version} 更新提示`;
+        if (!silent && this.lastError) {
+          this.probeEngine.recordExternalLog('warn', this.lastError, false);
+        }
         this.emitUpdateState();
         return {
           ok: false,
-          message: `联网刷新失败（${lastErrText}），本地已验签就绪的 v${prevManifest.version} 仍可直接重启更新`,
+          message: `联网刷新失败（${lastErrText}），已保留新版本 v${prevManifest.version} 更新提示`,
           state: this.probeEngine.getSnapshot(),
         };
       }
 
-      this.status = 'error';
+      this.cachedManifest = null;
       this.signatureVerified = false;
-      this.lastError = sawSignatureFailure
-        ? '更新清单 Ed25519 数字签名校验失败，已拒绝加载以防篡改'
-        : `检查更新失败：${lastErrText}`;
-      if (sawSignatureFailure || !silent) {
-        this.probeEngine.recordExternalLog(
-          sawSignatureFailure ? 'danger' : 'warn',
-          this.lastError,
-          false
-        );
+      this.deliveryMode = null;
+      this.includeMmdbUpdate = false;
+      this.downloadTotalBytes = null;
+      this.downloadedBytes = 0;
+      this.progressPercent = null;
+      this.status = 'error';
+      this.lastError = `检查更新失败：${lastErrText}`;
+      if (!silent) {
+        this.probeEngine.recordExternalLog('warn', this.lastError, false);
       }
       this.emitUpdateState();
       return {
@@ -1339,6 +1586,12 @@ export class UpdaterService {
         state: this.probeEngine.getSnapshot(),
       };
     }
+
+    this.lastAttemptSucceeded = true;
+    this.lastSuccessfulCheckAt = checkedNow;
+    this.startupCheckFailedAt = null;
+    this.startupRetryUsed = true;
+    this.clearStartupRetryTimer();
 
     this.cachedManifest = verifiedManifest;
     this.signatureVerified = true;
@@ -1362,18 +1615,26 @@ export class UpdaterService {
     }
 
     const decision = await this.decideDeliveryAndMmdb(verifiedManifest);
+    const stagedAlreadyValid = this.isPackaged
+      ? await this.isStagedUpdateAlreadyVerified(
+          verifiedManifest,
+          decision.deliveryMode,
+          decision.includeMmdbUpdate
+        )
+      : false;
+    if (this.applyingInProgress || (this.status as UpdateStatus) === 'applying') {
+      return {
+        ok: false,
+        message: '正在准备重启应用更新...',
+        state: this.probeEngine.getSnapshot(),
+      };
+    }
+
     this.deliveryMode = decision.deliveryMode;
     this.includeMmdbUpdate = decision.includeMmdbUpdate;
     this.downloadTotalBytes = decision.expectedBytes;
 
-    if (
-      this.isPackaged &&
-      (await this.isStagedUpdateAlreadyVerified(
-        verifiedManifest,
-        decision.deliveryMode,
-        decision.includeMmdbUpdate
-      ))
-    ) {
+    if (stagedAlreadyValid) {
       this.status = 'downloaded';
       this.downloadedBytes = decision.expectedBytes;
       this.progressPercent = 100;
@@ -1388,7 +1649,7 @@ export class UpdaterService {
 
     this.status = 'available';
     this.downloadedBytes = 0;
-    this.progressPercent = 0;
+    this.progressPercent = this.isPackaged ? 0 : null;
     this.lastError = null;
     this.emitUpdateState();
 
@@ -1397,20 +1658,22 @@ export class UpdaterService {
       return this.runTrackedDownload(silent);
     }
 
-    if (!silent) {
+    if (!silent || prevManifest?.version !== verifiedManifest.version) {
       this.probeEngine.recordExternalLog(
         'info',
-        `发现新版本 v${verifiedManifest.version}（${
-          decision.deliveryMode === 'asar' ? '增量热更包' : '完整更新包'
-        }）`
+        this.isPackaged
+          ? `发现新版本 v${verifiedManifest.version}（完整更新包），可点击右上角更新标志下载升级`
+          : `发现新版本 v${verifiedManifest.version}（源码运行模式），可点击右上角更新标志查看详情`,
+        false
       );
+      this.emitUpdateState();
     }
 
     return {
       ok: true,
       message: this.isPackaged
         ? `发现新版本 v${verifiedManifest.version}，请点击下载完整更新包`
-        : `发现新版本 v${verifiedManifest.version}（当前为开发调试环境，仅正式打包版执行在线替换）`,
+        : `发现新版本 v${verifiedManifest.version}（当前为源码运行模式，仅正式打包版执行原地替换）`,
       state: this.probeEngine.getSnapshot(),
     };
   }
@@ -1431,7 +1694,7 @@ export class UpdaterService {
   }
 
   public async downloadUpdate(): Promise<UpdateActionResult> {
-    if (this.applyingInProgress || this.status === 'applying') {
+    if (this.applyingInProgress || (this.status as UpdateStatus) === 'applying') {
       return {
         ok: false,
         message: '正在准备重启应用更新...',
@@ -1534,6 +1797,13 @@ export class UpdaterService {
     }
 
     const manifest = this.cachedManifest!;
+    if (compareSemver(manifest.version, this.currentVersion) <= 0) {
+      return {
+        ok: true,
+        message: `当前已是最新版本 (v${this.currentVersion})`,
+        state: this.probeEngine.getSnapshot(),
+      };
+    }
     if (!this.isPackaged) {
       return {
         ok: false,
@@ -1672,9 +1942,11 @@ export class UpdaterService {
       this.downloadedBytes = decision.expectedBytes;
       this.progressPercent = 100;
       this.lastError = null;
+      this.lastAttemptAt = Date.now();
+      this.lastAttemptSucceeded = true;
       this.probeEngine.recordExternalLog(
         'success',
-        `✨ 新版本 v${manifest.version} 更新包已下载并通过 Ed25519 + SHA-256 验签，可在「设置」页重启应用生效`,
+        `✨ 新版本 v${manifest.version} 更新包已下载并通过 Ed25519 + SHA-256 验签，可点击右上角更新标志立即重启生效`,
         false
       );
       this.emitUpdateState();
@@ -1687,6 +1959,10 @@ export class UpdaterService {
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.status = 'error';
+      this.downloadedBytes = 0;
+      this.progressPercent = 0;
+      this.lastAttemptAt = Date.now();
+      this.lastAttemptSucceeded = false;
       this.lastError = `更新包下载或验签失败：${msg}`;
       await rawFs.promises.rm(stageDir, { recursive: true, force: true }).catch(() => {});
       if (!silent) {

@@ -188,10 +188,12 @@ export async function runUpdaterRegressionTests(
   let manifestDelayMs = 0;
   let corruptAsarResponse = false;
   let mmdbDownloadCount = 0;
+  let manifestFetchCount = 0;
 
   const server = http.createServer((req, res) => {
     const pathname = new URL(req.url || '/', 'http://127.0.0.1').pathname;
     if (pathname === '/latest.json') {
+      manifestFetchCount++;
       if (failManifestNetwork) {
         res.writeHead(503);
         res.end('service unavailable');
@@ -401,6 +403,57 @@ export async function runUpdaterRegressionTests(
     const loopbackProxies = await engine.resolveUpdateDownloadProxies(`${baseUrl}/latest.json`);
     assert.equal(loopbackProxies.length, 1);
     assert.equal(loopbackProxies[0].proxyUrl, null);
+
+  // 验证 auto / manual 模式下 Clash 混合端口、全局 DIRECT 过滤与专属端口优先级隔离
+    const origGetRuntimeInfo = monitor.getRuntimeInfo.bind(monitor);
+    let mockedClashMode = 'rule';
+    monitor.getRuntimeInfo = () => ({
+      ...origGetRuntimeInfo(),
+      connected: true,
+      mode: mockedClashMode,
+      mixedPort: 7897,
+      antigravityDedicatedPort: 27898,
+      antigravityPortListening: true,
+      dedicatedPort: 27897,
+      dedicatedPortListening: true,
+    });
+    try {
+      const autoChannels = await engine.resolveUpdateDownloadProxies(
+        'https://github.com/liudg/proxy-region-guard/releases/latest/download/latest.json'
+      );
+      const urls = autoChannels.map((c) => c.proxyUrl);
+      assert.equal(urls[0], 'http://127.0.0.1:7897');
+      assert.equal(urls[1], 'http://127.0.0.1:27898');
+      assert.equal(urls[2], 'http://127.0.0.1:27897');
+      assert.equal(urls[urls.length - 1], null);
+
+      // Clash 处于全局 DIRECT 模式时应跳过直连 mixedPort，优先走绑定了节点的专属代理端口
+      mockedClashMode = 'direct';
+      const directModeAutoChannels = await engine.resolveUpdateDownloadProxies(
+        'https://github.com/liudg/proxy-region-guard/releases/latest/download/latest.json'
+      );
+      const directModeUrls = directModeAutoChannels.map((c) => c.proxyUrl);
+      assert.equal(directModeUrls.includes('http://127.0.0.1:7897'), false);
+      assert.equal(directModeUrls[0], 'http://127.0.0.1:27898');
+      assert.equal(directModeUrls[1], 'http://127.0.0.1:27897');
+
+      // manual 模式必须严格隔离，仅返回用户手动指定的代理通道，禁止旁路混入 Clash/系统代理/直连
+      store.update({
+        proxyMode: 'manual',
+        manualProxy: { protocol: 'socks5', host: '127.0.0.1', port: 10808 },
+      });
+      const manualChannels = await engine.resolveUpdateDownloadProxies(
+        'https://github.com/liudg/proxy-region-guard/releases/latest/download/latest.json'
+      );
+      assert.deepEqual(
+        manualChannels.map((c) => c.proxyUrl),
+        ['socks5h://127.0.0.1:10808'],
+        'manual 模式下更新代理不得越界回退其他端口或直连'
+      );
+    } finally {
+      monitor.getRuntimeInfo = origGetRuntimeInfo;
+    }
+
     store.update({ proxyMode: 'direct' });
 
     const appInstallDir = path.join(root, 'installed-app');
@@ -440,14 +493,21 @@ export async function runUpdaterRegressionTests(
       const forgedRes = await updater.checkForUpdates({ silent: false });
       assert.equal(forgedRes.ok, false);
       assert.equal(updater.getSnapshot().status, 'error');
+      assert.equal(updater.getSnapshot().hasUpdate, false, '伪造签名清单不得点亮更新标志');
       assert.match(forgedRes.message, /签名校验失败/);
 
-      // 4. 拦截下载包字节篡改
+      // 4. 拦截下载包字节篡改，但已验签通过的清单仍保持 hasUpdate = true 使右上角更新标志不消失
       servedManifestJson = JSON.stringify(validManifest);
       corruptAsarResponse = true;
       const corruptRes = await updater.checkForUpdates({ silent: false });
       assert.equal(corruptRes.ok, false);
       assert.equal(updater.getSnapshot().status, 'error');
+      assert.equal(updater.getSnapshot().signatureVerified, true);
+      assert.equal(
+        updater.getSnapshot().hasUpdate,
+        true,
+        '清单已验签但后台下载失败时，必须保持 hasUpdate=true 以保留右上角更新标志与重试入口'
+      );
       corruptAsarResponse = false;
 
       // 5. 模拟暂存目录残留上次中断解压留下的 _extract_full/resources/app.asar（验证 rawFs 不会报 EROFS 卡死！）
@@ -1107,7 +1167,7 @@ export async function runUpdaterRegressionTests(
         }
       }
 
-      // 9g. 验证新版本实例真实调用 startBackgroundSchedule() 时：同步写出握手标记，且在观察窗口期内绝不提前抢删 v-1.1.0 暂存/回滚备份或握手标记！
+      // 9g. 验证新版本实例真实调用 initialize() 时：同步写出握手标记，且在观察窗口期内绝不提前抢删 v-1.1.0 暂存/回滚备份或握手标记！
       const postBootStageV110 = path.join(spaceStageRoot, 'v-1.1.0', '_backup_app');
       rawFs.mkdirSync(postBootStageV110, { recursive: true });
       const postBootBackupSentinel = path.join(postBootStageV110, 'ffmpeg.dll');
@@ -1130,7 +1190,7 @@ export async function runUpdaterRegressionTests(
         allowLocalhostForTest: true,
       });
       try {
-        postBootUpdater.startBackgroundSchedule([
+        postBootUpdater.initialize([
           runtimeNodeBin,
           '--updated-from=1.0.0',
           `--update-ready-file="${postBootReadyFile}"`,
@@ -1138,7 +1198,7 @@ export async function runUpdaterRegressionTests(
         assert.equal(
           rawFs.existsSync(postBootReadyFile),
           true,
-          'startBackgroundSchedule 必须同步立即写出正向就绪握手文件'
+          'initialize 必须同步立即写出正向就绪握手文件'
         );
         await new Promise((r) => setTimeout(r, 250));
         assert.equal(
@@ -1165,6 +1225,195 @@ export async function runUpdaterRegressionTests(
           force: true,
         });
         rawFs.rmSync(postBootReadyFile, { force: true });
+      }
+
+      // 9g-2. 验证按需轻量检查策略：源码模式自动检查、唤起窗口冷却节流、离线 2 分钟短冷却防风暴、无闪烁静默复查、恶意篡改清空粘性缓存、启动断网精准单次恢复补查
+      const waitForCondition = async (
+        predicate: () => boolean,
+        timeoutMs = 3000,
+        label = '等待异步条件满足超时'
+      ): Promise<void> => {
+        const deadline = Date.now() + timeoutMs;
+        while (Date.now() < deadline) {
+          if (predicate()) return;
+          await new Promise((r) => setTimeout(r, 20));
+        }
+        assert.equal(predicate(), true, label);
+      };
+
+      servedManifestJson = JSON.stringify(validManifest);
+      failManifestNetwork = false;
+      const onDemandStageRoot = path.join(root, 'on-demand-stage');
+      const sourceModeUpdater = new UpdaterService({
+        configStore: store,
+        probeEngine: engine,
+        manifestUrlOverride: `${baseUrl}/latest.json`,
+        publicKeyOverride: pubB64,
+        isPackagedOverride: false,
+        currentVersionOverride: '1.0.0',
+        electronVersionOverride: '33.2.1',
+        appDirOverride: appInstallDir,
+        resourcesDirOverride: resDir,
+        exePathOverride: path.join(appInstallDir, '代理地区卫士.exe'),
+        stagingRootDirOverride: onDemandStageRoot,
+        allowLocalhostForTest: true,
+        startupCheckDelayMsOverride: 30,
+        windowShowCooldownMsOverride: 450,
+        errorRetryCooldownMsOverride: 280,
+      });
+      try {
+        const beforeInitCount = manifestFetchCount;
+        sourceModeUpdater.initialize([]);
+        // 启动定时器尚未触发前唤起窗口应让位给启动检查，避免重复并发请求
+        const earlyWinRes = await sourceModeUpdater.notifyWindowShown();
+        assert.equal(earlyWinRes, null);
+
+        await waitForCondition(
+          () => sourceModeUpdater.getSnapshot().status === 'available',
+          3000,
+          '源码模式启动后应自动检测并进入 available 状态'
+        );
+        const srcSnap = sourceModeUpdater.getSnapshot();
+        assert.equal(srcSnap.hasUpdate, true, '源码模式发现新版时必须置 hasUpdate = true');
+        assert.equal(srcSnap.latestVersion, '1.1.0');
+        assert.equal(
+          rawFs.existsSync(onDemandStageRoot),
+          false,
+          '源码模式自动检查绝不能下载任何安装包落盘'
+        );
+        const afterStartupCount = manifestFetchCount;
+        assert.equal(afterStartupCount - beforeInitCount, 1);
+
+        // 冷却期内唤起主窗口不得发起任何网络请求
+        const throttledRes = await sourceModeUpdater.notifyWindowShown();
+        assert.equal(throttledRes, null, '30 分钟冷却窗口内唤起窗口应直接跳过检查');
+        assert.equal(manifestFetchCount, afterStartupCount);
+
+        // 冷却期满后唤起窗口应执行按需静默检查：期间不退化为 checking（零闪烁），且断网失败时粘性保留 available！
+        await new Promise((r) => setTimeout(r, 480));
+        manifestDelayMs = 80;
+        const inFlightSilentCheck = sourceModeUpdater.notifyWindowShown();
+        assert.equal(
+          sourceModeUpdater.getSnapshot().status,
+          'available',
+          '已有验签新版本时后台静默复查期间不得退化为 checking 造成右上角标志闪烁'
+        );
+        const refreshedRes = await inFlightSilentCheck;
+        manifestDelayMs = 0;
+        assert.equal(refreshedRes?.ok, true);
+
+        // 再次等过长冷却后模拟断网唤起窗口：首次断网检查保留粘性状态，且紧接第二次唤起必须受 errorRetryCooldownMs 短冷却拦截！
+        await new Promise((r) => setTimeout(r, 480));
+        failManifestNetwork = true;
+        const offlineWinRes1 = await sourceModeUpdater.notifyWindowShown();
+        assert.notEqual(offlineWinRes1, null, '冷却期过后唤起窗口应触发按需检查');
+        assert.equal(offlineWinRes1?.ok, false);
+        assert.equal(
+          sourceModeUpdater.getSnapshot().status,
+          'available',
+          '已发现新版本后遇到临时断网重查失败，必须保留 available 状态不擦除右上角标志'
+        );
+        assert.equal(sourceModeUpdater.getSnapshot().hasUpdate, true);
+        assert.equal(sourceModeUpdater.getSnapshot().error, null, '静默重查失败不污染已有更新提示');
+
+        const countAfterOffline1 = manifestFetchCount;
+        const offlineWinRes2 = await sourceModeUpdater.notifyWindowShown();
+        assert.equal(
+          offlineWinRes2,
+          null,
+          '离线重查失败后在 errorRetryCooldownMs 短冷却窗口内再次唤起窗口必须节流跳过（防请求风暴）'
+        );
+        assert.equal(manifestFetchCount, countAfterOffline1);
+
+        // 安全边界：若已有合法缓存后远端返回篡改恶意下载域名（如 evil.example.com），绝不能误判为网络故障，必须清空 hasUpdate 并记 danger 告警！
+        failManifestNetwork = false;
+        await new Promise((r) => setTimeout(r, 310));
+        servedManifestJson = JSON.stringify({
+          ...validManifest,
+          asar: { ...validManifest.asar, url: 'https://evil.example.com/hijack.asar.gz' },
+        });
+        const hijackRes = await sourceModeUpdater.notifyWindowShown();
+        assert.equal(hijackRes?.ok, false);
+        assert.equal(sourceModeUpdater.getSnapshot().status, 'error');
+        assert.equal(
+          sourceModeUpdater.getSnapshot().hasUpdate,
+          false,
+          '遭遇恶意下载域名篡改时必须立即清空粘性更新缓存并关闭更新标志'
+        );
+        assert.equal(
+          engine
+            .getSnapshot()
+            .logs.some(
+              (l) => l.level === 'danger' && l.message.includes('安全校验未通过')
+            ),
+          true,
+          '静默检查遭遇篡改清单时也必须记录 danger 安全告警日志'
+        );
+        servedManifestJson = JSON.stringify(validManifest);
+      } finally {
+        manifestDelayMs = 0;
+        failManifestNetwork = false;
+        sourceModeUpdater.stop();
+      }
+
+      // 验证启动初期断网失败后：早于失败时刻的旧探测时间戳不会误消耗补查额度，真正恢复后的新时间戳仅执行单次补查
+      failManifestNetwork = true;
+      const staleProbeTimestamp = Date.now() - 2000;
+      const bootRecoverUpdater = new UpdaterService({
+        configStore: store,
+        probeEngine: engine,
+        manifestUrlOverride: `${baseUrl}/latest.json`,
+        publicKeyOverride: pubB64,
+        isPackagedOverride: false,
+        currentVersionOverride: '1.0.0',
+        electronVersionOverride: '33.2.1',
+        appDirOverride: appInstallDir,
+        resourcesDirOverride: resDir,
+        exePathOverride: path.join(appInstallDir, '代理地区卫士.exe'),
+        stagingRootDirOverride: onDemandStageRoot,
+        allowLocalhostForTest: true,
+        startupCheckDelayMsOverride: 25,
+        startupRetryDelayMsOverride: 10000,
+        windowShowCooldownMsOverride: 5000,
+        errorRetryCooldownMsOverride: 5000,
+      });
+      try {
+        bootRecoverUpdater.initialize([]);
+        await waitForCondition(
+          () => bootRecoverUpdater.getSnapshot().status === 'error',
+          3000,
+          '断网启动检查应进入 error 状态'
+        );
+        assert.equal(bootRecoverUpdater.getSnapshot().hasUpdate, false);
+
+        const countBeforeStale = manifestFetchCount;
+        bootRecoverUpdater.notifyNetworkReady(staleProbeTimestamp);
+        await new Promise((r) => setTimeout(r, 60));
+        assert.equal(
+          manifestFetchCount,
+          countBeforeStale,
+          '早于启动检查失败时刻的陈旧探测时间戳不得误触发并耗尽单次补查机会'
+        );
+
+        failManifestNetwork = false;
+        const countBeforeRecover = manifestFetchCount;
+        const freshTimestamp = Date.now() + 10;
+        bootRecoverUpdater.notifyNetworkReady(freshTimestamp);
+        bootRecoverUpdater.notifyNetworkReady(freshTimestamp + 50); // 重复调用应幂等忽略
+        await waitForCondition(
+          () => bootRecoverUpdater.getSnapshot().hasUpdate === true,
+          3000,
+          '网络恢复后的新时间戳应触发单次补查并发现新版本'
+        );
+        assert.equal(
+          manifestFetchCount - countBeforeRecover,
+          1,
+          'notifyNetworkReady 在启动检查失败后应仅执行单次补查'
+        );
+        assert.equal(bootRecoverUpdater.getSnapshot().status, 'available');
+      } finally {
+        failManifestNetwork = false;
+        bootRecoverUpdater.stop();
       }
 
       // 9h. 验证新版本可执行文件启动直接抛异常（如损坏/缺失）时，更新脚本捕获异常并完整回滚返回状态码 2

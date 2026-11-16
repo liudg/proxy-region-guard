@@ -6,6 +6,23 @@ import {
   GuardBridgeAPI,
 } from '../src/shared/types';
 
+let pendingOpenUpdateModalOpts: { confirmClaude?: boolean } | null = null;
+const openUpdateModalListeners = new Set<(opts: { confirmClaude?: boolean }) => void>();
+
+ipcRenderer.on(
+  'guard:open-update-modal',
+  (_event: Electron.IpcRendererEvent, opts: { confirmClaude?: boolean }) => {
+    const payload = opts || {};
+    if (openUpdateModalListeners.size === 0) {
+      pendingOpenUpdateModalOpts = payload;
+      return;
+    }
+    for (const listener of openUpdateModalListeners) {
+      listener(payload);
+    }
+  }
+);
+
 const api: GuardBridgeAPI = {
   getState: () => ipcRenderer.invoke('guard:get-state'),
   checkNow: (reason?: string) => ipcRenderer.invoke('guard:check-now', reason),
@@ -60,14 +77,19 @@ const api: GuardBridgeAPI = {
     };
   },
 
-  onNavigateToUpdate: (cb: (opts: { confirmClaude?: boolean }) => void) => {
-    const handler = (
-      _event: Electron.IpcRendererEvent,
-      opts: { confirmClaude?: boolean }
-    ) => cb(opts || {});
-    ipcRenderer.on('guard:navigate-to-update', handler);
+  onOpenUpdateModal: (cb: (opts: { confirmClaude?: boolean }) => void) => {
+    openUpdateModalListeners.add(cb);
+    if (pendingOpenUpdateModalOpts) {
+      queueMicrotask(() => {
+        if (pendingOpenUpdateModalOpts && openUpdateModalListeners.has(cb)) {
+          const buffered = pendingOpenUpdateModalOpts;
+          pendingOpenUpdateModalOpts = null;
+          cb(buffered);
+        }
+      });
+    }
     return () => {
-      ipcRenderer.removeListener('guard:navigate-to-update', handler);
+      openUpdateModalListeners.delete(cb);
     };
   },
 };

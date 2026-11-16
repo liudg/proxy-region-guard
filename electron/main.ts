@@ -147,6 +147,8 @@ let alertUserDragged = false;
 let suppressAlertMoveTrack = false;
 let lastTrayMenuSignature = '';
 let latestTrayTooltip = '代理地区卫士 · 正在初始化...';
+let mainWindowReadyToShow = false;
+const suppressAutoCheckWindows = new WeakSet<BrowserWindow>();
 
 function clearMainDestroyTimer(): void {
   if (mainDestroyTimer) {
@@ -264,12 +266,18 @@ function waitForPostUpdateRendererReady(
   });
 }
 
-function createMainWindow(revealOnReady = true, initialHash?: string): void {
+function createMainWindow(
+  revealOnReady = true,
+  initialHash?: string,
+  skipInitialAutoCheck = false
+): void {
   clearMainDestroyTimer();
+  mainWindowReadyToShow = !revealOnReady;
+  let suppressFirstShowAutoCheck = skipInitialAutoCheck;
   const curStatus = probeEngine ? probeEngine.getSnapshot().status : 'unset';
   const icon = createWindowAppIcon(curStatus);
 
-  mainWindow = new BrowserWindow({
+  const win = new BrowserWindow({
     width: 530,
     height: 760,
     minWidth: 480,
@@ -289,8 +297,9 @@ function createMainWindow(revealOnReady = true, initialHash?: string): void {
       spellcheck: false,
     },
   });
+  mainWindow = win;
 
-  loadRendererRoute(mainWindow, initialHash);
+  loadRendererRoute(win, initialHash);
 
   if (revealOnReady) {
     let revealed = false;
@@ -299,67 +308,139 @@ function createMainWindow(revealOnReady = true, initialHash?: string): void {
     const reveal = () => {
       if (revealed) return;
       revealed = true;
+      mainWindowReadyToShow = true;
       if (fallbackTimer) {
         clearTimeout(fallbackTimer);
         fallbackTimer = null;
       }
-      if (mainWindow && !mainWindow.isDestroyed() && !mainWindow.isVisible()) {
-        mainWindow.show();
-        mainWindow.focus();
+      if (!win.isDestroyed() && !win.isVisible()) {
+        win.show();
+        win.focus();
       }
     };
 
-    mainWindow.once('ready-to-show', reveal);
+    win.once('ready-to-show', reveal);
     fallbackTimer = setTimeout(reveal, 600);
+    fallbackTimer.unref?.();
   }
 
-  mainWindow.on('show', () => {
+  win.on('show', () => {
+    mainWindowReadyToShow = true;
     clearMainDestroyTimer();
-    if (probeEngine && mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send('guard:state-changed', probeEngine.getSnapshot());
+    if (probeEngine && !win.isDestroyed()) {
+      win.webContents.send('guard:state-changed', probeEngine.getSnapshot());
+    }
+    const skipAuto = suppressFirstShowAutoCheck || suppressAutoCheckWindows.has(win);
+    suppressFirstShowAutoCheck = false;
+    suppressAutoCheckWindows.delete(win);
+    if (!skipAuto) {
+      void updaterService?.notifyWindowShown();
     }
   });
 
-  mainWindow.on('close', (e) => {
+  win.on('restore', () => {
+    if (!suppressAutoCheckWindows.has(win)) {
+      void updaterService?.notifyWindowShown();
+    }
+  });
+
+  win.on('close', (e) => {
     if (!isQuitting && configStore?.get().closeToTray) {
       e.preventDefault();
       hideMainWindowToTray();
     }
   });
 
-  mainWindow.on('closed', () => {
+  win.on('closed', () => {
     clearMainDestroyTimer();
-    mainWindow = null;
+    if (mainWindow === win) {
+      mainWindow = null;
+      mainWindowReadyToShow = false;
+    }
   });
 }
 
-function showMainWindow(): void {
+function showMainWindow(opts: { skipAutoUpdateCheck?: boolean } = {}): void {
   if (!isBootstrapped) return;
   clearMainDestroyTimer();
   if (!mainWindow || mainWindow.isDestroyed()) {
-    createMainWindow(true);
+    createMainWindow(true, undefined, Boolean(opts.skipAutoUpdateCheck));
     return;
   }
-  if (mainWindow.isMinimized()) {
-    mainWindow.restore();
+  const win = mainWindow;
+  if (!mainWindowReadyToShow) {
+    if (opts.skipAutoUpdateCheck) {
+      suppressAutoCheckWindows.add(win);
+    }
+    return;
   }
-  mainWindow.show();
-  mainWindow.focus();
+  const wasHiddenOrMinimized = !win.isVisible() || win.isMinimized();
+  if (opts.skipAutoUpdateCheck) {
+    suppressAutoCheckWindows.add(win);
+  }
+  try {
+    if (win.isMinimized()) {
+      win.restore();
+    }
+    win.show();
+    win.focus();
+  } finally {
+    suppressAutoCheckWindows.delete(win);
+  }
+  if (!wasHiddenOrMinimized && !opts.skipAutoUpdateCheck) {
+    void updaterService?.notifyWindowShown();
+  }
 }
 
-function openUpdateCardInMainWindow(confirmClaude = false): void {
+function sendOpenUpdateModalWhenReady(win: BrowserWindow, confirmClaude: boolean): void {
+  if (win.isDestroyed()) return;
+  const dispatch = () => {
+    if (!win.isDestroyed()) {
+      win.webContents.send('guard:open-update-modal', { confirmClaude });
+    }
+  };
+  if (win.webContents.isLoading()) {
+    win.webContents.once('did-finish-load', dispatch);
+  } else {
+    dispatch();
+  }
+}
+
+function openUpdateModalInMainWindow(
+  confirmClaude = false,
+  skipAutoUpdateCheck = false
+): void {
   if (!isBootstrapped) return;
   clearMainDestroyTimer();
   if (!mainWindow || mainWindow.isDestroyed()) {
-    createMainWindow(true, confirmClaude ? 'update-confirm' : 'update');
+    createMainWindow(
+      true,
+      confirmClaude ? 'update-confirm' : 'update-modal',
+      skipAutoUpdateCheck
+    );
     return;
   }
-  if (mainWindow.isMinimized()) {
-    mainWindow.restore();
+  const win = mainWindow;
+  if (!mainWindowReadyToShow) {
+    if (skipAutoUpdateCheck) {
+      suppressAutoCheckWindows.add(win);
+    }
+    sendOpenUpdateModalWhenReady(win, confirmClaude);
+    return;
   }
-  mainWindow.show();
-  mainWindow.focus();
-  mainWindow.webContents.send('guard:navigate-to-update', { confirmClaude });
+  if (skipAutoUpdateCheck) {
+    suppressAutoCheckWindows.add(win);
+  }
+  try {
+    if (win.isMinimized()) {
+      win.restore();
+    }
+    win.show();
+    win.focus();
+  } finally {
+    suppressAutoCheckWindows.delete(win);
+  }
+  sendOpenUpdateModalWhenReady(win, confirmClaude);
 }
 
 function hideAlertWindow(): void {
@@ -693,8 +774,16 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     checking: '⏳ 正在检测...',
   };
 
+  const updateTooltipText =
+    state.updateState.hasUpdate && state.updateState.latestVersion
+      ? state.updateState.status === 'downloaded'
+        ? `✨ 新版 v${state.updateState.latestVersion} 已就绪 (可重启更新)`
+        : `⬇️ 发现新版本 v${state.updateState.latestVersion}`
+      : '';
+
   const tooltip = [
     `代理地区卫士 · ${statusLabelMap[state.status]}`,
+    updateTooltipText,
     clashChannelText,
     `当前出口: ${curText}`,
     nodeText,
@@ -751,6 +840,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
     state.isSyncingLocale ? '1' : '0',
     state.config.autoLaunch ? '1' : '0',
     state.updateState.status,
+    state.updateState.hasUpdate ? '1' : '0',
     state.updateState.latestVersion || '',
     dlProgressBucket,
   ].join('|');
@@ -889,7 +979,7 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
           ? claudeActiveForUpdate
             ? `✨ 新版本 v${state.updateState.latestVersion} 已就绪 (点击确认更新)`
             : `✨ 立即重启更新至 v${state.updateState.latestVersion}`
-          : state.updateState.status === 'available' && state.updateState.latestVersion
+          : state.updateState.hasUpdate && state.updateState.latestVersion
           ? `⬇️ 发现新版本 v${state.updateState.latestVersion} (点击查看)`
           : `检查版本更新 (v${state.updateState.currentVersion})`,
       enabled:
@@ -899,21 +989,23 @@ function refreshTrayFromState(state: AppStateSnapshot): void {
       click: () => {
         if (state.updateState.status === 'downloaded') {
           if (claudeActiveForUpdate) {
-            openUpdateCardInMainWindow(true);
+            openUpdateModalInMainWindow(true, true);
             return;
           }
           void updaterService.applyDownloadedUpdate(false).then((res) => {
             if (!res.ok) {
-              openUpdateCardInMainWindow(true);
+              const needClaudeConfirm =
+                res.state.claudeState.running || res.state.claudeState.authorizedSession;
+              openUpdateModalInMainWindow(needClaudeConfirm, true);
             }
           });
           return;
         }
-        if (state.updateState.status === 'available') {
-          openUpdateCardInMainWindow(false);
+        if (state.updateState.hasUpdate) {
+          openUpdateModalInMainWindow(false);
           return;
         }
-        openUpdateCardInMainWindow(false);
+        openUpdateModalInMainWindow(false, true);
         void updaterService.checkForUpdates({ silent: false });
       },
     },
@@ -1079,7 +1171,7 @@ function registerIpcHandlers(): void {
     }
 
     if (prevCfg.autoCheckUpdates !== nextCfg.autoCheckUpdates) {
-      updaterService?.reconcileAutoCheckTimer(false);
+      updaterService?.handleAutoCheckConfigChanged(nextCfg.autoCheckUpdates);
     }
 
     const agChanged =
@@ -1197,8 +1289,24 @@ if (tryRelaunchAsWindowsAdmin()) {
         },
       });
 
+      let wasClashProxyChannelReady = false;
       probeEngine.on('state-changed', (state: AppStateSnapshot) => {
         broadcastState(state);
+        const isClashProxyChannelReady = Boolean(
+          state.clashInfo.connected &&
+            ((state.clashInfo.mixedPort &&
+              state.clashInfo.mode?.trim().toLowerCase() !== 'direct') ||
+              state.clashInfo.antigravityPortListening ||
+              state.clashInfo.dedicatedPortListening)
+        );
+        if (!wasClashProxyChannelReady && isClashProxyChannelReady) {
+          updaterService?.notifyNetworkReady(Date.now());
+        }
+        wasClashProxyChannelReady = isClashProxyChannelReady;
+
+        if (state.status !== 'error' && state.lastProbe) {
+          updaterService?.notifyNetworkReady(state.lastProbe.checkedAt);
+        }
       });
 
       probeEngine.on('trigger-alert', (payload: AlertPayload) => {
@@ -1222,7 +1330,7 @@ if (tryRelaunchAsWindowsAdmin()) {
       if (IS_POST_UPDATE_BOOT && mainWindow && !mainWindow.isDestroyed()) {
         await waitForPostUpdateRendererReady(mainWindow);
       }
-      updaterService.startBackgroundSchedule(process.argv);
+      updaterService.initialize(process.argv);
       if (IS_POST_UPDATE_BOOT) {
         postUpdateHandshakeDone = true;
         process.removeListener('uncaughtException', handlePostUpdateBootFatal);

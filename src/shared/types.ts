@@ -48,7 +48,7 @@ export interface AppConfig {
   antigravityExePath: string;                 // 自定义 Antigravity.exe 启动路径（留空则自动探测）
 
   // 版本更新配置
-  autoCheckUpdates: boolean;                  // 启动与后台定时静默检查更新并预下载轻量增量包
+  autoCheckUpdates: boolean;                  // 启动与唤起主窗口时按需检查更新（30 分钟冷却），正式版自动预下载增量包
   useUpdateMirrorFallback: boolean;           // GitHub 直连与代理失败时允许经由镜像加速下载（强制公钥验签）
 }
 
@@ -220,6 +220,7 @@ export interface UpdateStateSnapshot {
   electronVersion: string;
   isPackaged: boolean;
   status: UpdateStatus;
+  hasUpdate: boolean;
   latestVersion: string | null;
   publishedAt: string | null;
   releaseNotes: string | null;
@@ -230,6 +231,7 @@ export interface UpdateStateSnapshot {
   progressPercent: number | null;
   signatureVerified: boolean;
   lastCheckedAt: number | null;
+  lastSuccessfulCheckAt: number | null;
   viaChannel: string | null;
   error: string | null;
   releasePageUrl: string;
@@ -318,7 +320,7 @@ export interface GuardBridgeAPI {
   // 事件订阅
   onStateChanged: (cb: (state: AppStateSnapshot) => void) => () => void;
   onAlertData: (cb: (payload: AlertPayload) => void) => () => void;
-  onNavigateToUpdate: (cb: (opts: { confirmClaude?: boolean }) => void) => () => void;
+  onOpenUpdateModal: (cb: (opts: { confirmClaude?: boolean }) => void) => () => void;
 }
 
 declare global {
