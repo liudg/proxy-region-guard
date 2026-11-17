@@ -189,7 +189,7 @@ export const AlertPopup: React.FC = () => {
             </div>
             <div className="disconnect-err-msg">
               <AlertTriangle size={15} />
-              <span>持续 30 秒无法完成地区校验，已执行 Claude 保护终止。</span>
+              <span>Claude 地区校验暂时不可用。</span>
             </div>
           </div>
         ) : isUnauthorizedLaunch ? (

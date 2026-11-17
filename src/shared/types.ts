@@ -135,7 +135,6 @@ export interface ProbeResult {
 
 export interface ClaudeVerificationFailure {
   startedAt: number;
-  deadlineAt: number;
   reason: string;
 }
 

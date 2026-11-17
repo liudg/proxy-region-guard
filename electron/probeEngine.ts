@@ -246,14 +246,6 @@ export class ProbeEngine extends EventEmitter {
         if (!this.claudeProbePromise && !this.claudeSafetyKillPromise) {
           await this.probeClaudeNodeNow('Claude 运行期后台复核');
         }
-      },
-      async (failure) => {
-        if (this.stopped || !this.claudeRunning) return;
-        await this.terminateUnsafeClaude({
-          safe: false,
-          alertType: 'verification-unavailable',
-          reason: `持续 30 秒无法完成地区校验：${failure.reason}`,
-        }, 'Claude 运行期后台复核');
       }
     );
 
@@ -1647,7 +1639,7 @@ export class ProbeEngine extends EventEmitter {
    * 轻量非重叠巡检：
    * 1. 严防任何未通过本卫士【Claude 专栏】启动的外部 Claude 进程（唯一启动入口硬性保障）
    * 2. 当 Claude 退出后自动回收 `claudeAuthorizedSession`，确保下次仍须从专栏启动
-   * 3. 地区、系统环境或代理绑定冲突立即终止；请求失败进入有期限的后台复核。
+   * 3. 地区、系统环境或代理绑定冲突立即终止；请求失败时持续进行后台复核。
    */
   private startClaudeExclusiveWatcher(): void {
     const scheduleNext = (delayMs: number) => {
@@ -1812,7 +1804,7 @@ export class ProbeEngine extends EventEmitter {
   }
 
   /**
-   * 明确冲突立即终止；校验请求失败静默复核，持续 30 秒未恢复时终止并提醒。
+   * 明确冲突立即终止；校验请求失败时持续进行后台复核，成功后清除异常状态。
    */
   private async enforceClaudeRunningSafety(triggerContext: string): Promise<boolean> {
     if (!this.claudeRunning || this.stopped) {

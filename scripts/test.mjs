@@ -7,7 +7,7 @@ import electron from 'electron';
 
 const directory = await mkdtemp(path.join(tmpdir(), 'guard-regression-'));
 try {
-  const entries = process.argv[2] ? [process.argv[2]] : ['tests/regression.ts', 'tests/appIdentity.ts'];
+  const entries = process.argv[2] ? [process.argv[2]] : ['tests/regression.ts', 'tests/appIdentity.ts', 'tests/claudeVerificationRecovery.ts'];
   for (const [index, entry] of entries.entries()) {
     const output = path.join(directory, `test-${index}.cjs`);
     await build({

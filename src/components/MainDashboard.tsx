@@ -1949,7 +1949,7 @@ export const MainDashboard: React.FC = () => {
                         </strong>
                         <p>
                           {formatTime(claudeState.verificationFailure.startedAt)} 起异常 ·{' '}
-                          {formatTime(claudeState.verificationFailure.deadlineAt)} 前未恢复将终止 Claude
+                          每隔 5 秒后台复核，恢复后自动清除提示
                         </p>
                         <small>
                           {claudeState.lockedSessionIp
@@ -2339,7 +2339,7 @@ export const MainDashboard: React.FC = () => {
                       <div className="setting-row">
                         <div>
                           <strong>Claude 保护终止提醒</strong>
-                          <p>IP、地区或时区异常立即强杀并弹窗；校验中断超 30 秒同样终止</p>
+                          <p>IP、地区或时区异常立即终止进程并弹窗；校验中断时持续后台复核</p>
                         </div>
                         <span className="mini-badge connected" style={{ flexShrink: 0 }}>
                           始终开启

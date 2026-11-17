@@ -1,7 +1,6 @@
 import { ClaudeVerificationFailure } from '../src/shared/types';
 
 export const CLAUDE_VERIFICATION_RETRY_MS = 5000;
-export const CLAUDE_VERIFICATION_DEADLINE_MS = 30000;
 
 export function normalizeVerificationFailureSignature(reason: string): string {
   return reason
@@ -20,14 +19,11 @@ export class ClaudeVerificationRecovery {
   private failure: ClaudeVerificationFailure | null = null;
   private loggedSignatures = new Set<string>();
   private retryTimer: NodeJS.Timeout | null = null;
-  private deadlineTimer: NodeJS.Timeout | null = null;
   private retryInProgress = false;
 
   constructor(
     private readonly retry: () => Promise<void>,
-    private readonly expire: (failure: ClaudeVerificationFailure) => Promise<void>,
-    private readonly retryMs = CLAUDE_VERIFICATION_RETRY_MS,
-    private readonly deadlineMs = CLAUDE_VERIFICATION_DEADLINE_MS
+    private readonly retryMs = CLAUDE_VERIFICATION_RETRY_MS
   ) {}
 
   get snapshot(): ClaudeVerificationFailure | null {
@@ -48,16 +44,10 @@ export class ClaudeVerificationRecovery {
     }
 
     const startedAt = Date.now();
-    const failure = { startedAt, deadlineAt: startedAt + this.deadlineMs, reason };
+    const failure = { startedAt, reason };
     this.failure = failure;
     this.loggedSignatures.clear();
     this.loggedSignatures.add(nextSignature);
-    this.deadlineTimer = setTimeout(() => {
-      if (this.failure !== failure) return;
-      const expired = { ...failure };
-      this.clear();
-      void this.expire(expired);
-    }, this.deadlineMs);
     this.retryTimer = setInterval(() => {
       if (this.failure !== failure || this.retryInProgress) return;
       this.retryInProgress = true;
@@ -76,9 +66,7 @@ export class ClaudeVerificationRecovery {
     this.failure = null;
     this.loggedSignatures.clear();
     if (this.retryTimer) clearInterval(this.retryTimer);
-    if (this.deadlineTimer) clearTimeout(this.deadlineTimer);
     this.retryTimer = null;
-    this.deadlineTimer = null;
     return previous;
   }
 }
