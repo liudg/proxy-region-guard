@@ -26,6 +26,7 @@ import {
 } from './autoLaunch';
 import { TrayHealthManager } from './trayHealth';
 import { configureAppUserData } from './appIdentity';
+import { recordUpdateBootEvent } from './updateBoot';
 import {
   quoteWindowsCommandLine,
   resolveWindowsPowerShellExe,
@@ -40,7 +41,11 @@ let postUpdateHandshakeDone = false;
 const handlePostUpdateBootFatal = (err: unknown) => {
   if (postUpdateHandshakeDone) return;
   console.error('[Updater Boot Fatal]', err);
-  app.exit(1);
+  try {
+    recordUpdateBootEvent('boot-failed', err instanceof Error ? err.stack || err.message : String(err));
+  } finally {
+    app.exit(1);
+  }
 };
 if (IS_POST_UPDATE_BOOT) {
   process.on('uncaughtException', handlePostUpdateBootFatal);
@@ -1269,6 +1274,7 @@ if (tryRelaunchAsWindowsAdmin()) {
     });
 
     app.whenReady().then(async () => {
+      if (IS_POST_UPDATE_BOOT) recordUpdateBootEvent('boot-start', '开始初始化主进程服务');
       const appRoot = app.getAppPath();
 
       configStore = new ConfigStore();
@@ -1328,6 +1334,7 @@ if (tryRelaunchAsWindowsAdmin()) {
       // 更新重启启动时，在主进程核心服务、离线库、托盘与本地主界面加载就绪后立即写出握手标记，
       // 避免被后续首次外网代理探测的慢网/断网超时（>12s）阻塞而误触发回滚
       if (IS_POST_UPDATE_BOOT && mainWindow && !mainWindow.isDestroyed()) {
+        recordUpdateBootEvent('renderer-wait', '等待主窗口加载');
         await waitForPostUpdateRendererReady(mainWindow);
       }
       updaterService.initialize(process.argv);

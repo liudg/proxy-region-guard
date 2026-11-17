@@ -23,6 +23,7 @@ import {
 import { ConfigStore } from './configStore';
 import { downloadFileViaProxy, requestTextViaProxy } from './netClient';
 import { ProbeEngine } from './probeEngine';
+import { readUpdateFailureReason, recordUpdateBootEvent, writeUpdateReadyFile } from './updateBoot';
 import {
   computeFileSha256,
   getRawFs,
@@ -111,7 +112,7 @@ function buildDetachedTrampolineEncodedCommand(): string {
   // 2) 通过短生命周期跳板以 ProcessStartInfo { UseShellExecute = true, WindowStyle = Hidden } 拉起内层 PowerShell：
   //    - ShellExecuteEx 在底层以 bInheritHandles = FALSE 创建新进程，彻底隔绝主进程打开的 asar/pak/dll/pipe 句柄继承锁死；
   //    - 规避 Start-Process -WorkingDirectory 对含 [ ] 方括号路径的通配符解析异常；
-  //    - 同时为内层分配独立隐藏控制台并切断与旧主进程的父子链，防止兜底 taskkill /T 误杀更新器自身。
+  //    - 为内层分配独立隐藏控制台，使更新器能够在主进程退出后继续运行。
   const trampoline = [
     '[Console]::OutputEncoding = [System.Text.Encoding]::UTF8',
     '$ProgressPreference = "SilentlyContinue"',
@@ -258,6 +259,7 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '$expectedZipSha = $env:GUARD_UPD_ZIP_SHA256',
     '$stageDir = $env:GUARD_UPD_STAGE_DIR',
     '$readyFile = $env:GUARD_UPD_READY_FILE',
+    '$diagnosticFile = $env:GUARD_UPD_DIAGNOSTIC_FILE',
     '$skipRelaunch = $env:GUARD_UPD_SKIP_RELAUNCH -eq "1"',
     '$defaultBootMs = if ($readyFile) { 12000 } else { 2200 }',
     '$bootCheckMs = if ($env:GUARD_UPD_BOOT_CHECK_MS) { [int]$env:GUARD_UPD_BOOT_CHECK_MS } else { $defaultBootMs }',
@@ -271,11 +273,24 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '  return \'"\' + $escaped + \'"\'',
     '}',
     '',
-    'function Invoke-SafeTaskkill([int]$ProcId) {',
-    '  if ($ProcId -le 0) { return }',
-    '  try {',
-    '    & cmd.exe /d /c "taskkill.exe /F /T /PID $ProcId >nul 2>&1"',
-    '  } catch {}',
+    'function Write-UpdateEvent([string]$Phase, [string]$Message) {',
+    '  if (-not $diagnosticFile) { return }',
+    '  $entry = @{ time = [DateTime]::UtcNow.ToString("o"); phase = $Phase; message = $Message; pid = $PID } | ConvertTo-Json -Compress',
+    '  [System.IO.File]::AppendAllText($diagnosticFile, $entry + [Environment]::NewLine, (New-Object System.Text.UTF8Encoding($false)))',
+    '}',
+    '',
+    'trap { Write-UpdateEvent "updater-failed" $_.Exception.ToString(); exit 1 }',
+    '',
+    'function Stop-GuardProcess([System.Diagnostics.Process]$GuardProcess) {',
+    '  if (-not $GuardProcess -or $GuardProcess.HasExited) { return }',
+    '  $null = $GuardProcess.Handle',
+    '  $actualPath = $GuardProcess.MainModule.FileName',
+    '  if (-not [string]::Equals([System.IO.Path]::GetFullPath($actualPath), [System.IO.Path]::GetFullPath($exePath), [StringComparison]::OrdinalIgnoreCase)) {',
+    '    throw "拒绝终止可执行文件路径不匹配的进程: $($GuardProcess.Id) $actualPath"',
+    '  }',
+    '  Write-UpdateEvent "stop-process" "终止卫士进程 PID=$($GuardProcess.Id)，路径=$actualPath"',
+    '  $GuardProcess.Kill()',
+    '  if (-not $GuardProcess.WaitForExit(4000)) { throw "卫士进程退出超时: $($GuardProcess.Id)" }',
     '}',
     '',
     'function Start-GuardProcess([string]$FilePath, [string]$WorkDir, [string[]]$RawArgs, [switch]$PassThru) {',
@@ -371,25 +386,12 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '}',
     '',
     'if ($targetPid -gt 0) {',
-    '  for ($i = 0; $i -lt $waitExitAttempts; $i++) {',
-    '    $p = Get-Process -Id $targetPid -ErrorAction SilentlyContinue',
-    '    if (-not $p) { break }',
-    '    Start-Sleep -Milliseconds 250',
-    '  }',
-    '  $still = Get-Process -Id $targetPid -ErrorAction SilentlyContinue',
-    '  if ($still) {',
-    '    $myParentId = 0',
-    '    try {',
-    '      $selfProc = Get-CimInstance Win32_Process -Filter "ProcessId = $PID" -ErrorAction SilentlyContinue',
-    '      if ($selfProc) { $myParentId = [int]$selfProc.ParentProcessId }',
-    '    } catch {}',
-    '    if ($myParentId -eq $targetPid -or $PID -eq $targetPid) {',
-    '      Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue',
-    '    } else {',
-    '      Invoke-SafeTaskkill $targetPid',
-    '      Stop-Process -Id $targetPid -Force -ErrorAction SilentlyContinue',
-    '    }',
-    '    Start-Sleep -Milliseconds 600',
+    '  $targetProcess = Get-Process -Id $targetPid -ErrorAction SilentlyContinue',
+    '  if ($targetProcess) {',
+    '    $null = $targetProcess.Handle',
+    '    Write-UpdateEvent "wait-old-process" "等待卫士进程退出 PID=$targetPid"',
+    '    if (-not $targetProcess.WaitForExit($waitExitAttempts * 250)) { Stop-GuardProcess $targetProcess }',
+    '    $targetProcess.Dispose()',
     '  }',
     '}',
     'Start-Sleep -Milliseconds 250',
@@ -471,11 +473,13 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '    }',
     '  } catch {',
     '    $allRestored = $false',
+    '    Write-UpdateEvent "rollback-failed" $_.Exception.ToString()',
     '  }',
     '  return $allRestored',
     '}',
     '',
     'try {',
+    '  Write-UpdateEvent "apply-start" "应用更新 $fromVer -> $toVer"',
     '  if ($mode -eq "asar") {',
     '    if (Test-Path -LiteralPath $asarTarget) {',
     '      Invoke-WithRetry { Copy-Item -LiteralPath $asarTarget -Destination $asarBak -Force }',
@@ -560,96 +564,96 @@ export function buildWindowsUpdatePowerShellScript(): string {
     '    throw "未知的更新应用模式: $mode"',
     '  }',
     '} catch {',
+    '  Write-UpdateEvent "apply-failed" $_.Exception.ToString()',
     '  Cleanup-ExtractArtifact',
     '  Cleanup-ReadyFile',
     '  $restoredOk = Restore-UpdateBackup',
+    '  if ($restoredOk) { Write-UpdateEvent "rollback-complete" "已恢复版本 $fromVer" }',
     '  if ($restoredOk -and (-not $skipRelaunch) -and (Test-Path -LiteralPath $exePath)) {',
     '    try {',
-    '      Start-GuardProcess -FilePath $exePath -WorkDir $appDir -RawArgs @("--update-rolled-back=$toVer")',
-    '    } catch {}',
+    '      Start-GuardProcess -FilePath $exePath -WorkDir $appDir -RawArgs @("--update-rolled-back=$toVer", "--update-diagnostic-file=$diagnosticFile")',
+    '    } catch { Write-UpdateEvent "rollback-launch-failed" $_.Exception.ToString(); throw }',
     '  }',
     '  exit 1',
     '}',
     '',
     'if (-not $skipRelaunch) {',
     '  Cleanup-ReadyFile',
-    '  $relaunchArgs = @("--updated-from=$fromVer")',
+    '  $relaunchArgs = @("--updated-from=$fromVer", "--update-diagnostic-file=$diagnosticFile")',
     '  if ($readyFile) {',
     '    $relaunchArgs += "--update-ready-file=$readyFile"',
     '  }',
     '  $proc = $null',
     '  $launchFailed = $false',
     '  try {',
+    '    Write-UpdateEvent "launch-start" "启动版本 $toVer"',
     '    $proc = Start-GuardProcess -FilePath $exePath -WorkDir $appDir -RawArgs $relaunchArgs -PassThru',
     '  } catch {',
     '    $launchFailed = $true',
+    '    Write-UpdateEvent "launch-failed" $_.Exception.ToString()',
     '  }',
     '  if ($launchFailed -or ($bootCheckMs -gt 0)) {',
     '    $bootReady = $false',
     '    if ((-not $launchFailed) -and ($bootCheckMs -gt 0)) {',
     '      $deadline = [DateTime]::UtcNow.AddMilliseconds($bootCheckMs)',
     '      while ([DateTime]::UtcNow -lt $deadline) {',
-    '        if ($readyFile -and (Test-Path -LiteralPath $readyFile)) {',
+    '        if ($readyFile -and (Test-Path -LiteralPath $readyFile -PathType Leaf)) {',
     '          $bootReady = $true',
     '          break',
     '        }',
     '        if ($proc) {',
     '          $procExited = $false',
     '          $procExitCode = 0',
-    '          try {',
-    '            $proc.Refresh()',
-    '            $procExited = $proc.HasExited',
-    '            if ($procExited) { $procExitCode = $proc.ExitCode }',
-    '          } catch {}',
+    '          $proc.Refresh()',
+    '          $procExited = $proc.HasExited',
+    '          if ($procExited) { $procExitCode = $proc.ExitCode }',
     '          if ($procExited) {',
     '            if ((-not $readyFile) -or ($procExitCode -ne 0)) { break }',
     '          }',
     '        }',
     '        Start-Sleep -Milliseconds 120',
     '      }',
-    '      if ((-not $bootReady) -and $readyFile -and (Test-Path -LiteralPath $readyFile)) {',
+    '      if ((-not $bootReady) -and $readyFile -and (Test-Path -LiteralPath $readyFile -PathType Leaf)) {',
     '        $bootReady = $true',
     '      }',
     '    }',
     '    $procExitedFinal = $false',
     '    $procExitCodeFinal = 0',
     '    if ($proc) {',
-    '      try {',
-    '        $proc.Refresh()',
-    '        $procExitedFinal = $proc.HasExited',
-    '        if ($procExitedFinal) { $procExitCodeFinal = $proc.ExitCode }',
-    '      } catch {}',
+    '      $proc.Refresh()',
+    '      $procExitedFinal = $proc.HasExited',
+    '      if ($procExitedFinal) { $procExitCodeFinal = $proc.ExitCode }',
     '    }',
     '    $shouldRollback = if ($launchFailed) {',
     '      $true',
     '    } elseif ($readyFile) {',
-    '      -not $bootReady',
+    '      (-not $bootReady) -or ($procExitedFinal -and ($procExitCodeFinal -ne 0))',
     '    } else {',
     '      ($null -eq $proc) -or ($procExitedFinal -and ($procExitCodeFinal -ne 0))',
     '    }',
     '    if ($shouldRollback) {',
+    '      if (-not $launchFailed) {',
+    '        if ($procExitedFinal) { Write-UpdateEvent "boot-exit" "新版本退出，退出代码=$procExitCodeFinal" }',
+    '        else { Write-UpdateEvent "boot-timeout" "等待启动就绪文件超时，等待时间=$bootCheckMs ms，文件=$readyFile" }',
+    '      }',
     '      if ($proc -and (-not $procExitedFinal)) {',
-    '        $killPid = 0',
-    '        try { $killPid = [int]$proc.Id } catch {}',
-    '        if ($killPid -gt 0) {',
-    '          Invoke-SafeTaskkill $killPid',
-    '          Stop-Process -Id $killPid -Force -ErrorAction SilentlyContinue',
-    '          Start-Sleep -Milliseconds 500',
-    '        }',
+    '        Stop-GuardProcess $proc',
     '      }',
     '      Cleanup-ExtractArtifact',
     '      Cleanup-ReadyFile',
     '      $restoredOk = Restore-UpdateBackup',
+    '      if ($restoredOk) { Write-UpdateEvent "rollback-complete" "已恢复版本 $fromVer" }',
     '      if ($restoredOk -and (Test-Path -LiteralPath $exePath)) {',
     '        try {',
-    '          Start-GuardProcess -FilePath $exePath -WorkDir $appDir -RawArgs @("--update-rolled-back=$toVer")',
-    '        } catch {}',
+    '          Start-GuardProcess -FilePath $exePath -WorkDir $appDir -RawArgs @("--update-rolled-back=$toVer", "--update-diagnostic-file=$diagnosticFile")',
+    '        } catch { Write-UpdateEvent "rollback-launch-failed" $_.Exception.ToString(); throw }',
     '      }',
     '      exit 2',
     '    }',
     '  }',
     '}',
     '',
+    'Write-UpdateEvent "complete" "更新完成 $fromVer -> $toVer"',
     'Cleanup-ExtractArtifact',
     'Cleanup-ReadyFile',
     'Remove-Item -LiteralPath $asarBak -Force -ErrorAction SilentlyContinue',
@@ -906,14 +910,16 @@ export class UpdaterService {
     this.startupCheckFailedAt = null;
     this.startupRetryUsed = false;
 
-    if (!this.configStore.get().autoCheckUpdates) {
-      return;
+    if (this.configStore.get().autoCheckUpdates) {
+      this.startupTimer = setTimeout(() => {
+        void this.runStartupAutoCheck();
+      }, this.startupCheckDelayMs);
+      this.startupTimer.unref?.();
     }
-
-    this.startupTimer = setTimeout(() => {
-      void this.runStartupAutoCheck();
-    }, this.startupCheckDelayMs);
-    this.startupTimer.unref?.();
+    if (argv.some((arg) => arg.startsWith('--updated-from='))) {
+      recordUpdateBootEvent('boot-check-complete', '启动检查完成，准备发布就绪标记', argv);
+    }
+    writeUpdateReadyFile(argv);
   }
 
   private async runStartupAutoCheck(): Promise<void> {
@@ -1025,14 +1031,8 @@ export class UpdaterService {
   }
 
   private handlePostUpdateStartupFlags(argv: string[]): void {
-    let readyFilePath = '';
     for (const arg of argv) {
-      if (arg.startsWith('--update-ready-file=')) {
-        readyFilePath = arg
-          .slice('--update-ready-file='.length)
-          .trim()
-          .replace(/^"+|"+$/g, '');
-      } else if (arg.startsWith('--updated-from=')) {
+      if (arg.startsWith('--updated-from=')) {
         const fromVer = arg.slice('--updated-from='.length).trim();
         if (fromVer && fromVer !== this.currentVersion) {
           this.probeEngine.recordExternalLog(
@@ -1044,18 +1044,8 @@ export class UpdaterService {
         const failedVer = arg.slice('--update-rolled-back='.length).trim();
         this.probeEngine.recordExternalLog(
           'danger',
-          `⚠️ 更新至 v${failedVer || '新版本'} 后启动自检未通过，已自动安全回滚至 v${this.currentVersion}`
+          `⚠️ 更新至 v${failedVer || '新版本'} 未完成，已回滚至 v${this.currentVersion}${readUpdateFailureReason(argv)}`
         );
-      }
-    }
-
-    // 写入正向就绪握手标记，通知脱离式 PowerShell 更新脚本新实例已完成核心引导
-    if (readyFilePath) {
-      try {
-        rawFs.mkdirSync(path.dirname(readyFilePath), { recursive: true });
-        rawFs.writeFileSync(readyFilePath, `${process.pid}:${Date.now()}\n`, 'utf-8');
-      } catch {
-        // ignore
       }
     }
 
@@ -2078,6 +2068,8 @@ export class UpdaterService {
         this.stagingRootDir,
         `boot-ready-${manifest.version}-${targetPid}.ok`
       );
+      const diagnosticFile = path.join(this.stagingRootDir, `update-${manifest.version}-${crypto.randomUUID()}.jsonl`);
+      rawFs.writeFileSync(diagnosticFile, '', { encoding: 'utf8', flag: 'wx' });
 
       const { encodedCommand, scriptGzB64 } = buildEncodedPowerShellLaunch();
 
@@ -2103,6 +2095,7 @@ export class UpdaterService {
           mode === 'full-zip' ? manifest.fullZip.sha256.toLowerCase() : '',
         GUARD_UPD_STAGE_DIR: stageDir,
         GUARD_UPD_READY_FILE: readyHandshakeFile,
+        GUARD_UPD_DIAGNOSTIC_FILE: diagnosticFile,
         GUARD_UPD_BOOT_CHECK_MS: String(this.bootHandshakeTimeoutMs),
       };
       if (this.waitExitAttemptsOverride !== undefined) {

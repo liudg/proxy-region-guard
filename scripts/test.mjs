@@ -7,7 +7,9 @@ import electron from 'electron';
 
 const directory = await mkdtemp(path.join(tmpdir(), 'guard-regression-'));
 try {
-  const entries = process.argv[2] ? [process.argv[2]] : ['tests/regression.ts', 'tests/appIdentity.ts', 'tests/claudeVerificationRecovery.ts'];
+  const entries = process.argv[2] ? [process.argv[2]] : ['tests/regression.ts', 'tests/appIdentity.ts', 'tests/claudeVerificationRecovery.ts', 'tests/updaterIntegration.ts'];
+  const updaterApp = path.join(directory, 'updater-app.cjs');
+  await build({ entryPoints: ['tests/updaterApp.ts'], outfile: updaterApp, bundle: true, platform: 'node', format: 'cjs', external: ['electron'] });
   for (const [index, entry] of entries.entries()) {
     const output = path.join(directory, `test-${index}.cjs`);
     await build({
@@ -23,6 +25,7 @@ try {
       ...process.env,
       GUARD_TEST_NODE: process.execPath,
       GUARD_TEST_DATA: path.join(directory, `user-data-${index}`),
+      GUARD_UPDATER_TEST_APP: updaterApp,
     };
     delete env.ELECTRON_RUN_AS_NODE;
     const child = spawn(electron, [output], { stdio: 'inherit', env, windowsHide: true });
