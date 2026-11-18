@@ -20,6 +20,7 @@ import { UpdateReleaseManifest, validateUpdateManifestStructure } from '../src/s
 import { isWindowsLocaleMatchingCountry } from '../src/shared/timezones';
 import { getTargetServiceVerificationError, isValidIpAddress } from '../src/shared/probeValidation';
 import { createStatusTrayIcon } from '../electron/trayIcon';
+import { requestTextViaProxy } from '../electron/netClient';
 import { validateSnapshots } from './snapshotValidation';
 import { validateLegacyMigration } from './legacyMigration';
 
@@ -127,8 +128,14 @@ async function run(): Promise<void> {
   assert.notEqual(service.channels.claude.getState().pid, service.channels.antigravity.getState().pid);
 
   const nonce = randomUUID();
+  const peerConnections = new Set<net.Socket>();
   server = http.createServer((request, response) => {
-    if (request.url === '/slow') { setTimeout(() => response.end(nonce), 2000); return; }
+    if (request.url === '/peer') {
+      peerConnections.add(request.socket);
+      response.end(request.socket.remoteAddress);
+      return;
+    }
+    if (request.url === '/slow') { setTimeout(() => response.end(nonce), 3000); return; }
     if (request.url !== '/stream') { response.end(nonce); return; }
     response.writeHead(200, { 'Content-Type': 'text/plain' });
     let sequence = 0;
@@ -290,6 +297,11 @@ async function run(): Promise<void> {
   execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-File', path.resolve('tests/suspendKernel.ps1'),
     '-KernelPid', String(recoveredPid), '-ExpectedExecutable', verifyCore(core)], { windowsHide: true, stdio: 'pipe' });
   await assert.rejects(service.channels.claude.checkReady(), /超时/);
+  await assert.rejects(requestTextViaProxy('https://example.com', `http://127.0.0.1:${claudePort}`, 700), /超时/);
+  const pendingConnections = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+    '@(Get-NetTCPConnection -OwningProcess $env:GUARD_CLIENT_PID -RemotePort $env:GUARD_PROXY_PORT -State Established -ErrorAction SilentlyContinue).Count'],
+    { windowsHide: true, encoding: 'utf8', env: { ...process.env, GUARD_CLIENT_PID: String(process.pid), GUARD_PROXY_PORT: String(claudePort) } });
+  assert.equal(pendingConnections.trim(), '0', 'CONNECT 超时后客户端应关闭代理连接');
   await service.channels.claude.restart();
   assert.notEqual(service.channels.claude.getState().pid, recoveredPid);
   assert.equal(await getThrough(claudePort, origin), nonce);
@@ -317,6 +329,31 @@ async function run(): Promise<void> {
   manifest.mihomo.sha256 = '0'.repeat(64);
   assert.equal(verifyUpdateManifestSignature(manifest, publicKey), false);
   console.log('通过：真实 Ed25519 签名覆盖私有内核版本与二进制校验值');
+
+  const httpProxy = `http://127.0.0.1:${claudePort}`;
+  const socksProxy = `socks5h://127.0.0.1:${claudePort}`;
+  for (const proxy of [httpProxy, httpProxy, socksProxy, socksProxy]) {
+    assert.equal(await requestTextViaProxy(`${origin}/peer`, proxy, 5000), '127.0.0.1');
+  }
+  assert.equal(peerConnections.size, 4);
+  await Promise.all([null, httpProxy, socksProxy].map(async (proxy) => {
+    assert.equal(await requestTextViaProxy(`${origin}/slow`, proxy, 5000), nonce);
+  }));
+  await assert.rejects(requestTextViaProxy('https://example.com', `http://user%2:pass@127.0.0.1:${claudePort}`, 5000), /URI malformed/i);
+  console.log('通过：HTTP 与 SOCKS 四次请求建立四条连接，直连和代理均在五秒内收到三秒延迟响应');
+
+  const ipv6Server = http.createServer((request, response) => response.end(request.socket.remoteAddress));
+  ipv6Server.listen(0, '::1');
+  await once(ipv6Server, 'listening');
+  try {
+    const ipv6Origin = `http://[::1]:${(ipv6Server.address() as net.AddressInfo).port}`;
+    for (const proxy of [httpProxy, socksProxy]) {
+      assert.equal(await requestTextViaProxy(ipv6Origin, proxy, 5000), '::1');
+    }
+    console.log('通过：同一个私有内核可以分别通过 IPv4 和 IPv6 访问本机服务');
+  } finally {
+    await new Promise<void>((resolve) => ipv6Server.close(() => resolve()));
+  }
 }
 
 async function cleanup(): Promise<void> {

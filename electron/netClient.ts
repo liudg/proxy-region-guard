@@ -4,6 +4,7 @@ import * as http from 'node:http';
 import * as https from 'node:https';
 import * as net from 'node:net';
 import * as path from 'node:path';
+import * as tls from 'node:tls';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { getRawFs } from './updateCrypto';
@@ -141,46 +142,249 @@ export function formatNetworkErrorMessage(err: unknown): string {
   return String(err || '网络连接异常').trim() || '网络连接异常';
 }
 
+export function isLocalProxyRefusedError(errMsg: string, proxyUrl: string | null): boolean {
+  if (!proxyUrl || !/ECONNREFUSED/i.test(errMsg)) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(proxyUrl);
+  } catch {
+    return false;
+  }
+  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
+    return false;
+  }
+  const proto = parsed.protocol.toLowerCase();
+  const effectivePort =
+    parsed.port ||
+    (proto === 'https:' ? '443' : proto.startsWith('socks') ? '1080' : '80');
+
+  // 剥离头部的探测目标 URL 前缀（兼容带端口 URL，如 https://example.com:27897/trace：...）
+  const body = errMsg.replace(/^https?:\/\/[^\s：]+?(?:：|:\s+)/i, '').trim();
+  if (!/ECONNREFUSED/i.test(body)) {
+    return false;
+  }
+
+  // 显式匹配本机回环地址 + 专属代理端口（兼容 127.0.0.1、localhost、[::1]、::1）
+  const loopbackEndpointRe = new RegExp(
+    `(?:^|[\\s(\\[])(?:127\\.0\\.0\\.1|localhost|\\[::1\\]|::1):${effectivePort}(?!\\d)`,
+    'i'
+  );
+  if (loopbackEndpointRe.test(body)) {
+    return true;
+  }
+
+  // 若错误信息包含任何其他显式地址:端口（如远端 IP:端口、非当前代理端口或 IPv6 地址），绝不误判为本机代理拒绝
+  if (/(?:[0-9a-zA-Z.-]+|\[[0-9a-fA-F:]+\]):\d+\b/.test(body)) {
+    return false;
+  }
+  if (/[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:]+/.test(body)) {
+    return false;
+  }
+
+  return true;
+}
+
+type ProxyConnectOpts = Parameters<HttpsProxyAgent<string>['connect']>[1];
+
+function withTlsServername<T extends { host?: string; servername?: string }>(options: T): T {
+  if (options.servername === undefined && options.host && !net.isIP(options.host)) {
+    return { ...options, servername: options.host };
+  }
+  return options;
+}
+
+function attachFallbackSocketErrorGuard(sock: net.Socket, req: http.ClientRequest): void {
+  sock.on('error', (err) => {
+    // 消除 Node ClientRequest.onSocket (process.nextTick(onSocketNT)) 挂载前及 CONNECT cleanup 后的无监听空窗期，
+    // 仅在无其他 error 监听器时兜底转发至 req，既杜绝主进程 uncaughtException 又不干扰正常错误传播
+    if (sock.listenerCount('error') <= 1 && !req.destroyed) {
+      req.destroy(err);
+    }
+  });
+}
+
+class ScopedHttpsProxyAgent extends HttpsProxyAgent<string> {
+  private readonly activeSockets = new Set<net.Socket>();
+  private readonly controller = new AbortController();
+
+  private trackSocket(sock: net.Socket, req: http.ClientRequest): void {
+    attachFallbackSocketErrorGuard(sock, req);
+    this.activeSockets.add(sock);
+    sock.once('close', () => {
+      this.activeSockets.delete(sock);
+    });
+  }
+
+  override async connect(req: http.ClientRequest, opts: ProxyConnectOpts): Promise<net.Socket> {
+    if (!opts.host) {
+      throw new TypeError('No "host" provided');
+    }
+    if (this.controller.signal.aborted || req.destroyed) {
+      throw new Error('连接超时');
+    }
+
+    const host = net.isIPv6(opts.host) ? `[${opts.host}]` : opts.host;
+    const authority = `${host}:${opts.port}`;
+    const headers: http.OutgoingHttpHeaders = { Host: authority, 'Proxy-Connection': 'close' };
+    if (this.proxy.username || this.proxy.password) {
+      const auth = `${decodeURIComponent(this.proxy.username)}:${decodeURIComponent(this.proxy.password)}`;
+      headers['Proxy-Authorization'] = `Basic ${Buffer.from(auth).toString('base64')}`;
+    }
+    const transport = this.proxy.protocol === 'https:' ? https : http;
+    const rawSocket = await new Promise<net.Socket>((resolve, reject) => {
+      const connectRequest = transport.request({
+        hostname: this.connectOpts.host,
+        port: this.connectOpts.port,
+        method: 'CONNECT',
+        path: authority,
+        headers,
+        agent: false,
+        signal: this.controller.signal,
+        maxHeaderSize: MAX_HEADER_BYTES,
+      });
+      connectRequest.once('error', reject);
+      connectRequest.once('connect', (response, socket, head) => {
+        if (response.statusCode !== 200) {
+          socket.destroy();
+          reject(new Error(`HTTP 状态码 ${response.statusCode}`));
+          return;
+        }
+        this.trackSocket(socket, req);
+        if (head.length) socket.unshift(head);
+        resolve(socket);
+      });
+      connectRequest.end();
+    });
+
+    try {
+      if (this.controller.signal.aborted || req.destroyed) {
+        throw new Error('连接超时');
+      }
+
+      req.once('socket', (s) => s.resume());
+
+      if (opts.secureEndpoint) {
+        const { host: _h, path: _p, port: _port, ...restOpts } = withTlsServername(opts);
+        void _h;
+        void _p;
+        void _port;
+        const tlsSocket = tls.connect({
+          ...restOpts,
+          socket: rawSocket,
+        });
+        this.trackSocket(tlsSocket, req);
+        req.once('close', () => {
+          if (!tlsSocket.destroyed) tlsSocket.destroy();
+        });
+        return tlsSocket;
+      }
+
+      return rawSocket;
+    } catch (err) {
+      rawSocket.destroy();
+      throw err;
+    }
+  }
+
+  override destroy(): void {
+    this.controller.abort();
+    for (const sock of this.activeSockets) {
+      if (!sock.destroyed) sock.destroy();
+    }
+    this.activeSockets.clear();
+    super.destroy();
+  }
+}
+
+class ScopedSocksProxyAgent extends SocksProxyAgent {
+  private readonly activeSockets = new Set<net.Socket>();
+  private isDestroyed = false;
+
+  override async connect(req: http.ClientRequest, opts: ProxyConnectOpts): Promise<net.Socket> {
+    if (this.isDestroyed || req.destroyed) {
+      throw new Error('连接超时');
+    }
+    const sock = await super.connect(req, opts);
+    attachFallbackSocketErrorGuard(sock, req);
+    this.activeSockets.add(sock);
+    sock.once('close', () => {
+      this.activeSockets.delete(sock);
+    });
+    if (this.isDestroyed || req.destroyed) {
+      sock.destroy();
+      throw new Error('连接超时');
+    }
+    req.once('close', () => {
+      if (!sock.destroyed) sock.destroy();
+    });
+    return sock;
+  }
+
+  override destroy(): void {
+    this.isDestroyed = true;
+    for (const sock of this.activeSockets) {
+      if (!sock.destroyed) sock.destroy();
+    }
+    this.activeSockets.clear();
+    super.destroy();
+  }
+}
+
+function createOneShotAgent(
+  normalizedProxy: string | null,
+  isHttps: boolean,
+  timeoutMs: number
+): http.Agent {
+  if (normalizedProxy) {
+    return normalizedProxy.toLowerCase().startsWith('socks')
+      ? new ScopedSocksProxyAgent(normalizedProxy, { keepAlive: false, timeout: timeoutMs })
+      : new ScopedHttpsProxyAgent(normalizedProxy, { keepAlive: false, timeout: timeoutMs });
+  }
+  return isHttps
+    ? new https.Agent({ keepAlive: false, timeout: timeoutMs })
+    : new http.Agent({ keepAlive: false, timeout: timeoutMs });
+}
+
+function isNonRetriableRequestError(msg: string): boolean {
+  if (/探测 URL 格式无效|不支持的 URL 协议|重定向|安全策略拦截|响应体积超出安全上限|代理响应头超出安全上限|URI malformed/i.test(msg)) {
+    return true;
+  }
+  const httpCodeMatch = /^HTTP 状态码 (\d+)/.exec(msg);
+  if (httpCodeMatch) {
+    const statusCode = Number(httpCodeMatch[1]);
+    return statusCode !== 408 && statusCode !== 429 && statusCode < 500;
+  }
+  return false;
+}
+
 export async function requestTextViaProxy(
   targetUrl: string,
   proxyUrl: string | null,
   timeoutMs: number,
   acceptHeader = 'text/plain, */*',
   redirectsLeft = 2,
-  allowLocalhost = false
+  allowLocalhost = false,
+  signal?: AbortSignal
 ): Promise<string> {
   const deadlineAt = Date.now() + timeoutMs;
+  const normalizedProxy = proxyUrl ? normalizeProxyUrlScheme(proxyUrl) : null;
+  const request = () => requestTextViaProxyOnce(
+    targetUrl, normalizedProxy, deadlineAt, acceptHeader, redirectsLeft, allowLocalhost, signal
+  );
   try {
-    return await requestTextViaProxyOnce(
-      targetUrl,
-      proxyUrl,
-      deadlineAt,
-      acceptHeader,
-      redirectsLeft,
-      allowLocalhost
-    );
-  } catch (err) {
-    const msg = formatNetworkErrorMessage(err);
-    const remainingMs = deadlineAt - Date.now();
-    const isTransientProxySocketDisconnect =
-      Boolean(proxyUrl) &&
-      remainingMs >= 1600 &&
-      /before secure TLS connection was established|socket hang up|ECONNRESET|ECONNREFUSED|EPIPE/i.test(
-        msg
-      );
-    if (!isTransientProxySocketDisconnect) {
-      throw err;
+    return await request();
+  } catch (error) {
+    const msg = formatNetworkErrorMessage(error);
+    if (signal?.aborted || (!normalizedProxy && timeoutMs < 5000) || isNonRetriableRequestError(msg)) {
+      throw error;
     }
-    await new Promise((r) => setTimeout(r, 240));
-    const retryDeadlineAt = Math.max(deadlineAt, Date.now() + 1500);
-    return requestTextViaProxyOnce(
-      targetUrl,
-      proxyUrl,
-      retryDeadlineAt,
-      acceptHeader,
-      redirectsLeft,
-      allowLocalhost
-    );
+    const localRefused = isLocalProxyRefusedError(msg, normalizedProxy);
+    const transient = /连接超时|ETIMEDOUT|before secure TLS connection was established|socket hang up|ECONNRESET|EPIPE|EAI_AGAIN/i.test(msg)
+      || (normalizedProxy && /ECONNREFUSED|ENOTFOUND|^HTTP 状态码 (?:408|429|5\d\d)/i.test(msg));
+    if (!transient || deadlineAt - Date.now() < (localRefused ? 500 : 1360)) throw error;
+    await new Promise((resolve) => setTimeout(resolve, localRefused ? 180 : 160));
+    return request();
   }
 }
 
@@ -190,8 +394,10 @@ async function requestTextViaProxyOnce(
   deadlineAt: number,
   acceptHeader = 'text/plain, */*',
   redirectsLeft = 2,
-  allowLocalhost = false
+  allowLocalhost = false,
+  signal?: AbortSignal
 ): Promise<string> {
+  signal?.throwIfAborted();
   let parsedUrl: URL;
   try {
     parsedUrl = new URL(targetUrl);
@@ -213,11 +419,25 @@ async function requestTextViaProxyOnce(
   return new Promise<string>((resolve, reject) => {
     let settled = false;
     let req: http.ClientRequest | null = null;
+    let agent: http.Agent | null = null;
+
+    const cleanupTransport = () => {
+      try {
+        agent?.destroy();
+      } catch {
+        // ignore
+      }
+    };
 
     const finish = (err: Error | null, body?: string) => {
       if (settled) return;
       settled = true;
       clearTimeout(hardDeadline);
+      signal?.removeEventListener('abort', onAbort);
+      if (err) {
+        req?.destroy();
+      }
+      cleanupTransport();
       if (err) {
         const normalizedErr = err.message.trim()
           ? err
@@ -237,6 +457,8 @@ async function requestTextViaProxyOnce(
       }
       finish(new Error('连接超时'));
     }, budgetMs);
+    const onAbort = () => finish(new Error('探测请求已取消'));
+    signal?.addEventListener('abort', onAbort, { once: true });
 
     const isHttps = parsedUrl.protocol === 'https:';
     const baseHeaders: Record<string, string> = {
@@ -254,11 +476,13 @@ async function requestTextViaProxyOnce(
       const code = res.statusCode || 0;
 
       if (REDIRECT_STATUS_CODES.has(code) && res.headers.location && redirectsLeft > 0) {
-        const locationHeader = res.headers.location;
-        res.destroy();
-        clearTimeout(hardDeadline);
         if (settled) return;
         settled = true;
+        clearTimeout(hardDeadline);
+        signal?.removeEventListener('abort', onAbort);
+        const locationHeader = res.headers.location;
+        res.destroy();
+        cleanupTransport();
 
         let nextUrl: string;
         try {
@@ -279,7 +503,8 @@ async function requestTextViaProxyOnce(
           deadlineAt,
           acceptHeader,
           redirectsLeft - 1,
-          allowLocalhost
+          allowLocalhost,
+          signal
         )
           .then(resolve)
           .catch(reject);
@@ -316,6 +541,9 @@ async function requestTextViaProxyOnce(
       if (normalizedProxy && !normalizedProxy.toLowerCase().startsWith('socks') && !isHttps) {
         // 明文 HTTP 目标经由 HTTP 代理：直接发送标准正向代理请求，无需 CONNECT 隧道
         const proxyParsed = new URL(normalizedProxy);
+        agent = proxyParsed.protocol === 'https:'
+          ? new https.Agent({ keepAlive: false, timeout: budgetMs })
+          : new http.Agent({ keepAlive: false, timeout: timeoutMsOrBudget(budgetMs) });
         const headers: Record<string, string> = {
           ...baseHeaders,
           Host: parsedUrl.host,
@@ -333,6 +561,7 @@ async function requestTextViaProxyOnce(
             port: proxyParsed.port || (proxyParsed.protocol === 'https:' ? 443 : 80),
             method: 'GET',
             path: parsedUrl.toString(),
+            agent,
             timeout: budgetMs,
             maxHeaderSize: MAX_HEADER_BYTES,
             headers,
@@ -340,16 +569,7 @@ async function requestTextViaProxyOnce(
           handleResponse
         );
       } else {
-        let agent: http.Agent;
-        if (normalizedProxy) {
-          agent = normalizedProxy.toLowerCase().startsWith('socks')
-            ? new SocksProxyAgent(normalizedProxy, { keepAlive: false, timeout: budgetMs })
-            : new HttpsProxyAgent(normalizedProxy, { keepAlive: false, timeout: budgetMs });
-        } else {
-          agent = isHttps
-            ? new https.Agent({ keepAlive: false, timeout: budgetMs })
-            : new http.Agent({ keepAlive: false, timeout: budgetMs });
-        }
+        agent = createOneShotAgent(normalizedProxy, isHttps, budgetMs);
 
         const transport = isHttps ? https : http;
         req = transport.request(
@@ -378,6 +598,10 @@ async function requestTextViaProxyOnce(
       finish(err instanceof Error ? err : new Error(String(err)));
     }
   });
+}
+
+function timeoutMsOrBudget(budgetMs: number): number {
+  return Math.max(1, budgetMs);
 }
 
 export async function requestJsonViaProxy<T = Record<string, unknown>>(
@@ -452,8 +676,17 @@ export async function downloadFileViaProxy(
   return new Promise<{ size: number; sha256: string }>((resolve, reject) => {
     let settled = false;
     let req: http.ClientRequest | null = null;
+    let agent: http.Agent | null = null;
     let fileStream: fs.WriteStream | null = null;
     let stallTimer: NodeJS.Timeout | null = null;
+
+    const cleanupTransport = () => {
+      try {
+        agent?.destroy();
+      } catch {
+        // ignore
+      }
+    };
 
     const clearStall = () => {
       if (stallTimer) {
@@ -500,6 +733,10 @@ export async function downloadFileViaProxy(
       clearTimeout(hardDeadline);
       clearStall();
       if (err) {
+        req?.destroy();
+      }
+      cleanupTransport();
+      if (err) {
         cleanupPartialFile();
         reject(err);
       } else if (result) {
@@ -531,12 +768,13 @@ export async function downloadFileViaProxy(
       const code = res.statusCode || 0;
 
       if (REDIRECT_STATUS_CODES.has(code) && res.headers.location && redirectsLeft > 0) {
-        const locationHeader = res.headers.location;
-        res.destroy();
-        clearTimeout(hardDeadline);
-        clearStall();
         if (settled) return;
         settled = true;
+        clearTimeout(hardDeadline);
+        clearStall();
+        const locationHeader = res.headers.location;
+        res.destroy();
+        cleanupTransport();
 
         let nextUrl: string;
         try {
@@ -639,6 +877,9 @@ export async function downloadFileViaProxy(
     try {
       if (normalizedProxy && !normalizedProxy.toLowerCase().startsWith('socks') && !isHttps) {
         const proxyParsed = new URL(normalizedProxy);
+        agent = proxyParsed.protocol === 'https:'
+          ? new https.Agent({ keepAlive: false, timeout: effectiveStallMs })
+          : new http.Agent({ keepAlive: false, timeout: timeoutMsOrBudget(effectiveStallMs) });
         const headers: Record<string, string> = {
           ...baseHeaders,
           Host: parsedUrl.host,
@@ -656,6 +897,7 @@ export async function downloadFileViaProxy(
             port: proxyParsed.port || (proxyParsed.protocol === 'https:' ? 443 : 80),
             method: 'GET',
             path: parsedUrl.toString(),
+            agent,
             timeout: effectiveStallMs,
             maxHeaderSize: MAX_HEADER_BYTES,
             headers,
@@ -663,16 +905,7 @@ export async function downloadFileViaProxy(
           handleResponse
         );
       } else {
-        let agent: http.Agent;
-        if (normalizedProxy) {
-          agent = normalizedProxy.toLowerCase().startsWith('socks')
-            ? new SocksProxyAgent(normalizedProxy, { keepAlive: false, timeout: effectiveStallMs })
-            : new HttpsProxyAgent(normalizedProxy, { keepAlive: false, timeout: effectiveStallMs });
-        } else {
-          agent = isHttps
-            ? new https.Agent({ keepAlive: false, timeout: effectiveStallMs })
-            : new http.Agent({ keepAlive: false, timeout: effectiveStallMs });
-        }
+        agent = createOneShotAgent(normalizedProxy, isHttps, effectiveStallMs);
 
         const transport = isHttps ? https : http;
         req = transport.request(

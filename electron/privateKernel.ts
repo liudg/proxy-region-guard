@@ -49,6 +49,7 @@ export class PrivateKernel extends EventEmitter {
   private stopped = false;
   private booting = false;
   private recoveryEpoch = 0;
+  private forwardingStateSeq = 0;
   private readonly state: PrivateChannelState = {
     phase: 'idle', pid: null, port: null, nodeName: null, profileUid: null, profileName: null,
     generation: 0, error: null, verificationError: null, sourceStatus: 'unknown', sourceError: null,
@@ -122,6 +123,7 @@ export class PrivateKernel extends EventEmitter {
 
   private setSelection(saved: SavedChannel | null): void {
     this.saved = saved;
+    this.forwardingStateSeq++;
     Object.assign(this.state, {
       nodeName: saved?.snapshot.nodeName || null, profileUid: saved?.snapshot.profileUid || null,
       profileName: saved?.snapshot.profileName || null, port: saved?.port || null,
@@ -168,16 +170,19 @@ export class PrivateKernel extends EventEmitter {
     if (!names.has(snapshot.nodeName)) throw new Error('节点副本缺少选中的代理定义');
     let outbound = 'guard-selected-outbound';
     while (names.has(outbound)) outbound += '-private';
+    const proxies = snapshot.proxies.map((proxy) =>
+      proxy['ip-version'] ? { ...proxy } : { ...proxy, 'ip-version': 'ipv4-prefer' }
+    );
     return {
       'mixed-port': saved.port, 'bind-address': '127.0.0.1', 'allow-lan': false,
-      mode: 'rule', ipv6: true, 'log-level': 'warning', 'find-process-mode': 'off',
+      mode: 'rule', ipv6: true, 'tcp-concurrent': true, 'log-level': 'warning', 'find-process-mode': 'off',
       'external-controller-pipe': endpoint.pipePath, secret: endpoint.secret,
       tun: { enable: false }, profile: { 'store-selected': false, 'store-fake-ip': false },
       dns: { enable: true, ipv6: true, 'enhanced-mode': 'redir-host', 'use-system-hosts': false,
         'default-nameserver': ['223.5.5.5'], 'proxy-server-nameserver': resolvers,
         'proxy-server-nameserver-policy': policy,
         nameserver: [`https://1.1.1.1/dns-query#${outbound}`] },
-      hosts: snapshot.hosts, proxies: snapshot.proxies,
+      hosts: snapshot.hosts, proxies,
       'proxy-groups': [{ name: outbound, type: 'select', proxies: [snapshot.nodeName] }],
       rules: [`MATCH,${outbound}`],
     };
@@ -241,12 +246,45 @@ export class PrivateKernel extends EventEmitter {
     if (!proxies.proxies[this.saved.snapshot.nodeName] || !await isLocalPortListening(this.saved.port)) throw new Error('私有内核专属监听未就绪');
   }
 
+  public clearForwardingError(): void {
+    if (this.state.phase === 'ready' && this.state.verificationError?.startsWith('专属代理请求失败：')) {
+      this.forwardingStateSeq++;
+      this.state.verificationError = null;
+      this.publish();
+    }
+  }
+
+  private async probeForwarding(port: number, totalTimeoutMs = 10000): Promise<void> {
+    const proxyUrl = `http://127.0.0.1:${port}`;
+    const deadlineAt = Date.now() + totalTimeoutMs;
+    const urls = [
+      'https://ipv4.icanhazip.com/cdn-cgi/trace',
+      'https://cp.cloudflare.com/generate_204',
+    ];
+    let lastError: unknown = new Error('连接超时');
+    for (let i = 0; i < urls.length; i++) {
+      const remainingMs = deadlineAt - Date.now();
+      if (remainingMs <= 0) break;
+      const budgetMs = i === 0 ? Math.min(remainingMs, Math.round(totalTimeoutMs * 0.65)) : remainingMs;
+      try {
+        await requestTextViaProxy(urls[i], proxyUrl, budgetMs);
+        return;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw lastError;
+  }
+
   private async verifyForwarding(): Promise<void> {
+    const seq = ++this.forwardingStateSeq;
     this.state.verificationError = null;
     try {
-      await requestTextViaProxy('https://cp.cloudflare.com/generate_204', `http://127.0.0.1:${this.saved!.port}`, 10000);
+      await this.probeForwarding(this.saved!.port, 10000);
     } catch (error) {
-      this.state.verificationError = `专属代理请求失败：${errorText(error)}`;
+      if (this.forwardingStateSeq === seq) {
+        this.state.verificationError = `专属代理请求失败：${errorText(error)}`;
+      }
     }
   }
 
@@ -255,6 +293,7 @@ export class PrivateKernel extends EventEmitter {
     if (await isLocalPortListening(this.saved.port)) throw new Error(`专属端口 ${this.saved.port} 已被其他进程占用`);
     const endpoint = preparedEndpoint || await this.prepare(this.saved);
     const revisionDirectory = path.join(this.directory, this.saved.revision);
+    this.forwardingStateSeq++;
     this.state.phase = this.retries.length ? 'recovering' : 'starting';
     this.state.error = null;
     this.state.verificationError = null;
@@ -314,9 +353,20 @@ export class PrivateKernel extends EventEmitter {
       try {
         await this.verifyListener();
         if (this.state.verificationError && this.saved) {
-          await requestTextViaProxy('https://cp.cloudflare.com/generate_204', `http://127.0.0.1:${this.saved.port}`, 10000);
-          this.state.verificationError = null;
-          this.publish();
+          const seq = this.forwardingStateSeq;
+          try {
+            await this.probeForwarding(this.saved.port, 10000);
+            if (this.forwardingStateSeq === seq) {
+              this.forwardingStateSeq++;
+              this.state.verificationError = null;
+              this.publish();
+            }
+          } catch (error) {
+            if (this.forwardingStateSeq === seq && this.state.verificationError !== null) {
+              this.state.verificationError = `专属代理请求失败：${errorText(error)}`;
+              this.publish();
+            }
+          }
         }
       } catch (error) { this.state.verificationError = errorText(error); this.publish(); }
       this.scheduleHealth();

@@ -73,6 +73,7 @@ import {
 import {
   formatHostForUrl,
   formatNetworkErrorMessage,
+  isLocalProxyRefusedError,
   requestTextViaProxy,
 } from './netClient';
 
@@ -105,6 +106,11 @@ const BUILTIN_TRACE_ENDPOINTS: TraceEndpoint[] = [
     format: 'cf-trace',
   },
   {
+    name: 'AWS CheckIP (IPv4)',
+    url: 'https://checkip.amazonaws.com',
+    format: 'plain-ip',
+  },
+  {
     name: 'Cloudflare Connectivity Trace',
     url: 'https://cp.cloudflare.com/cdn-cgi/trace',
     format: 'cf-trace',
@@ -113,11 +119,6 @@ const BUILTIN_TRACE_ENDPOINTS: TraceEndpoint[] = [
     name: 'Cloudflare Global Trace',
     url: 'https://www.cloudflare.com/cdn-cgi/trace',
     format: 'cf-trace',
-  },
-  {
-    name: 'AWS CheckIP (IPv4)',
-    url: 'https://checkip.amazonaws.com',
-    format: 'plain-ip',
   },
   {
     name: 'Cloudflare ICanHazIP (IPv4)',
@@ -783,11 +784,12 @@ export class ProbeEngine extends EventEmitter {
           const proxyUrl = `http://127.0.0.1:${curCfg.antigravityDedicatedPort}`;
           const channelDesc = `Antigravity 专属端口 (127.0.0.1:${curCfg.antigravityDedicatedPort})`;
 
-          const firstPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 5500);
+          const firstPass = await this.probeOnceViaChannel(proxyUrl, channelDesc, 7500);
           const probeSuccess = firstPass.result;
           const lastErrMsg = firstPass.errMsg;
 
           if (probeSuccess && this.isCurrentAntigravityProbe(seqAtStart, curCfg)) {
+            this.privateProxies.channels.antigravity.clearForwardingError();
             await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'antigravity', true);
           }
 
@@ -1193,27 +1195,11 @@ export class ProbeEngine extends EventEmitter {
           const proxyUrl = `http://127.0.0.1:${curCfg.dedicatedProxyPort}`;
           const channelDesc = `Claude 专属节点 [${label}] (127.0.0.1:${curCfg.dedicatedProxyPort})`;
 
-          const reportRuntimeProbeFailure = (
-            error: string,
-            _meta: { localProxyRefused?: boolean } | undefined
-          ) => {
-            if (
-              this.isCurrentClaudeProbe(seqAtStart, curCfg) &&
-              !this.claudeActiveProbeSkipSafety &&
-              this.claudeRunning &&
-              !this.claudeSafetyKillPromise &&
-              !this.stopped
-            ) {
-              this.recordClaudeVerificationFailure(`${channelDesc}：${error}`);
-            }
-          };
-
           const firstPass = await this.probeOnceViaChannel(
             proxyUrl,
             channelDesc,
-            5800,
-            '探测超时',
-            (error, meta) => reportRuntimeProbeFailure(error, meta)
+            8000,
+            '探测超时'
           );
           const probeSuccess = firstPass.result;
           const lastErrMsg = firstPass.errMsg;
@@ -1222,7 +1208,6 @@ export class ProbeEngine extends EventEmitter {
           const isSilentPoll = isHeartbeat || activeReason.includes('后台复核');
           if (probeSuccess && this.isCurrentClaudeProbe(seqAtStart, curCfg)) {
             await this.verifyTargetServiceRegion(proxyUrl, probeSuccess, 'claude', true);
-
           }
 
           const afterCfg = this.configStore.get();
@@ -1280,6 +1265,9 @@ export class ProbeEngine extends EventEmitter {
             }
             this.claudeNodeProbe = probeSuccess;
             this.claudeNodeProbeError = null;
+            if (!verificationError) {
+              this.privateProxies.channels.claude.clearForwardingError();
+            }
             if (!verificationError && !this.privateProxies.channels.claude.getState().verificationError) {
               this.claudeLastVerificationSuccessAt = probeSuccess.claudeTraceCheckedAt || probeSuccess.checkedAt;
               this.claudeLastVerifiedRegion = {
@@ -3248,51 +3236,61 @@ export class ProbeEngine extends EventEmitter {
     proxyUrl: string | null,
     viaChannel: string,
     timeoutMs: number,
-    defaultErrMsg = '探测超时',
-    onFailure?: (reason: string, meta: { localProxyRefused: boolean }) => void
+    defaultErrMsg = '探测超时'
   ): Promise<{ result: ProbeResult | null; errMsg: string; localProxyRefused: boolean }> {
     const endpoints = this.buildEndpointsList();
+    const hasCustomFirst = endpoints.length > BUILTIN_TRACE_ENDPOINTS.length;
+    const channelDeadlineAt = Date.now() + Math.max(timeoutMs, 15000);
+    const backupTimeoutMs = Math.min(timeoutMs, 3600);
+    const controller = new AbortController();
+    let unknownRegion: ProbeResult | null = null;
     let errOut = defaultErrMsg;
-    let localProxyRefused = false;
-    for (const ep of endpoints) {
-      try {
-        const startedAt = Date.now();
-        const rawBody = await requestTextViaProxy(ep.url, proxyUrl, timeoutMs);
-        const latencyMs = Date.now() - startedAt;
 
-        const parsed = parseTraceResponse(rawBody, ep.format);
-        if (!parsed.ip) {
-          throw new Error('响应中未解析到有效公网 IP');
-        }
+    const probe = async (ep: TraceEndpoint, budgetMs: number): Promise<ProbeResult> => {
+      const startedAt = Date.now();
+      const body = await requestTextViaProxy(ep.url, proxyUrl, budgetMs, undefined, undefined, false, controller.signal);
+      const parsed = parseTraceResponse(body, ep.format);
+      if (!parsed.ip) throw new Error('响应中未解析到有效公网 IP');
 
-        const geo = this.geoIp.lookup(parsed.ip, parsed.loc);
-        return {
-          result: {
-            ip: parsed.ip,
-            countryCode: geo.countryCode,
-            countryName: geo.countryName,
-            edgeLoc: parsed.loc,
-            viaChannel,
-            latencyMs,
-            checkedAt: Date.now(),
-          },
-          errMsg: '',
-          localProxyRefused: false,
-        };
-      } catch (err) {
-        const rawErrMsg = formatNetworkErrorMessage(err);
-        const isLocalRefused = isLocalProxyRefusedError(rawErrMsg, proxyUrl);
-        errOut = `${ep.url}：${rawErrMsg}`;
-        onFailure?.(errOut, { localProxyRefused: isLocalRefused });
-        if (isLocalRefused) {
-          // 本地代理监听端口自身拒绝连接 (ECONNREFUSED) 时，继续轮询其余远端探测 URL 毫无意义，
-          // 专属端口拒绝连接时立即返回，由私有内核管理报告进程状态。
-          localProxyRefused = true;
-          break;
-        }
+      const checkedAt = Date.now();
+      const result = {
+        ip: parsed.ip, ...this.geoIp.lookup(parsed.ip, parsed.loc), edgeLoc: parsed.loc,
+        viaChannel, latencyMs: checkedAt - startedAt, checkedAt,
+      };
+      if (!isValidIsoCountryCode(result.countryCode)) {
+        unknownRegion ??= result;
+        throw new Error('尚未获取有效出口国家');
       }
+      return result;
+    };
+
+    try {
+      for (let index = 0; index < endpoints.length;) {
+        const remainingMs = channelDeadlineAt - Date.now();
+        const limitMs = index === 0 ? (hasCustomFirst ? Math.min(timeoutMs, 5500) : timeoutMs) : backupTimeoutMs;
+        // 剩余时间只够完成一轮时，同时请求余下的来源。
+        const batch = remainingMs <= limitMs + backupTimeoutMs
+          ? endpoints.slice(index)
+          : [endpoints[index]];
+        try {
+          const result = await Promise.any(batch.map((ep) => probe(ep, Math.min(limitMs, remainingMs))));
+          return { result, errMsg: '', localProxyRefused: false };
+        } catch (error) {
+          if (!(error instanceof AggregateError)) throw error;
+          for (const [offset, cause] of error.errors.entries()) {
+            const reason = formatNetworkErrorMessage(cause);
+            errOut = `${batch[offset].url}：${reason}`;
+            if (isLocalProxyRefusedError(reason, proxyUrl)) {
+              return { result: null, errMsg: errOut, localProxyRefused: true };
+            }
+          }
+        }
+        index += batch.length;
+      }
+      return { result: unknownRegion, errMsg: unknownRegion ? '' : errOut, localProxyRefused: false };
+    } finally {
+      controller.abort();
     }
-    return { result: null, errMsg: errOut, localProxyRefused };
   }
 
   /**
@@ -3570,48 +3568,7 @@ function parseTraceResponse(
   return { ip: null };
 }
 
-export function isLocalProxyRefusedError(errMsg: string, proxyUrl: string | null): boolean {
-  if (!proxyUrl || !/ECONNREFUSED/i.test(errMsg)) return false;
-  let parsed: URL;
-  try {
-    parsed = new URL(proxyUrl);
-  } catch {
-    return false;
-  }
-  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
-    return false;
-  }
-  const proto = parsed.protocol.toLowerCase();
-  const effectivePort =
-    parsed.port ||
-    (proto === 'https:' ? '443' : proto.startsWith('socks') ? '1080' : '80');
-
-  // 剥离头部的探测目标 URL 前缀（兼容带端口 URL，如 https://example.com:27897/trace：...）
-  const body = errMsg.replace(/^https?:\/\/[^\s：]+?(?:：|:\s+)/i, '').trim();
-  if (!/ECONNREFUSED/i.test(body)) {
-    return false;
-  }
-
-  // 显式匹配本机回环地址 + 专属代理端口（兼容 127.0.0.1、localhost、[::1]、::1）
-  const loopbackEndpointRe = new RegExp(
-    `(?:^|[\\s(\\[])(?:127\\.0\\.0\\.1|localhost|\\[::1\\]|::1):${effectivePort}(?!\\d)`,
-    'i'
-  );
-  if (loopbackEndpointRe.test(body)) {
-    return true;
-  }
-
-  // 若错误信息包含任何其他显式地址:端口（如远端 IP:端口、非当前代理端口或 IPv6 地址），绝不误判为本机代理拒绝
-  if (/(?:[0-9a-zA-Z.-]+|\[[0-9a-fA-F:]+\]):\d+\b/.test(body)) {
-    return false;
-  }
-  if (/[0-9a-fA-F]*:[0-9a-fA-F]*:[0-9a-fA-F:]+/.test(body)) {
-    return false;
-  }
-
-  return true;
-}
+export { isLocalProxyRefusedError };
 
 function simplifyNetworkError(errMsg: string, channelDesc: string): string {
   if (errMsg.includes('ECONNREFUSED')) {
@@ -3705,7 +3662,7 @@ async function probeGoogleRegionViaProxy(
 async function probeClaudeTraceViaProxy(
   proxyUrl: string | null
 ): Promise<{ loc: string; ip: string }> {
-  const raw = await requestTextViaProxy('https://claude.ai/cdn-cgi/trace', proxyUrl, 6500);
+  const raw = await requestTextViaProxy('https://claude.ai/cdn-cgi/trace', proxyUrl, 10500);
   const parsed = parseTraceResponse(raw, 'cf-trace');
   const loc = normalizeIsoCountryCode(parsed.loc);
   if (!loc) throw new Error('响应中未解析到有效国家/地区代码');
