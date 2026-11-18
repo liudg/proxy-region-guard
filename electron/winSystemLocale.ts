@@ -22,7 +22,7 @@ function execRegQuery(keyPath: string, valueName?: string): Promise<string> {
     execFile(
       'reg.exe',
       args,
-      { encoding: 'buffer', windowsHide: true, timeout: 2500 },
+      { encoding: 'buffer', windowsHide: true, timeout: 15_000 },
       (err, stdout) => {
         if (err || !stdout) {
           resolve('');
