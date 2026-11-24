@@ -47,18 +47,41 @@ export function validateSnapshots(root: string): void {
   assert.throws(() => independentNodeDns({ 'proxy-server-nameserver': ['https://127.0.0.1:1053/dns-query'] },
     { listen: '127.0.0.1:1053', nameserver: ['8.8.8.8'] }), /无法展开/);
 
-  const install = path.join(root, 'clean-core-install');
+  const install = path.join(root, 'clean-core-install [中文 路径]');
+  const installCoreDir = path.join(install, 'resources', 'mihomo');
+  const staleExtractDir = path.join(installCoreDir, 'extracted');
   fs.mkdirSync(path.join(install, 'scripts'), { recursive: true });
-  fs.mkdirSync(path.join(install, 'resources', 'mihomo'), { recursive: true });
+  fs.mkdirSync(staleExtractDir, { recursive: true });
+  fs.writeFileSync(path.join(staleExtractDir, 'stale-old-core.exe'), 'stale');
   fs.copyFileSync('scripts/prepare-mihomo.mjs', path.join(install, 'scripts', 'prepare-mihomo.mjs'));
   fs.copyFileSync('resources/mihomo-release.json', path.join(install, 'resources', 'mihomo-release.json'));
   const release = JSON.parse(fs.readFileSync('resources/mihomo-release.json', 'utf8'));
   const archive = `mihomo-${release.version}.zip`;
   const cachedArchive = path.join('resources/mihomo', archive);
-  if (fs.existsSync(cachedArchive)) fs.copyFileSync(cachedArchive, path.join(install, 'resources', 'mihomo', archive));
+  if (fs.existsSync(cachedArchive)) fs.copyFileSync(cachedArchive, path.join(installCoreDir, archive));
+  const pollutedModules = path.join(root, 'pwsh7-modules');
+  const incompatibleArchiveModule = path.join(pollutedModules, 'Microsoft.PowerShell.Archive');
+  fs.mkdirSync(incompatibleArchiveModule, { recursive: true });
+  fs.writeFileSync(
+    path.join(incompatibleArchiveModule, 'Microsoft.PowerShell.Archive.psd1'),
+    "@{ RootModule = 'Microsoft.PowerShell.Archive.psm1'; ModuleVersion = '1.2.5'; FunctionsToExport = @('Expand-Archive', 'Compress-Archive') }\n"
+  );
+  fs.writeFileSync(
+    path.join(incompatibleArchiveModule, 'Microsoft.PowerShell.Archive.psm1'),
+    "function Expand-Archive { param([string]$LiteralPath, [string]$DestinationPath, [switch]$Force) Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFileExtensions]::ExtractToDirectory($null, $DestinationPath, $true) }\n"
+  );
+  const pollutedEnv = {
+    ...process.env,
+    PSModulePath: `${pollutedModules};${process.env.PSModulePath || ''}`,
+  };
   for (let attempt = 0; attempt < 2; attempt++) {
-    execFileSync(process.env.GUARD_TEST_NODE!, [path.join(install, 'scripts', 'prepare-mihomo.mjs')], { windowsHide: true, stdio: 'pipe' });
-    assert.ok(fs.existsSync(verifyCore(path.join(install, 'resources', 'mihomo'))));
+    execFileSync(process.env.GUARD_TEST_NODE!, [path.join(install, 'scripts', 'prepare-mihomo.mjs')], {
+      windowsHide: true,
+      stdio: 'pipe',
+      env: pollutedEnv,
+    });
+    assert.ok(fs.existsSync(verifyCore(installCoreDir)));
+    assert.equal(fs.existsSync(staleExtractDir), false, '准备内核后应清理临时 extracted 目录');
   }
-  console.log('通过：空内核目录从官方压缩包准备文件，重复准备完成完整性检查');
+  console.log('通过：在污染 PSModulePath、含中文空格方括号路径及旧解压残留场景下从官方压缩包准备内核并完成完整性检查');
 }

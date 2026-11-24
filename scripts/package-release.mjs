@@ -220,6 +220,24 @@ function parsePublicKey(rawKey) {
   return keyObj;
 }
 
+function resolveWindowsPowerShellExe() {
+  const sysRoot = process.env.SystemRoot || process.env.WINDIR;
+  if (sysRoot) {
+    const candidate = path.join(sysRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe');
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+  return 'powershell.exe';
+}
+
+function buildWindowsPowerShellEnv(extra = {}) {
+  const env = Object.fromEntries(
+    Object.entries(process.env).filter(([key]) => key.toLowerCase() !== 'psmodulepath')
+  );
+  return { ...env, ...extra };
+}
+
 function createUtf8ZipArchive(appOutDir, zipPath) {
   if (fs.existsSync(zipPath)) {
     fs.rmSync(zipPath, { force: true });
@@ -232,16 +250,15 @@ function createUtf8ZipArchive(appOutDir, zipPath) {
     ].join('; ');
 
     execFileSync(
-      'powershell.exe',
+      resolveWindowsPowerShellExe(),
       ['-NoProfile', '-NonInteractive', '-Command', psScript],
       {
         stdio: 'inherit',
         windowsHide: true,
-        env: {
-          ...process.env,
+        env: buildWindowsPowerShellEnv({
           GUARD_ZIP_SRC: appOutDir,
           GUARD_ZIP_DEST: zipPath,
-        },
+        }),
       }
     );
   } catch {
@@ -357,13 +374,17 @@ function findPidsInDirectory(targetDir) {
       '$prefix = (Get-Item -LiteralPath $env:GUARD_TARGET_DIR -Force).FullName.TrimEnd("\\") + "\\"',
       'Get-Process -ErrorAction SilentlyContinue | Where-Object { $_.Path -and ([System.IO.Path]::GetFullPath($_.Path)).StartsWith($prefix, [System.StringComparison]::OrdinalIgnoreCase) } | ForEach-Object { $_.Id }',
     ].join('; ');
-    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
-      encoding: 'utf-8',
-      stdio: ['ignore', 'pipe', 'ignore'],
-      windowsHide: true,
-      timeout: 5000,
-      env: { ...process.env, GUARD_TARGET_DIR: targetDir },
-    });
+    const out = execFileSync(
+      resolveWindowsPowerShellExe(),
+      ['-NoProfile', '-NonInteractive', '-Command', ps],
+      {
+        encoding: 'utf-8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+        windowsHide: true,
+        timeout: 5000,
+        env: buildWindowsPowerShellEnv({ GUARD_TARGET_DIR: targetDir }),
+      }
+    );
     return out
       .split(/\r?\n/)
       .map((s) => Number(s.trim()))
@@ -403,10 +424,11 @@ async function stopGuardInDirectory(appOutDir, destExe) {
       ].join('; ');
       const encoded = Buffer.from(innerCmd, 'utf16le').toString('base64');
       const outerPs = `Start-Process -FilePath 'powershell.exe' -ArgumentList @('-NoProfile','-NonInteractive','-WindowStyle','Hidden','-EncodedCommand','${encoded}') -Verb RunAs -WindowStyle Hidden -Wait`;
-      execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', outerPs], {
+      execFileSync(resolveWindowsPowerShellExe(), ['-NoProfile', '-NonInteractive', '-Command', outerPs], {
         stdio: 'ignore',
         windowsHide: true,
         timeout: 15000,
+        env: buildWindowsPowerShellEnv(),
       });
     } catch {
       // 下方做最终文件锁核验
@@ -451,16 +473,19 @@ function moveStagedFileSync(stagedPath, finalPath) {
 function relaunchGuardInTray(appOutDir, destExe) {
   const ps =
     "Start-Process -FilePath $env:GUARD_RELAUNCH_EXE -WorkingDirectory $env:GUARD_RELAUNCH_CWD -ArgumentList @('--silent-tray')";
-  execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', ps], {
-    stdio: 'ignore',
-    windowsHide: true,
-    timeout: 10000,
-    env: {
-      ...process.env,
-      GUARD_RELAUNCH_EXE: destExe,
-      GUARD_RELAUNCH_CWD: appOutDir,
-    },
-  });
+  execFileSync(
+    resolveWindowsPowerShellExe(),
+    ['-NoProfile', '-NonInteractive', '-WindowStyle', 'Hidden', '-Command', ps],
+    {
+      stdio: 'ignore',
+      windowsHide: true,
+      timeout: 10000,
+      env: buildWindowsPowerShellEnv({
+        GUARD_RELAUNCH_EXE: destExe,
+        GUARD_RELAUNCH_CWD: appOutDir,
+      }),
+    }
+  );
 }
 
 async function main() {
