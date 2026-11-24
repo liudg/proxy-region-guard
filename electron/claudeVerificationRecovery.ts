@@ -5,7 +5,10 @@ export const CLAUDE_VERIFICATION_RETRY_MS = 5000;
 function normalizeSingleErrorDetail(raw: string): string {
   return raw
     .trim()
-    .replace(/https?:\/\/(?:[^\s：:)\[]+|\[[^\]]+\]|:\d+)+(?:：|:\s*)/gi, '<probe-url>:')
+    .replace(
+      /https?:\/\/(?:\[[^\]]+\]|[^\s：:)\[/?#]+)(?:(?::\d+)?[/?#][^\s：:)]*(?:：|:\s*)|:\d+(?:：|:\s*)|(?:：|:(?!\d)\s*))/gi,
+      '<probe-url>:'
+    )
     .replace(/\s+/g, ' ');
 }
 

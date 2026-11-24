@@ -5,7 +5,10 @@ import * as http from 'node:http';
 import * as net from 'node:net';
 import { once } from 'node:events';
 import { setTimeout as delay } from 'node:timers/promises';
-import { ClaudeVerificationRecovery } from '../electron/claudeVerificationRecovery';
+import {
+  ClaudeVerificationRecovery,
+  normalizeVerificationFailureSignature,
+} from '../electron/claudeVerificationRecovery';
 
 const listener = net.createServer((socket) => socket.end());
 let port: number;
@@ -131,6 +134,30 @@ async function verifyStaleRetryDoesNotOverwriteNextFailure(): Promise<void> {
   }
 }
 
+function verifyFailureSignatureLinearTimeAndFormat(): void {
+  const longUrlNoColon = `Claude 专属节点出口不可达 (Claude 专属节点 [节点[含括号] https://${'a'.repeat(40000)}] (127.0.0.1:27897)：连接超时)`;
+  const startedAt = Date.now();
+  const sig = normalizeVerificationFailureSignature(longUrlNoColon);
+  const elapsedMs = Date.now() - startedAt;
+  assert.ok(elapsedMs < 200, `超长无冒号 URL 归一化不得发生指数回溯 (实际 ${elapsedMs}ms)`);
+  assert.ok(sig.includes('连接超时'));
+
+  assert.equal(
+    normalizeVerificationFailureSignature('目标服务地区校验未通过：https://claude.ai/cdn-cgi/trace：连接超时'),
+    normalizeVerificationFailureSignature('目标服务地区校验未通过：https://claude.ai/cdn-cgi/trace: 连接超时')
+  );
+  assert.equal(
+    normalizeVerificationFailureSignature('目标服务地区校验未通过：http://[::1]:8080/trace：连接超时'),
+    normalizeVerificationFailureSignature('目标服务地区校验未通过：http://127.0.0.1:8080/trace:连接超时')
+  );
+  assert.equal(
+    normalizeVerificationFailureSignature('代理连接失败 http://127.0.0.1:8080'),
+    '代理连接失败 http://127.0.0.1:8080',
+    '不带错误分隔符的端口 URL 不得误把端口号截断为探测分隔符'
+  );
+  console.log('通过：复核错误归一化线性耗时（防 ReDoS 回溯）且兼容 IPv6/端口/冒号变体');
+}
+
 async function run(): Promise<void> {
   if (process.env.GUARD_RECOVERY_UNHANDLED_CHILD === '1') {
     port = Number(process.env.GUARD_RECOVERY_CLOSED_PORT);
@@ -140,6 +167,8 @@ async function run(): Promise<void> {
     throwingRecovery.clear();
     return;
   }
+
+  verifyFailureSignatureLinearTimeAndFormat();
 
   listener.listen(0, '127.0.0.1');
   await once(listener, 'listening');

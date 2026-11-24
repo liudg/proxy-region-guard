@@ -2055,21 +2055,31 @@ export const MainDashboard: React.FC = () => {
                               )}
                               <strong
                                 className="ellipsis"
-                                title={`Claude 出口 IP: ${
-                                  claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip
-                                }${
-                                  claudeFallbackDetectedCode
-                                    ? ` · ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode})`
-                                    : ''
-                                } (${claudeState.nodeProbe.latencyMs}ms)`}
+                                title={
+                                  claudeState.nodeProbe.claudeTraceIp
+                                    ? `Claude 出口 IP: ${claudeState.nodeProbe.claudeTraceIp}${
+                                        claudeFallbackDetectedCode
+                                          ? ` · ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode})`
+                                          : ''
+                                      } (${claudeState.nodeProbe.latencyMs}ms)`
+                                    : `Claude 出口未知${
+                                        claudeFallbackDetectedCode
+                                          ? ` · ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode})`
+                                          : ''
+                                      }${
+                                        claudeState.nodeProbe.ip
+                                          ? ` · 常规回显 IP: ${claudeState.nodeProbe.ip}`
+                                          : ''
+                                      } (${claudeState.nodeProbe.latencyMs}ms)`
+                                }
                               >
-                                {claudeFallbackDetectedCode
-                                  ? `Claude ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode}) · ${
-                                      claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip
-                                    }`
-                                  : `Claude 出口 ${
-                                      claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip
-                                    }`}
+                                {claudeState.nodeProbe.claudeTraceIp
+                                  ? claudeFallbackDetectedCode
+                                    ? `Claude ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode}) · ${claudeState.nodeProbe.claudeTraceIp}`
+                                    : `Claude 出口 ${claudeState.nodeProbe.claudeTraceIp}`
+                                  : claudeFallbackDetectedCode
+                                  ? `Claude ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode}) · 出口未知`
+                                  : 'Claude 出口未知'}
                               </strong>
                             </div>
                             <small

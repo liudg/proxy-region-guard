@@ -1374,12 +1374,14 @@ app.on('before-quit', () => {
   trayHealth?.stop();
   updaterService?.stop();
   probeEngine?.stop();
+  privateProxies?.stopMonitoring();
 });
 
 app.on('will-quit', () => {
   trayHealth?.stop();
   updaterService?.stop();
   probeEngine?.stop();
+  privateProxies?.stopMonitoring();
   tray?.destroy();
   tray = null;
 });

@@ -51,6 +51,13 @@ class PortOwnershipError extends Error {
   }
 }
 
+class PortOwnershipLookupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'PortOwnershipLookupError';
+  }
+}
+
 function errorText(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 
 export class PrivateKernel extends EventEmitter {
@@ -62,12 +69,15 @@ export class PrivateKernel extends EventEmitter {
   private retryTimer: NodeJS.Timeout | null = null;
   private retries: number[] = [];
   private stopped = false;
+  private shuttingDown = false;
   private booting = false;
   private listenerFaultRecoverable = false;
   private recoveryEpoch = 0;
   private forwardingStateSeq = 0;
+  private startupAbort: AbortController | null = null;
   private listenerRecoveryAbort: AbortController | null = null;
   private forwardingAbort: AbortController | null = null;
+  private healthAbort: AbortController | null = null;
   private readonly state: PrivateChannelState = {
     phase: 'idle', pid: null, port: null, nodeName: null, profileUid: null, profileName: null,
     generation: 0, error: null, verificationError: null, sourceStatus: 'unknown', sourceError: null,
@@ -99,6 +109,13 @@ export class PrivateKernel extends EventEmitter {
     }
   }
 
+  private abortStartup(reason = '私有内核启动已取消'): void {
+    if (this.startupAbort && !this.startupAbort.signal.aborted) {
+      this.startupAbort.abort(Object.assign(new Error(reason), { name: 'AbortError' }));
+    }
+    this.startupAbort = null;
+  }
+
   private abortListenerRecovery(reason = '私有内核恢复已取消'): void {
     if (this.listenerRecoveryAbort && !this.listenerRecoveryAbort.signal.aborted) {
       this.listenerRecoveryAbort.abort(Object.assign(new Error(reason), { name: 'AbortError' }));
@@ -113,6 +130,13 @@ export class PrivateKernel extends EventEmitter {
     this.forwardingAbort = null;
   }
 
+  private abortHealthCheck(reason = '私有内核健康检查已取消'): void {
+    if (this.healthAbort && !this.healthAbort.signal.aborted) {
+      this.healthAbort.abort(Object.assign(new Error(reason), { name: 'AbortError' }));
+    }
+    this.healthAbort = null;
+  }
+
   private markRecoverableListenerFault(error: Error, isPortConflict = error instanceof PortOwnershipError): void {
     const reason = errorText(error);
     const changed = this.state.phase !== 'error' || this.state.error !== reason;
@@ -120,6 +144,7 @@ export class PrivateKernel extends EventEmitter {
       clearTimeout(this.timer);
       this.timer = null;
     }
+    this.abortHealthCheck('监听归属异常，停止当前健康检查');
     this.booting = false;
     this.listenerFaultRecoverable = true;
     this.forwardingStateSeq++;
@@ -214,6 +239,7 @@ export class PrivateKernel extends EventEmitter {
 
   public async restore(): Promise<void> {
     this.stopped = false;
+    this.shuttingDown = false;
     const file = path.join(this.directory, 'current.json');
     if (!fs.existsSync(file)) return;
     try {
@@ -283,28 +309,40 @@ export class PrivateKernel extends EventEmitter {
   }
 
   public select(snapshot: NodeSnapshot | null, port: number): Promise<void> {
+    this.abortStartup('切换专属节点');
+    this.abortHealthCheck('切换专属节点');
     this.abortListenerRecovery('切换专属节点');
     this.abortForwardingProbe('切换专属节点');
     return this.serial(async () => {
-      if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('私有代理端口无效');
-      const next: SavedChannel | null = snapshot ? { schema: 1, snapshot, port, revision: randomUUID() } : null;
-      const endpoint = next ? await this.prepare(next) : null;
-      if (next && port !== this.state.port && await isLocalPortListening(port)) throw new Error(`专属端口 ${port} 已被其他进程占用`);
-      this.cancelRetry();
+      let stoppedPrevious = false;
       try {
-        await this.stopProcess();
-        if (next) atomicJson(path.join(this.directory, 'current.json'), next);
-        else fs.rmSync(path.join(this.directory, 'current.json'), { force: true });
-        this.retries = [];
-        this.state.restartAttempts = 0;
-        this.setSelection(next);
-        if (next) await this.startProcess(endpoint!);
-        else { this.state.phase = 'idle'; this.publish(); }
-      } catch (error) { this.fail(error); throw error; }
+        if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('私有代理端口无效');
+        const next: SavedChannel | null = snapshot ? { schema: 1, snapshot, port, revision: randomUUID() } : null;
+        const endpoint = next ? await this.prepare(next) : null;
+        if (next && port !== this.state.port && await isLocalPortListening(port)) throw new Error(`专属端口 ${port} 已被其他进程占用`);
+        this.cancelRetry();
+        stoppedPrevious = true;
+        try {
+          await this.stopProcess();
+          if (next) atomicJson(path.join(this.directory, 'current.json'), next);
+          else fs.rmSync(path.join(this.directory, 'current.json'), { force: true });
+          this.retries = [];
+          this.state.restartAttempts = 0;
+          this.setSelection(next);
+          if (next) await this.startProcess(endpoint!);
+          else { this.state.phase = 'idle'; this.publish(); }
+        } catch (error) { this.fail(error); throw error; }
+      } finally {
+        if (!stoppedPrevious && !this.stopped && this.lease && this.state.phase === 'ready' && !this.timer) {
+          this.scheduleHealth();
+        }
+      }
     });
   }
 
   public restart(): Promise<void> {
+    this.abortStartup('重启私有内核');
+    this.abortHealthCheck('重启私有内核');
     this.abortListenerRecovery('重启私有内核');
     this.abortForwardingProbe('重启私有内核');
     return this.serial(async () => {
@@ -363,18 +401,33 @@ export class PrivateKernel extends EventEmitter {
         try {
           await this.verifyListener(true, recoverySignal);
           if (isSuperseded()) return 'failed';
+          if (!this.lease || !alive(this.lease.pid)) {
+            this.child = null;
+            this.lease = null;
+            this.state.pid = null;
+            this.unexpectedExit('私有内核进程已退出');
+            return 'failed';
+          }
+          const wasNotReady = this.state.phase !== 'ready';
+          const prevVerificationError = this.state.verificationError;
+          if (wasNotReady || prevVerificationError !== null) {
+            await this.verifyForwarding(recoverySignal);
+            if (isSuperseded()) return 'failed';
+            if (!this.lease || !alive(this.lease.pid)) {
+              this.child = null;
+              this.lease = null;
+              this.state.pid = null;
+              this.unexpectedExit('私有内核进程已退出');
+              return 'failed';
+            }
+          }
           this.booting = false;
           this.listenerFaultRecoverable = false;
-          const wasNotReady = this.state.phase !== 'ready';
-          let changed = false;
+          let changed = this.state.verificationError !== prevVerificationError;
           if (wasNotReady) {
             this.state.phase = 'ready';
             this.state.error = null;
             this.state.generation++;
-            changed = true;
-          }
-          if (this.state.verificationError && !this.state.verificationError.startsWith('专属代理请求失败：')) {
-            this.state.verificationError = null;
             changed = true;
           }
           if (changed) {
@@ -391,11 +444,29 @@ export class PrivateKernel extends EventEmitter {
             this.markRecoverableListenerFault(error, true);
             return 'failed';
           }
+          if (error instanceof PortOwnershipLookupError) {
+            if (!this.lease || !alive(this.lease.pid)) {
+              this.child = null;
+              this.lease = null;
+              this.state.pid = null;
+              this.unexpectedExit('私有内核进程已退出');
+              return 'failed';
+            }
+            if (this.state.phase === 'error') {
+              this.markRecoverableListenerFault(error, false);
+            } else {
+              this.state.verificationError = errorText(error);
+              this.publish();
+              this.scheduleHealth();
+            }
+            return 'failed';
+          }
           // 监听异常或配置漂移时尝试重载本版本已保存的独立配置以恢复本地专属监听
         }
 
         if (isSuperseded()) return 'failed';
         if (!this.lease || !alive(this.lease.pid)) {
+          this.child = null;
           this.lease = null;
           this.state.pid = null;
           this.unexpectedExit('私有内核进程已退出');
@@ -426,12 +497,19 @@ export class PrivateKernel extends EventEmitter {
           }
           if (isSuperseded()) return 'failed';
           if (lastVerifyError) throw lastVerifyError;
+          await this.verifyForwarding(recoverySignal);
+          if (isSuperseded()) return 'failed';
+          if (!this.lease || !alive(this.lease.pid)) {
+            this.child = null;
+            this.lease = null;
+            this.state.pid = null;
+            this.unexpectedExit('私有内核进程已退出');
+            return 'failed';
+          }
           this.booting = false;
           this.listenerFaultRecoverable = false;
-          this.forwardingStateSeq++;
           this.state.phase = 'ready';
           this.state.error = null;
-          this.state.verificationError = null;
           this.state.generation++;
           this.publish();
           this.emit('ready');
@@ -440,13 +518,64 @@ export class PrivateKernel extends EventEmitter {
         } catch (error) {
           if (isSuperseded()) return 'failed';
           if (!this.lease || !alive(this.lease.pid)) {
+            this.child = null;
             this.lease = null;
             this.state.pid = null;
             this.unexpectedExit('私有内核进程已退出');
             return 'failed';
           }
           const normalizedErr = error instanceof Error ? error : new Error(errorText(error));
-          this.markRecoverableListenerFault(normalizedErr, normalizedErr instanceof PortOwnershipError);
+          if (normalizedErr instanceof PortOwnershipError) {
+            this.markRecoverableListenerFault(normalizedErr, true);
+            return 'failed';
+          }
+          if (this.state.phase === 'error') {
+            this.markRecoverableListenerFault(normalizedErr, false);
+            return 'failed';
+          }
+          // 私有内核仍存活且未确认为端口冲突时，复核监听归属；确认冲突才标为 error 熔断，
+          // 否则保留 ready 并设置 verificationError（阻断新启动、保留运行中 Claude 会话并由 5s 后台复核）。
+          const leaseAtFault = this.lease;
+          if (await isLocalPortListening(savedAtStart.port, 800, recoverySignal)) {
+            if (isSuperseded()) return 'failed';
+            let pids: number[] | null = null;
+            try {
+              pids = await this.getLocalPortOwnerPids(savedAtStart.port, recoverySignal);
+            } catch {
+              pids = null;
+            }
+            if (isSuperseded()) return 'failed';
+            if (!this.lease || this.lease !== leaseAtFault || !alive(leaseAtFault.pid)) {
+              if (this.lease === leaseAtFault) {
+                this.child = null;
+                this.lease = null;
+                this.state.pid = null;
+                this.unexpectedExit('私有内核进程已退出');
+              }
+              return 'failed';
+            }
+            if (pids !== null) {
+              const foreignPidDetected = pids.some((pid) => pid !== leaseAtFault.pid);
+              const stillListeningWithUnknownOwner =
+                !foreignPidDetected &&
+                pids.length === 0 &&
+                (await isLocalPortListening(savedAtStart.port, 800, recoverySignal));
+              if (isSuperseded()) return 'failed';
+              if (foreignPidDetected || stillListeningWithUnknownOwner) {
+                this.markRecoverableListenerFault(
+                  new PortOwnershipError(
+                    `专属端口 ${savedAtStart.port} 监听归属与当前私有内核进程不匹配`
+                  ),
+                  true
+                );
+                return 'failed';
+              }
+            }
+          }
+          if (isSuperseded()) return 'failed';
+          this.state.verificationError = errorText(normalizedErr);
+          this.publish();
+          this.scheduleHealth();
           return 'failed';
         }
       } finally {
@@ -460,36 +589,67 @@ export class PrivateKernel extends EventEmitter {
 
   private async verifyListener(verifyOwner = false, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
-    if (!this.lease || !this.saved || !alive(this.lease.pid)) throw new Error('私有内核进程已退出');
-    if (!await isLocalPortListening(this.saved.port, 800, signal)) {
+    const lease = this.lease;
+    const saved = this.saved;
+    const generation = this.state.generation;
+    const assertLeaseCurrent = () => {
+      if (
+        this.stopped ||
+        this.lease !== lease ||
+        this.saved !== saved ||
+        this.state.generation !== generation ||
+        !lease ||
+        !saved ||
+        !alive(lease.pid)
+      ) {
+        throw new Error('私有内核进程已退出');
+      }
+    };
+    assertLeaseCurrent();
+    if (!await isLocalPortListening(saved!.port, 800, signal)) {
       signal?.throwIfAborted();
+      assertLeaseCurrent();
       throw new Error('私有内核专属监听未就绪');
     }
     signal?.throwIfAborted();
+    assertLeaseCurrent();
     if (verifyOwner) {
-      const pids = await this.getLocalPortOwnerPids(this.saved.port, signal);
-      signal?.throwIfAborted();
-      if (pids.length !== 1 || pids[0] !== this.lease.pid) {
-        const foreignPidDetected = pids.some((pid) => pid !== this.lease!.pid);
-        const stillListeningWithUnknownOwner =
-          !foreignPidDetected && (await isLocalPortListening(this.saved.port, 800, signal));
+      let pids: number[];
+      try {
+        pids = await this.getLocalPortOwnerPids(saved!.port, signal);
+      } catch (ownerError) {
         signal?.throwIfAborted();
+        assertLeaseCurrent();
+        throw new PortOwnershipLookupError(
+          `专属端口 ${saved!.port} 监听归属复核未完成：${errorText(ownerError)}`
+        );
+      }
+      signal?.throwIfAborted();
+      assertLeaseCurrent();
+      if (pids.length !== 1 || pids[0] !== lease!.pid) {
+        const foreignPidDetected = pids.some((pid) => pid !== lease!.pid);
+        const stillListeningWithUnknownOwner =
+          !foreignPidDetected && (await isLocalPortListening(saved!.port, 800, signal));
+        signal?.throwIfAborted();
+        assertLeaseCurrent();
         if (!foreignPidDetected && !stillListeningWithUnknownOwner) {
           throw new Error('私有内核专属监听未就绪');
         }
         throw new PortOwnershipError(
-          `专属端口 ${this.saved.port} 监听归属与当前私有内核进程不匹配`
+          `专属端口 ${saved!.port} 监听归属与当前私有内核进程不匹配`
         );
       }
     }
-    const config = await mihomoRequest<Record<string, unknown>>(this.lease.endpoint, '/configs', 'GET', undefined, signal);
-    if (config['mixed-port'] !== this.saved.port || config.mode !== 'rule') throw new Error('私有内核运行配置与保存的副本不一致');
-    const proxies = await mihomoRequest<{ proxies: Record<string, unknown> }>(this.lease.endpoint, '/proxies', 'GET', undefined, signal);
-    if (!proxies.proxies[this.saved.snapshot.nodeName]) throw new Error('私有内核专属监听未就绪');
+    const config = await mihomoRequest<Record<string, unknown>>(lease!.endpoint, '/configs', 'GET', undefined, signal);
+    assertLeaseCurrent();
+    if (config['mixed-port'] !== saved!.port || config.mode !== 'rule') throw new Error('私有内核运行配置与保存的副本不一致');
+    const proxies = await mihomoRequest<{ proxies: Record<string, unknown> }>(lease!.endpoint, '/proxies', 'GET', undefined, signal);
+    assertLeaseCurrent();
+    if (!proxies.proxies[saved!.snapshot.nodeName]) throw new Error('私有内核专属监听未就绪');
   }
 
   public clearForwardingError(): void {
-    if (this.state.phase === 'ready' && this.state.verificationError?.startsWith('专属代理请求失败：')) {
+    if (this.state.phase === 'ready' && this.state.verificationError !== null) {
       this.forwardingStateSeq++;
       this.state.verificationError = null;
       this.publish();
@@ -561,14 +721,19 @@ export class PrivateKernel extends EventEmitter {
     }
   }
 
-  private async verifyForwarding(): Promise<void> {
+  private async verifyForwarding(signal?: AbortSignal): Promise<void> {
     const seq = ++this.forwardingStateSeq;
-    this.state.verificationError = null;
+    const saved = this.saved;
+    if (!saved) return;
     try {
-      await this.probeForwarding(this.saved!.port, 10000);
+      await this.probeForwarding(saved.port, 10000, signal);
+      if (!this.stopped && !signal?.aborted && this.forwardingStateSeq === seq) {
+        this.state.verificationError = null;
+      }
     } catch (error) {
       if (
         !this.stopped &&
+        !signal?.aborted &&
         this.forwardingStateSeq === seq &&
         !(error instanceof Error && error.name === 'AbortError')
       ) {
@@ -603,6 +768,10 @@ export class PrivateKernel extends EventEmitter {
     } finally { fs.closeSync(log); }
     this.child = child;
     this.booting = true;
+    const startupCtrl = new AbortController();
+    this.startupAbort = startupCtrl;
+    const startupSignal = startupCtrl.signal;
+    let listenerVerified = false;
     try {
       await new Promise<void>((resolve, reject) => { child.once('spawn', resolve); child.once('error', reject); });
       child.unref();
@@ -620,17 +789,48 @@ export class PrivateKernel extends EventEmitter {
       let lastError: unknown;
       const deadline = Date.now() + 10000;
       while (Date.now() < deadline) {
+        if (this.stopped || startupSignal.aborted) {
+          throw Object.assign(new Error('私有内核启动已取消'), { name: 'AbortError' });
+        }
         if (child.exitCode !== null || child.signalCode !== null) throw new Error('私有内核在启动期间退出，请查看内核日志');
-        try { await this.verifyListener(true); lastError = null; break; }
-        catch (error) { lastError = error; await delay(150); }
+        try { await this.verifyListener(true, startupSignal); lastError = null; break; }
+        catch (error) {
+          if (this.stopped || startupSignal.aborted) {
+            throw Object.assign(new Error('私有内核启动已取消'), { name: 'AbortError' });
+          }
+          lastError = error;
+          await delay(150, undefined, { signal: startupSignal }).catch(() => undefined);
+        }
       }
       if (lastError) throw lastError;
+      listenerVerified = true;
       // 通过真实 HTTPS 请求确认专属代理能够完成转发。
-      await this.verifyForwarding();
-      if (this.stopped || this.child !== child || !this.lease) throw new Error('私有内核在启动校验期间退出');
+      await this.verifyForwarding(startupSignal);
+      if (this.stopped && !this.shuttingDown && this.child === child && this.lease && alive(this.lease.pid)) {
+        // 托盘退出仅停止后台巡检，监听归属已确认就绪时保留已脱离运行的私有内核（如 Antigravity 内核）
+        this.booting = false;
+        this.state.phase = 'ready';
+        this.publish();
+        return;
+      }
+      if (this.stopped || startupSignal.aborted || this.child !== child || !this.lease) {
+        throw new Error('私有内核在启动校验期间退出');
+      }
       this.booting = false;
     } catch (error) {
       this.booting = false;
+      if (
+        this.stopped &&
+        !this.shuttingDown &&
+        listenerVerified &&
+        this.child === child &&
+        this.lease &&
+        alive(this.lease.pid)
+      ) {
+        this.state.phase = 'ready';
+        this.publish();
+        return;
+      }
       if (this.child === child || this.lease !== null) {
         try {
           await this.stopProcess();
@@ -639,6 +839,11 @@ export class PrivateKernel extends EventEmitter {
         }
       }
       throw error;
+    } finally {
+      if (this.startupAbort === startupCtrl) {
+        this.startupAbort = null;
+      }
+      startupCtrl.abort();
     }
     this.state.phase = 'ready';
     this.publish();
@@ -650,68 +855,110 @@ export class PrivateKernel extends EventEmitter {
     if (this.timer) clearTimeout(this.timer);
     if (this.stopped) return;
     this.timer = setTimeout(() => void this.serial(async () => {
-      if (!this.lease || this.state.phase !== 'ready') return;
-      if (!alive(this.lease.pid)) { this.lease = null; this.state.pid = null; this.unexpectedExit('私有内核进程已退出'); return; }
+      const leaseAtStart = this.lease;
+      const savedAtStart = this.saved;
+      const generationAtStart = this.state.generation;
+      if (!leaseAtStart || !savedAtStart || this.state.phase !== 'ready') return;
+      const healthCtrl = new AbortController();
+      this.healthAbort = healthCtrl;
+      const healthSignal = healthCtrl.signal;
+      const isHealthCheckCurrent = (): boolean =>
+        !this.stopped &&
+        !healthSignal.aborted &&
+        this.lease === leaseAtStart &&
+        this.saved === savedAtStart &&
+        this.state.phase === 'ready' &&
+        this.state.generation === generationAtStart;
+      const abortIfSupersededOrDead = (): boolean => {
+        if (!isHealthCheckCurrent()) return true;
+        if (!alive(leaseAtStart.pid)) {
+          this.child = null;
+          this.lease = null;
+          this.state.pid = null;
+          this.unexpectedExit('私有内核进程已退出');
+          return true;
+        }
+        return false;
+      };
       try {
-        await this.verifyListener();
-        if (this.state.verificationError && this.saved) {
-          const seq = this.forwardingStateSeq;
-          try {
-            await this.probeForwarding(this.saved.port, 10000);
-            if (this.forwardingStateSeq === seq) {
-              this.forwardingStateSeq++;
-              this.state.verificationError = null;
-              this.publish();
+        if (abortIfSupersededOrDead()) return;
+        try {
+          await this.verifyListener(false, healthSignal);
+          if (abortIfSupersededOrDead()) return;
+          if (this.state.verificationError) {
+            const seq = this.forwardingStateSeq;
+            try {
+              await this.probeForwarding(savedAtStart.port, 10000, healthSignal);
+              if (abortIfSupersededOrDead()) return;
+              if (this.forwardingStateSeq === seq) {
+                this.forwardingStateSeq++;
+                this.state.verificationError = null;
+                this.publish();
+              }
+            } catch (error) {
+              if (abortIfSupersededOrDead()) return;
+              if (
+                this.forwardingStateSeq === seq &&
+                this.state.verificationError !== null &&
+                !(error instanceof Error && error.name === 'AbortError')
+              ) {
+                this.state.verificationError = `专属代理请求失败：${errorText(error)}`;
+                this.publish();
+              }
             }
-          } catch (error) {
-            if (
-              !this.stopped &&
-              this.forwardingStateSeq === seq &&
-              this.state.verificationError !== null &&
-              !(error instanceof Error && error.name === 'AbortError')
-            ) {
-              this.state.verificationError = `专属代理请求失败：${errorText(error)}`;
+          }
+        } catch (error) {
+          if (abortIfSupersededOrDead()) return;
+          if (await isLocalPortListening(savedAtStart.port, 800, healthSignal)) {
+            if (abortIfSupersededOrDead()) return;
+            let ownerLookupFailed: unknown = null;
+            let pids: number[] = [];
+            try {
+              pids = await this.getLocalPortOwnerPids(savedAtStart.port, healthSignal);
+            } catch (ownerError) {
+              ownerLookupFailed = ownerError;
+            }
+            if (abortIfSupersededOrDead()) return;
+            if (ownerLookupFailed !== null) {
+              this.state.verificationError = `${errorText(error)}（端口归属复核未完成：${errorText(ownerLookupFailed)}）`;
               this.publish();
+              this.scheduleHealth();
+              return;
+            }
+            const foreignPidDetected = pids.some((pid) => pid !== leaseAtStart.pid);
+            const stillListeningWithUnknownOwner =
+              !foreignPidDetected &&
+              pids.length === 0 &&
+              (await isLocalPortListening(savedAtStart.port, 800, healthSignal));
+            if (abortIfSupersededOrDead()) return;
+            if (foreignPidDetected || stillListeningWithUnknownOwner) {
+              this.markRecoverableListenerFault(
+                new PortOwnershipError(
+                  `专属端口 ${savedAtStart.port} 监听归属与当前私有内核进程不匹配`
+                ),
+                true
+              );
+              return;
             }
           }
+          if (abortIfSupersededOrDead()) return;
+          this.state.verificationError = errorText(error);
+          this.publish();
         }
-      } catch (error) {
-        if (this.saved && this.lease && alive(this.lease.pid) && await isLocalPortListening(this.saved.port)) {
-          let ownerLookupFailed: unknown = null;
-          let pids: number[] = [];
-          try {
-            pids = await this.getLocalPortOwnerPids(this.saved.port);
-          } catch (ownerError) {
-            ownerLookupFailed = ownerError;
-          }
-          if (ownerLookupFailed !== null) {
-            this.state.verificationError = `${errorText(error)}（端口归属复核未完成：${errorText(ownerLookupFailed)}）`;
-            this.publish();
-            this.scheduleHealth();
-            return;
-          }
-          const occupied =
-            pids.some((pid) => pid !== this.lease!.pid) ||
-            (pids.length === 0 && (await isLocalPortListening(this.saved.port)));
-          if (this.lease && occupied) {
-            this.markRecoverableListenerFault(
-              new PortOwnershipError(
-                `专属端口 ${this.saved.port} 监听归属与当前私有内核进程不匹配`
-              ),
-              true
-            );
-            return;
-          }
+        if (abortIfSupersededOrDead()) return;
+        this.scheduleHealth();
+      } finally {
+        if (this.healthAbort === healthCtrl) {
+          this.healthAbort = null;
         }
-        this.state.verificationError = errorText(error);
-        this.publish();
+        healthCtrl.abort();
       }
-      this.scheduleHealth();
     }), 3000);
   }
 
   private unexpectedExit(reason: string): void {
     if (this.stopped) return;
+    this.abortHealthCheck('私有内核意外退出');
     this.booting = false;
     this.listenerFaultRecoverable = false;
     this.state.phase = 'recovering';
@@ -779,6 +1026,8 @@ export class PrivateKernel extends EventEmitter {
   }
 
   private async stopProcess(): Promise<void> {
+    this.abortStartup('停止私有内核进程');
+    this.abortHealthCheck('停止私有内核进程');
     this.abortListenerRecovery('停止私有内核进程');
     this.abortForwardingProbe('停止私有内核进程');
     if (this.timer) clearTimeout(this.timer);
@@ -826,11 +1075,25 @@ export class PrivateKernel extends EventEmitter {
     fs.rmSync(path.join(this.directory, 'runtime.json'), { force: true });
   }
 
-  public async shutdown(): Promise<void> {
+  /**
+   * 停止后台健康巡检、恢复定时器与在途端口/转发查询，同时保留已脱离运行的私有内核进程（如托盘退出时保留 Antigravity 内核）。
+   */
+  public stopMonitoring(): void {
     this.stopped = true;
-    this.abortListenerRecovery('私有内核服务停机');
-    this.abortForwardingProbe('私有内核服务停机');
     this.cancelRetry();
+    if (this.timer) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    this.abortStartup('停止私有内核后台巡检');
+    this.abortHealthCheck('停止私有内核后台巡检');
+    this.abortListenerRecovery('停止私有内核后台巡检');
+    this.abortForwardingProbe('停止私有内核后台巡检');
+  }
+
+  public async shutdown(): Promise<void> {
+    this.shuttingDown = true;
+    this.stopMonitoring();
     await this.serial(() => this.stopProcess());
     this.state.phase = 'idle';
     this.publish();
@@ -854,5 +1117,6 @@ export class PrivateProxyService extends EventEmitter {
     return { claude: this.channels.claude.getState(), antigravity: this.channels.antigravity.getState() };
   }
   public async restore(): Promise<void> { await Promise.all(Object.values(this.channels).map((channel) => channel.restore())); }
+  public stopMonitoring(): void { for (const channel of Object.values(this.channels)) channel.stopMonitoring(); }
   public async shutdown(): Promise<void> { await Promise.all(Object.values(this.channels).map((channel) => channel.shutdown())); }
 }
