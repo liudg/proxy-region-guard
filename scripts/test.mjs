@@ -7,7 +7,7 @@ import electron from 'electron';
 
 const directory = await mkdtemp(path.join(tmpdir(), 'guard-regression-'));
 try {
-  const entries = process.argv[2] ? [process.argv[2]] : ['tests/regression.ts', 'tests/appIdentity.ts', 'tests/claudeVerificationRecovery.ts', 'tests/updaterIntegration.ts'];
+  const entries = process.argv[2] ? [process.argv[2]] : ['tests/regression.ts', 'tests/proxyConsensus.ts', 'tests/appIdentity.ts', 'tests/claudeVerificationRecovery.ts', 'tests/updaterIntegration.ts'];
   const updaterApp = path.join(directory, 'updater-app.cjs');
   await build({ entryPoints: ['tests/updaterApp.ts'], outfile: updaterApp, bundle: true, platform: 'node', format: 'cjs', external: ['electron'] });
   for (const [index, entry] of entries.entries()) {
@@ -20,6 +20,9 @@ try {
       target: 'node20',
       format: 'cjs',
       external: ['electron', 'original-fs'],
+      banner: {
+        js: `(() => { let fatal = false; const exitFail = () => { try { require('electron').app.exit(1); } catch { process.exit(1); } }; const fail = (type, tag, err) => { process.exitCode = 1; if (fatal) return; fatal = true; console.error(tag, err); if (process.listenerCount(type) > 1) { setTimeout(exitFail, 8000).unref(); return; } setImmediate(exitFail); }; process.on('uncaughtException', (err) => fail('uncaughtException', '[uncaughtException]', err)); process.on('unhandledRejection', (err) => fail('unhandledRejection', '[unhandledRejection]', err)); })();`,
+      },
     });
     const env = {
       ...process.env,

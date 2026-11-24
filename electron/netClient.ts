@@ -5,6 +5,7 @@ import * as https from 'node:https';
 import * as net from 'node:net';
 import * as path from 'node:path';
 import * as tls from 'node:tls';
+import { setTimeout as delay } from 'node:timers/promises';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import { getRawFs } from './updateCrypto';
@@ -142,23 +143,8 @@ export function formatNetworkErrorMessage(err: unknown): string {
   return String(err || '网络连接异常').trim() || '网络连接异常';
 }
 
-export function isLocalProxyRefusedError(errMsg: string, proxyUrl: string | null): boolean {
-  if (!proxyUrl || !/ECONNREFUSED/i.test(errMsg)) return false;
-  let parsed: URL;
-  try {
-    parsed = new URL(proxyUrl);
-  } catch {
-    return false;
-  }
-  const host = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
-  if (host !== '127.0.0.1' && host !== 'localhost' && host !== '::1') {
-    return false;
-  }
-  const proto = parsed.protocol.toLowerCase();
-  const effectivePort =
-    parsed.port ||
-    (proto === 'https:' ? '443' : proto.startsWith('socks') ? '1080' : '80');
-
+function matchesLocalProxyRefusedMessage(errMsg: string, effectivePort: number): boolean {
+  if (!/ECONNREFUSED/i.test(errMsg)) return false;
   // 剥离头部的探测目标 URL 前缀（兼容带端口 URL，如 https://example.com:27897/trace：...）
   const body = errMsg.replace(/^https?:\/\/[^\s：]+?(?:：|:\s+)/i, '').trim();
   if (!/ECONNREFUSED/i.test(body)) {
@@ -183,6 +169,59 @@ export function isLocalProxyRefusedError(errMsg: string, proxyUrl: string | null
   }
 
   return true;
+}
+
+export function isLocalProxyRefusedCause(error: unknown, proxyUrl: string | null): boolean {
+  if (!proxyUrl || !error) return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(normalizeProxyUrlScheme(proxyUrl));
+  } catch {
+    return false;
+  }
+  const proxyHost = parsed.hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (proxyHost !== '127.0.0.1' && proxyHost !== 'localhost' && proxyHost !== '::1') {
+    return false;
+  }
+  const proto = parsed.protocol.toLowerCase();
+  const effectivePort = Number(
+    parsed.port || (proto === 'https:' ? '443' : proto.startsWith('socks') ? '1080' : '80')
+  );
+  if (!Number.isInteger(effectivePort) || effectivePort <= 0) {
+    return false;
+  }
+
+  const checkSingleCause = (cause: unknown): boolean | null => {
+    if (!cause || typeof cause !== 'object') return null;
+    const nested = (cause as { errors?: unknown[] }).errors;
+    if (Array.isArray(nested) && nested.length > 0) {
+      let sawStructured = false;
+      for (const item of nested) {
+        const res = checkSingleCause(item);
+        if (res === true) return true;
+        if (res === false) sawStructured = true;
+      }
+      if (sawStructured) return false;
+    }
+    const err = cause as NodeJS.ErrnoException & { address?: string; port?: number };
+    if (err.code !== 'ECONNREFUSED') {
+      return null;
+    }
+    if (typeof err.address === 'string' && err.port !== undefined) {
+      const addr = err.address.replace(/^\[|\]$/g, '').toLowerCase();
+      const hostMatched =
+        addr === proxyHost ||
+        (proxyHost === 'localhost' && (addr === '127.0.0.1' || addr === '::1'));
+      return hostMatched && Number(err.port) === effectivePort;
+    }
+    return null;
+  };
+
+  const structured = checkSingleCause(error);
+  if (structured !== null) {
+    return structured;
+  }
+  return matchesLocalProxyRefusedMessage(formatNetworkErrorMessage(error), effectivePort);
 }
 
 type ProxyConnectOpts = Parameters<HttpsProxyAgent<string>['connect']>[1];
@@ -242,6 +281,12 @@ class ScopedHttpsProxyAgent extends HttpsProxyAgent<string> {
         agent: false,
         signal: this.controller.signal,
         maxHeaderSize: MAX_HEADER_BYTES,
+      });
+      connectRequest.once('socket', (sock) => {
+        this.activeSockets.add(sock);
+        sock.once('close', () => {
+          this.activeSockets.delete(sock);
+        });
       });
       connectRequest.once('error', reject);
       connectRequest.once('connect', (response, socket, head) => {
@@ -358,6 +403,9 @@ function isNonRetriableRequestError(msg: string): boolean {
   return false;
 }
 
+const RETRY_DELAYS_MS = [200, 600] as const;
+const MIN_RETRY_REMAINING_MS = 1400;
+
 export async function requestTextViaProxy(
   targetUrl: string,
   proxyUrl: string | null,
@@ -372,19 +420,40 @@ export async function requestTextViaProxy(
   const request = () => requestTextViaProxyOnce(
     targetUrl, normalizedProxy, deadlineAt, acceptHeader, redirectsLeft, allowLocalhost, signal
   );
-  try {
-    return await request();
-  } catch (error) {
-    const msg = formatNetworkErrorMessage(error);
-    if (signal?.aborted || (!normalizedProxy && timeoutMs < 5000) || isNonRetriableRequestError(msg)) {
-      throw error;
+  let attempt = 0;
+  while (true) {
+    try {
+      return await request();
+    } catch (error) {
+      signal?.throwIfAborted();
+      const msg = formatNetworkErrorMessage(error);
+      if ((!normalizedProxy && timeoutMs < 5000) || isNonRetriableRequestError(msg)) {
+        throw error;
+      }
+      // 本地代理端口直接拒绝连接时立即外抛，交由上层优先触发监听恢复/重绑，避免在重试延迟内掩盖断口
+      if (isLocalProxyRefusedCause(error, normalizedProxy)) {
+        throw error;
+      }
+      const retryDelayMs = RETRY_DELAYS_MS[attempt];
+      const code =
+        typeof (error as NodeJS.ErrnoException)?.code === 'string'
+          ? (error as NodeJS.ErrnoException).code!
+          : '';
+      const transient =
+        /ETIMEDOUT|before secure TLS connection was established|socket hang up|ECONNRESET|EPIPE|EAI_AGAIN/i.test(
+          `${code} ${msg}`
+        ) ||
+        Boolean(normalizedProxy && /ENOTFOUND|^HTTP 状态码 (?:408|429|5\d\d)/i.test(msg));
+      if (
+        retryDelayMs === undefined ||
+        !transient ||
+        deadlineAt - Date.now() < MIN_RETRY_REMAINING_MS + retryDelayMs
+      ) {
+        throw error;
+      }
+      attempt++;
+      await delay(retryDelayMs, undefined, { signal });
     }
-    const localRefused = isLocalProxyRefusedError(msg, normalizedProxy);
-    const transient = /连接超时|ETIMEDOUT|before secure TLS connection was established|socket hang up|ECONNRESET|EPIPE|EAI_AGAIN/i.test(msg)
-      || (normalizedProxy && /ECONNREFUSED|ENOTFOUND|^HTTP 状态码 (?:408|429|5\d\d)/i.test(msg));
-    if (!transient || deadlineAt - Date.now() < (localRefused ? 500 : 1360)) throw error;
-    await new Promise((resolve) => setTimeout(resolve, localRefused ? 180 : 160));
-    return request();
   }
 }
 
@@ -443,6 +512,9 @@ async function requestTextViaProxyOnce(
           ? err
           : Object.assign(new Error(formatNetworkErrorMessage(err)), {
               code: (err as NodeJS.ErrnoException).code,
+              address: (err as NodeJS.ErrnoException & { address?: string }).address,
+              port: (err as NodeJS.ErrnoException & { port?: number }).port,
+              errors: (err as Error & { errors?: unknown[] }).errors,
             });
         reject(normalizedErr);
       } else {
@@ -457,7 +529,14 @@ async function requestTextViaProxyOnce(
       }
       finish(new Error('连接超时'));
     }, budgetMs);
-    const onAbort = () => finish(new Error('探测请求已取消'));
+    const onAbort = () => {
+      const reason = signal?.reason;
+      finish(
+        reason instanceof Error
+          ? reason
+          : Object.assign(new Error('探测请求已取消'), { name: 'AbortError' })
+      );
+    };
     signal?.addEventListener('abort', onAbort, { once: true });
 
     const isHttps = parsedUrl.protocol === 'https:';

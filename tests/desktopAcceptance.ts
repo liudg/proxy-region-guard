@@ -8,7 +8,7 @@ const directory = process.env.GUARD_TEST_DATA;
 if (!directory) throw new Error('桌面验收需要独立数据目录');
 fs.mkdirSync(directory, { recursive: true });
 app.setPath('userData', directory);
-app.setAppPath(process.cwd());
+(app as Electron.App & { setAppPath(p: string): void }).setAppPath(process.cwd());
 const store = new ConfigStore();
 store.update({ dedicatedProxyPort: 28897, antigravityDedicatedPort: 28898, autoCheckUpdates: false, autoLaunch: false, closeToTray: false, alertSoundEnabled: false });
 let administrator = false;

@@ -273,7 +273,10 @@ export const AlertPopup: React.FC = () => {
             <div className="compare-box actual danger">
               <span className="compare-label">当前漂移 IP</span>
               <div className="compare-region-main">
-                <CountryFlag code={payload.actualCode || payload.expectedCode} size="md" />
+                <CountryFlag
+                  code={payload.actualCode || (payload.actualName ? null : payload.expectedCode)}
+                  size="md"
+                />
                 <div className="compare-region-text">
                   <strong title={payload.actualIp || undefined}>
                     {payload.actualIp || '未知'}

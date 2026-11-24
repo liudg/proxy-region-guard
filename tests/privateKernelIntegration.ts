@@ -41,7 +41,7 @@ async function verifyProbeSources(port: number): Promise<void> {
   const kernelDir = path.join(directory, 'kernels', 'antigravity');
   const lease = JSON.parse(fs.readFileSync(path.join(kernelDir, 'runtime.json'), 'utf8'));
   const kernelConfig = readYaml(path.join(kernelDir, lease.revision, 'config.yaml'));
-  const blockedHosts = ['ipv4.icanhazip.com', 'checkip.amazonaws.com', 'cp.cloudflare.com', 'www.cloudflare.com'];
+  const blockedHosts = ['ipv4.icanhazip.com', 'checkip.amazonaws.com', 'api.ipify.org', 'cp.cloudflare.com'];
   const rules = blockedHosts.map((host) => `DOMAIN,${host},REJECT-DROP`);
   assert.ok(Array.isArray(kernelConfig.rules));
   const payload = yaml.dump({ ...kernelConfig, rules: [...rules, ...kernelConfig.rules] });
@@ -50,7 +50,7 @@ async function verifyProbeSources(port: number): Promise<void> {
   const last = await engine.checkNow();
   assert.ok(isValidIsoCountryCode(last.lastProbe?.countryCode), last.lastError || '最后一个探测来源未返回地区');
   assert.ok(Date.now() - startedAt < 16000, '首轮探测必须在通道时限内完成');
-  console.log('通过：前五个探测地址均无法访问时，首轮通过第六个来源取得出口地区');
+  console.log('通过：前四个独立探测地址均无法访问时，首轮通过第五个来源取得出口地区');
 }
 
 async function run(): Promise<void> {

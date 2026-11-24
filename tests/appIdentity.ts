@@ -6,8 +6,9 @@ import { spawn, ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
 import { configureAppUserData } from '../electron/appIdentity';
 
-const root = process.env.GUARD_TEST_DATA;
-if (!root) throw new Error('实例测试需要独立数据目录');
+const rawRoot = process.env.GUARD_TEST_DATA;
+if (!rawRoot) throw new Error('实例测试需要独立数据目录');
+const root: string = rawRoot;
 fs.mkdirSync(root, { recursive: true });
 app.setPath('appData', root);
 

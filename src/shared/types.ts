@@ -128,6 +128,7 @@ export interface ProbeResult {
   googleCountryName?: string;     // Google 识别地区中文名
   claudeTraceLoc?: string;        // claude.ai/cdn-cgi/trace 边缘识别的国家代码
   claudeTraceIp?: string;         // claude.ai 看到的实际出口 IP
+  claudeTraceCountryCode?: string; // claudeTraceIp 的离线 GeoIP 归属国家代码
   claudeTraceError?: string;      // Claude 请求或地区解析失败的具体原因
   claudeTraceCheckedAt?: number;  // 实际取得 Claude 地区结果的时间
   regionMismatchDetail?: string | null; // 当发现送中/假地区或分流不一致时的详细告警说明

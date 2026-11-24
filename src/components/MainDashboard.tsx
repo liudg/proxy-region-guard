@@ -38,7 +38,7 @@ import {
   XCircle,
 } from 'lucide-react';
 import { AppConfig, AppStateSnapshot } from '../shared/types';
-import { COMMON_COUNTRIES, isValidIsoCountryCode } from '../shared/countries';
+import { COMMON_COUNTRIES, getCountryNameZh, isValidIsoCountryCode } from '../shared/countries';
 import { inspectProcessPattern } from '../shared/processPattern';
 import { getTargetServiceVerificationError } from '../shared/probeValidation';
 import {
@@ -257,6 +257,13 @@ export const MainDashboard: React.FC = () => {
     logs,
   } = state;
   const claudeVerificationError = getTargetServiceVerificationError(claudeState.nodeProbe);
+  const claudeFallbackDetectedCode = claudeState.nodeProbe
+    ? isValidIsoCountryCode(claudeState.nodeProbe.claudeTraceCountryCode)
+      ? claudeState.nodeProbe.claudeTraceCountryCode.toUpperCase()
+      : isValidIsoCountryCode(claudeState.nodeProbe.claudeTraceLoc)
+      ? claudeState.nodeProbe.claudeTraceLoc.toUpperCase()
+      : null
+    : null;
 
   const displayedProxyMode = pendingManualMode ? 'manual' : config.proxyMode;
 
@@ -2039,6 +2046,38 @@ export const MainDashboard: React.FC = () => {
                                 · {claudeState.nodeProbe.latencyMs}ms
                               </small>
                             )}
+                          </>
+                        ) : claudeState.nodeProbe ? (
+                          <>
+                            <div className="step-main-line">
+                              {claudeFallbackDetectedCode && (
+                                <CountryFlag code={claudeFallbackDetectedCode} size="sm" />
+                              )}
+                              <strong
+                                className="ellipsis"
+                                title={`Claude 出口 IP: ${
+                                  claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip
+                                }${
+                                  claudeFallbackDetectedCode
+                                    ? ` · ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode})`
+                                    : ''
+                                } (${claudeState.nodeProbe.latencyMs}ms)`}
+                              >
+                                {claudeFallbackDetectedCode
+                                  ? `Claude ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode}) · ${
+                                      claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip
+                                    }`
+                                  : `Claude 出口 ${
+                                      claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip
+                                    }`}
+                              </strong>
+                            </div>
+                            <small
+                              className="ellipsis text-danger"
+                              title={claudeVerificationError || undefined}
+                            >
+                              {claudeVerificationError}
+                            </small>
                           </>
                         ) : (
                           <>

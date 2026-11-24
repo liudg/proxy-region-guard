@@ -8,8 +8,18 @@ export interface MihomoEndpoint {
   secret: string;
 }
 
-export function mihomoRequest<T>(endpoint: MihomoEndpoint, route: string, method = 'GET', body?: unknown): Promise<T> {
+export function mihomoRequest<T>(
+  endpoint: MihomoEndpoint,
+  route: string,
+  method = 'GET',
+  body?: unknown,
+  signal?: AbortSignal
+): Promise<T> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(signal.reason ?? Object.assign(new Error('内核控制接口请求已取消'), { name: 'AbortError' }));
+      return;
+    }
     const payload = body === undefined ? undefined : JSON.stringify(body);
     const request = http.request({
       socketPath: endpoint.pipePath,
@@ -42,17 +52,41 @@ export function mihomoRequest<T>(endpoint: MihomoEndpoint, route: string, method
         } catch (error) { reject(error); }
       });
     });
+    const onAbort = () => {
+      request.destroy(
+        signal?.reason instanceof Error
+          ? signal.reason
+          : Object.assign(new Error('内核控制接口请求已取消'), { name: 'AbortError' })
+      );
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
     const deadline = setTimeout(() => request.destroy(new Error('内核控制接口请求超时')), 3000);
-    request.on('close', () => clearTimeout(deadline));
+    request.on('close', () => {
+      clearTimeout(deadline);
+      signal?.removeEventListener('abort', onAbort);
+    });
     request.on('error', reject);
     request.end(payload);
   });
 }
 
-export function isLocalPortListening(port: number, timeoutMs = 800): Promise<boolean> {
+export function isLocalPortListening(port: number, timeoutMs = 800, signal?: AbortSignal): Promise<boolean> {
   return new Promise((resolve) => {
+    if (signal?.aborted) {
+      resolve(false);
+      return;
+    }
     const socket = net.connect({ host: '127.0.0.1', port });
-    const finish = (result: boolean) => { socket.destroy(); resolve(result); };
+    let settled = false;
+    const onAbort = () => finish(false);
+    const finish = (result: boolean) => {
+      if (settled) return;
+      settled = true;
+      signal?.removeEventListener('abort', onAbort);
+      socket.destroy();
+      resolve(result);
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
     socket.once('connect', () => finish(true));
     socket.once('error', () => finish(false));
     socket.setTimeout(timeoutMs, () => finish(false));

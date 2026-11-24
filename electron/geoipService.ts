@@ -19,6 +19,13 @@ export class GeoIpService {
   private dbSourceDescription = '未加载离线库';
 
   public async init(appRootPath: string): Promise<void> {
+    this.mmdbFilePath = null;
+    this.reader = null;
+    this.mmdbIpCache.clear();
+    if (this.releaseTimer) {
+      clearTimeout(this.releaseTimer);
+      this.releaseTimer = null;
+    }
     const resPath = process.resourcesPath || '';
 
     const candidateFiles = [
@@ -79,40 +86,67 @@ export class GeoIpService {
     this.releaseTimer.unref?.();
   }
 
-  public lookup(ip: string, fallbackLoc?: string): { countryCode: string; countryName: string } {
-    const cleanIp = ip.trim();
-    let code: string | undefined;
-
-    if (net.isIP(cleanIp)) {
-      if (this.mmdbIpCache.has(cleanIp)) {
-        code = this.mmdbIpCache.get(cleanIp) || undefined;
-      } else {
-        const reader = this.getOrLoadReader();
-        if (reader) {
-          try {
-            const record = reader.get(cleanIp);
-            if (record) {
-              const candidate =
-                record.country?.iso_code ||
-                record.country_code ||
-                record.registered_country?.iso_code;
-              if (isValidIsoCountryCode(candidate)) {
-                code = candidate.trim().toUpperCase();
-              }
-            }
-            if (this.mmdbIpCache.size >= MAX_IP_CACHE_ENTRIES) {
-              const oldestKey = this.mmdbIpCache.keys().next().value;
-              if (oldestKey !== undefined) {
-                this.mmdbIpCache.delete(oldestKey);
-              }
-            }
-            this.mmdbIpCache.set(cleanIp, code || null);
-          } catch (err) {
-            console.warn('[GeoIpService] Lookup failed for IP:', cleanIp, err);
-          }
+  private lookupMmdbCountryCode(cleanIp: string, strict: boolean): string | null {
+    if (this.mmdbIpCache.has(cleanIp)) {
+      return this.mmdbIpCache.get(cleanIp) ?? null;
+    }
+    const reader = this.getOrLoadReader();
+    if (!reader) {
+      if (strict) throw new Error('离线 GeoIP 数据库未就绪');
+      return null;
+    }
+    let code: string | null = null;
+    try {
+      const record = reader.get(cleanIp);
+      if (record) {
+        const candidate =
+          record.country?.iso_code ||
+          record.country_code ||
+          record.registered_country?.iso_code;
+        if (isValidIsoCountryCode(candidate)) {
+          code = candidate.trim().toUpperCase();
         }
       }
+    } catch (err) {
+      if (strict) {
+        throw new Error(
+          `读取离线 GeoIP 数据库失败 (${cleanIp})：${err instanceof Error ? err.message : String(err)}`
+        );
+      }
+      console.warn('[GeoIpService] Lookup failed for IP:', cleanIp, err);
+      return null;
     }
+    if (this.mmdbIpCache.size >= MAX_IP_CACHE_ENTRIES) {
+      const oldestKey = this.mmdbIpCache.keys().next().value;
+      if (oldestKey !== undefined) {
+        this.mmdbIpCache.delete(oldestKey);
+      }
+    }
+    this.mmdbIpCache.set(cleanIp, code);
+    return code;
+  }
+
+  public lookupOfflineStrict(ip: string): { countryCode: string; countryName: string } {
+    const cleanIp = ip.trim();
+    if (!net.isIP(cleanIp)) {
+      throw new Error(`无效的出口 IP：${ip}`);
+    }
+    if (!this.mmdbFilePath) {
+      throw new Error('离线 GeoIP 数据库未就绪');
+    }
+    const code = this.lookupMmdbCountryCode(cleanIp, true);
+    if (!code) {
+      throw new Error(`离线 GeoIP 数据库无法确定出口 ${cleanIp} 的国家`);
+    }
+    return {
+      countryCode: code,
+      countryName: getCountryNameZh(code),
+    };
+  }
+
+  public lookup(ip: string, fallbackLoc?: string): { countryCode: string; countryName: string } {
+    const cleanIp = ip.trim();
+    let code: string | null = net.isIP(cleanIp) ? this.lookupMmdbCountryCode(cleanIp, false) : null;
 
     if (!code && isValidIsoCountryCode(fallbackLoc)) {
       code = fallbackLoc.trim().toUpperCase();
