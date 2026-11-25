@@ -406,20 +406,40 @@ function isNonRetriableRequestError(msg: string): boolean {
 const RETRY_DELAYS_MS = [200, 600] as const;
 const MIN_RETRY_REMAINING_MS = 1400;
 
-export async function requestTextViaProxy(
+export interface ProxyHttpResponse {
+  statusCode: number;
+  location: string | null;
+  finalUrl: string;
+  body: string;
+}
+
+export interface ProxyHttpRequestOptions {
+  acceptHeader?: string;
+  redirectsLeft?: number;
+  allowLocalhost?: boolean;
+  signal?: AbortSignal;
+  userAgent?: string;
+  headers?: Record<string, string>;
+  allowRedirectStatus?: boolean;
+  onRedirect?: (info: {
+    statusCode: number;
+    location: string;
+    fromUrl: URL;
+  }) => 'follow' | 'stop';
+  discardBody?: boolean;
+}
+
+export async function requestHttpViaProxy(
   targetUrl: string,
   proxyUrl: string | null,
   timeoutMs: number,
-  acceptHeader = 'text/plain, */*',
-  redirectsLeft = 2,
-  allowLocalhost = false,
-  signal?: AbortSignal
-): Promise<string> {
+  options: ProxyHttpRequestOptions = {}
+): Promise<ProxyHttpResponse> {
   const deadlineAt = Date.now() + timeoutMs;
   const normalizedProxy = proxyUrl ? normalizeProxyUrlScheme(proxyUrl) : null;
-  const request = () => requestTextViaProxyOnce(
-    targetUrl, normalizedProxy, deadlineAt, acceptHeader, redirectsLeft, allowLocalhost, signal
-  );
+  const signal = options.signal;
+  const request = () =>
+    requestHttpViaProxyOnce(targetUrl, normalizedProxy, deadlineAt, options);
   let attempt = 0;
   while (true) {
     try {
@@ -457,15 +477,41 @@ export async function requestTextViaProxy(
   }
 }
 
-async function requestTextViaProxyOnce(
+export async function requestTextViaProxy(
   targetUrl: string,
   proxyUrl: string | null,
-  deadlineAt: number,
+  timeoutMs: number,
   acceptHeader = 'text/plain, */*',
   redirectsLeft = 2,
   allowLocalhost = false,
   signal?: AbortSignal
 ): Promise<string> {
+  const res = await requestHttpViaProxy(targetUrl, proxyUrl, timeoutMs, {
+    acceptHeader,
+    redirectsLeft,
+    allowLocalhost,
+    signal,
+  });
+  return res.body;
+}
+
+async function requestHttpViaProxyOnce(
+  targetUrl: string,
+  proxyUrl: string | null,
+  deadlineAt: number,
+  options: ProxyHttpRequestOptions = {}
+): Promise<ProxyHttpResponse> {
+  const {
+    acceptHeader = 'text/plain, */*',
+    redirectsLeft = 2,
+    allowLocalhost = false,
+    signal,
+    userAgent = 'curl/8.7.1',
+    headers: extraHeaders,
+    allowRedirectStatus = false,
+    onRedirect,
+    discardBody = false,
+  } = options;
   signal?.throwIfAborted();
   let parsedUrl: URL;
   try {
@@ -485,7 +531,7 @@ async function requestTextViaProxyOnce(
 
   const normalizedProxy = proxyUrl ? normalizeProxyUrlScheme(proxyUrl) : null;
 
-  return new Promise<string>((resolve, reject) => {
+  return new Promise<ProxyHttpResponse>((resolve, reject) => {
     let settled = false;
     let req: http.ClientRequest | null = null;
     let agent: http.Agent | null = null;
@@ -498,12 +544,16 @@ async function requestTextViaProxyOnce(
       }
     };
 
-    const finish = (err: Error | null, body?: string) => {
+    const finish = (
+      err: Error | null,
+      result?: ProxyHttpResponse,
+      destroyReq = false
+    ) => {
       if (settled) return;
       settled = true;
       clearTimeout(hardDeadline);
       signal?.removeEventListener('abort', onAbort);
-      if (err) {
+      if (err || destroyReq) {
         req?.destroy();
       }
       cleanupTransport();
@@ -518,7 +568,14 @@ async function requestTextViaProxyOnce(
             });
         reject(normalizedErr);
       } else {
-        resolve(body ?? '');
+        resolve(
+          result ?? {
+            statusCode: 200,
+            location: null,
+            finalUrl: parsedUrl.toString(),
+            body: '',
+          }
+        );
       }
     };
 
@@ -541,10 +598,11 @@ async function requestTextViaProxyOnce(
 
     const isHttps = parsedUrl.protocol === 'https:';
     const baseHeaders: Record<string, string> = {
-      'User-Agent': 'curl/8.7.1',
+      'User-Agent': userAgent,
       Accept: acceptHeader,
       'Cache-Control': 'no-cache',
       Connection: 'close',
+      ...extraHeaders,
     };
 
     const handleResponse = (res: http.IncomingMessage) => {
@@ -553,46 +611,80 @@ async function requestTextViaProxyOnce(
       });
 
       const code = res.statusCode || 0;
+      const rawLocation = res.headers.location;
+      const locationHeader = Array.isArray(rawLocation) ? rawLocation[0] : rawLocation;
 
-      if (REDIRECT_STATUS_CODES.has(code) && res.headers.location && redirectsLeft > 0) {
-        if (settled) return;
-        settled = true;
-        clearTimeout(hardDeadline);
-        signal?.removeEventListener('abort', onAbort);
-        const locationHeader = res.headers.location;
-        res.destroy();
-        cleanupTransport();
+      if (REDIRECT_STATUS_CODES.has(code) && locationHeader) {
+        const redirectAction =
+          redirectsLeft > 0
+            ? onRedirect?.({ statusCode: code, location: locationHeader, fromUrl: parsedUrl }) ??
+              'follow'
+            : 'stop';
 
-        let nextUrl: string;
-        try {
-          nextUrl = resolveSafeRedirectUrl(parsedUrl, locationHeader, allowLocalhost);
-        } catch (err) {
-          reject(err instanceof Error ? err : new Error(String(err)));
+        if (redirectAction === 'follow') {
+          if (settled) return;
+          settled = true;
+          clearTimeout(hardDeadline);
+          signal?.removeEventListener('abort', onAbort);
+          res.destroy();
+          cleanupTransport();
+
+          let nextUrl: string;
+          try {
+            nextUrl = resolveSafeRedirectUrl(parsedUrl, locationHeader, allowLocalhost);
+          } catch (err) {
+            reject(err instanceof Error ? err : new Error(String(err)));
+            return;
+          }
+
+          if (deadlineAt - Date.now() <= 0) {
+            reject(new Error('连接超时'));
+            return;
+          }
+
+          requestHttpViaProxyOnce(nextUrl, normalizedProxy, deadlineAt, {
+            ...options,
+            redirectsLeft: redirectsLeft - 1,
+          })
+            .then(resolve)
+            .catch(reject);
           return;
         }
 
-        if (deadlineAt - Date.now() <= 0) {
-          reject(new Error('连接超时'));
+        if (allowRedirectStatus) {
+          finish(
+            null,
+            {
+              statusCode: code,
+              location: locationHeader,
+              finalUrl: parsedUrl.toString(),
+              body: '',
+            },
+            true
+          );
+          res.destroy();
           return;
         }
-
-        requestTextViaProxyOnce(
-          nextUrl,
-          normalizedProxy,
-          deadlineAt,
-          acceptHeader,
-          redirectsLeft - 1,
-          allowLocalhost,
-          signal
-        )
-          .then(resolve)
-          .catch(reject);
-        return;
       }
 
       if (code < 200 || code >= 300) {
         res.destroy();
         finish(new Error(`HTTP 状态码 ${code}`));
+        return;
+      }
+
+      if (discardBody) {
+        finish(
+          null,
+          {
+            statusCode: code,
+            location: null,
+            finalUrl: parsedUrl.toString(),
+            body: '',
+          },
+          true
+        );
+        res.destroy();
         return;
       }
 
@@ -612,7 +704,12 @@ async function requestTextViaProxyOnce(
       });
 
       res.on('end', () => {
-        finish(null, Buffer.concat(chunks).toString('utf-8'));
+        finish(null, {
+          statusCode: code,
+          location: null,
+          finalUrl: parsedUrl.toString(),
+          body: Buffer.concat(chunks).toString('utf-8'),
+        });
       });
     };
 

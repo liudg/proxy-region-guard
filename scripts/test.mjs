@@ -114,6 +114,9 @@ try {
         'cp.cloudflare.com',
         'ident.me',
         'www.google.com',
+        'www.google.com.hk',
+        'notebooklm.google.com',
+        'notebook.google.com',
         'www.youtube.com',
       ],
       ['127.0.0.1']

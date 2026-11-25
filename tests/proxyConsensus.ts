@@ -1,4 +1,5 @@
 import { app } from 'electron';
+import { BinaryWriter, WireType } from '@bufbuild/protobuf/wire';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { once } from 'node:events';
@@ -18,11 +19,16 @@ import { isLocalProxyRefusedCause, requestTextViaProxy } from '../electron/netCl
 import { PrivateProxyService, verifyCore } from '../electron/privateKernel';
 import {
   BUILTIN_TRACE_ENDPOINTS,
+  classifyNotebookLmResponse,
   doesHostShareDomain,
   evaluateClaudeNodeProbeSafety,
+  extractGoogleRedirectCountry,
+  extractYoutubeVisitorCountryCode,
   interpretClaudeTracePayload,
   isProbeRegionMismatched,
   MIN_CONSENSUS_MATCHES,
+  parseGoogleSearchHtml,
+  parseYoutubeSwJsData,
   ProbeEngine,
   resolveAlertActualMismatchFields,
   selectProbeEndpointsForTransportHosts,
@@ -352,7 +358,126 @@ function verifyTransportHostsAndPureSafety(): void {
     dedup.clear();
   }
 
-  console.log('通过：独立探测池、传输层域名提取过滤、离线归属未知优先级与后台复核去重校验');
+  // Google 送中与 NotebookLM 地区校验解析器单元测试（@bufbuild/protobuf/wire、原始 ASCII 字节校验、pref=hkredirect、NotebookLM 域名迁移）
+  const encodeVisitorToken = (
+    country: string | Uint8Array,
+    visitorId = 'B_0FWZLX6ec',
+    ts = 1795570159
+  ): string => {
+    const geoWriter = new BinaryWriter();
+    geoWriter
+      .tag(1, WireType.LengthDelimited)
+      .bytes(typeof country === 'string' ? Buffer.from(country, 'utf8') : country);
+    geoWriter.tag(2, WireType.LengthDelimited).bytes(new Uint8Array([0x1a, 0x00, 0x20, 0x64]));
+    const rootWriter = new BinaryWriter();
+    rootWriter.tag(1, WireType.LengthDelimited).string(visitorId);
+    rootWriter.tag(5, WireType.Varint).uint64(ts);
+    rootWriter.tag(6, WireType.LengthDelimited).bytes(geoWriter.finish());
+    rootWriter.tag(9, WireType.Varint).uint32(1);
+    return Buffer.from(rootWriter.finish())
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+  };
+
+  const cnVisitorToken = encodeVisitorToken('CN');
+  const usVisitorToken = encodeVisitorToken('US');
+  const invalidHighBitToken = encodeVisitorToken(new Uint8Array([0xc3, 0xce]));
+  assert.equal(extractYoutubeVisitorCountryCode(cnVisitorToken), 'CN');
+  assert.equal(extractYoutubeVisitorCountryCode(usVisitorToken), 'US');
+  assert.equal(
+    extractYoutubeVisitorCountryCode(invalidHighBitToken),
+    null,
+    '非 ASCII 高位字节（如 0xC3 0xCE）不得因剥离最高位被误判为 CN'
+  );
+  assert.equal(extractYoutubeVisitorCountryCode('not-a-valid-protobuf-token!!!'), null);
+  assert.equal(extractYoutubeVisitorCountryCode(''), null);
+
+  const songzhongSw = parseYoutubeSwJsData(
+    `)]}'\n[["yt.sw.adr",null,[[["en","US",null,"23.237.50.28",null,null,null,null,null,null,null,"Robot","Bot or Crawler","${cnVisitorToken}"]]]]]`
+  );
+  assert.equal(songzhongSw?.countryCode, 'CN', 'sw.js_data 中 inner[1]=US 但 visitorData=CN 时必须优先识别为 CN');
+  assert.equal(songzhongSw?.glCountryCode, 'US');
+  assert.equal(songzhongSw?.visitorCountryCode, 'CN');
+  assert.equal(songzhongSw?.ip, '23.237.50.28');
+
+  const highBitSw = parseYoutubeSwJsData(
+    `)]}'\n[["yt.sw.adr",null,[[["en","JP",null,"1.0.16.1",null,null,null,null,null,null,null,"Robot","Bot or Crawler","${invalidHighBitToken}"]]]]]`
+  );
+  assert.equal(highBitSw?.visitorCountryCode, undefined, '非法高位字节 visitorData 不得覆盖 YouTube 地区字段');
+  assert.equal(highBitSw?.countryCode, 'JP');
+
+  const legacySw = parseYoutubeSwJsData(`)]}'\n["yt.sw.adr",null,[[["","JP",null,"1.2.3.4"]]]]`);
+  assert.equal(legacySw?.countryCode, 'JP');
+  assert.equal(legacySw?.ip, '1.2.3.4');
+
+  assert.equal(
+    extractGoogleRedirectCountry(
+      'https://www.google.com.hk/url?sa=p&hl=zh-CN&pref=hkredirect&pval=yes&q=https://www.google.com.hk/%3Fhl%3Den'
+    ),
+    'CN'
+  );
+  assert.equal(extractGoogleRedirectCountry('https://www.google.cn/search?q=test'), 'CN');
+  assert.equal(extractGoogleRedirectCountry('https://consent.google.com/m?continue=https://www.google.com/&gl=DE'), 'DE');
+  assert.equal(extractGoogleRedirectCountry('https://www.google.com.hk/?hl=en'), null);
+
+  assert.equal(parseGoogleSearchHtml('var x=["",2,1,200,"CHN",null];')?.countryCode, 'CN');
+  assert.equal(parseGoogleSearchHtml('{"MgUcDb":"JP"}')?.countryCode, 'JP');
+
+  assert.equal(
+    classifyNotebookLmResponse({ statusCode: 302, location: 'https://notebooklm.google?location=unsupported' }),
+    false
+  );
+  assert.equal(
+    classifyNotebookLmResponse({ statusCode: 302, location: 'https://notebook.google?location=unsupported' }),
+    false
+  );
+  assert.equal(
+    classifyNotebookLmResponse({ statusCode: 301, location: 'https://notebook.google.com/' }),
+    undefined,
+    '未跟随完成的域名迁移 301 不得直接判定为支持'
+  );
+  assert.equal(
+    classifyNotebookLmResponse({
+      statusCode: 302,
+      location: 'https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fnotebook.google.com%2F',
+      finalUrl: 'https://notebook.google.com/',
+    }),
+    true
+  );
+  assert.equal(
+    classifyNotebookLmResponse({
+      statusCode: 302,
+      location: 'https://notebook.google/',
+      finalUrl: 'https://notebook.google.com/',
+    }),
+    true
+  );
+  assert.equal(classifyNotebookLmResponse({ statusCode: 200, location: null }), true);
+  assert.equal(
+    classifyNotebookLmResponse({ statusCode: 302, location: 'https://www.google.com/sorry/index' }),
+    undefined
+  );
+
+  const aiBlockedAgProbe: ProbeResult = {
+    ip: '198.51.100.8',
+    countryCode: 'HK',
+    countryName: '中国香港',
+    viaChannel: '测试通道',
+    latencyMs: 42,
+    checkedAt: Date.now(),
+    googleCountryCode: 'HK',
+    googleCountryName: '中国香港',
+    googleAiSupported: false,
+    regionMismatchDetail: null,
+  };
+  assert.match(
+    getTargetServiceVerificationError(aiBlockedAgProbe, 'antigravity') || '',
+    /NotebookLM.*不受支持/
+  );
+
+  console.log('通过：独立探测池、传输层域名提取过滤、离线归属未知优先级、后台复核去重与 Google 送中/NotebookLM 解析校验');
 }
 
 async function verifyLocalNetClientAndKernelRecovery(coreDir: string): Promise<void> {
@@ -1345,6 +1470,29 @@ async function verifyMultiSourceConsensus(coreDir: string): Promise<void> {
   let proxyClaudeTraceMode: 'normal' | 'bad-first-then-ok' | 'loc-xx-then-fail' | 'drift-loc-xx-then-old-ok' = 'normal';
   let proxyClaudeTraceHits = 0;
   let foreignClaudeTraceMode: 'normal' | 'loc-xx-proxy-ip' = 'normal';
+  let proxyGoogleMode:
+    | 'normal'
+    | 'cn-songzhong-hkredirect'
+    | 'cn-songzhong-hkredirect-yt-fallback-us'
+    | 'cn-songzhong-yt-protobuf-only'
+    | 'same-country-ai-unsupported' = 'normal';
+  let proxyGoogleHkRedirectFollowHits = 0;
+  let proxyNotebookDomainMigrationHits = 0;
+  const encodeTestYoutubeVisitorData = (countryCode: string, visitorId = 'B_0FWZLX6ec', ts = 1795570159): string => {
+    const geoWriter = new BinaryWriter();
+    geoWriter.tag(1, WireType.LengthDelimited).string(countryCode);
+    geoWriter.tag(2, WireType.LengthDelimited).bytes(new Uint8Array([0x1a, 0x00, 0x20, 0x64]));
+    const rootWriter = new BinaryWriter();
+    rootWriter.tag(1, WireType.LengthDelimited).string(visitorId);
+    rootWriter.tag(5, WireType.Varint).uint64(ts);
+    rootWriter.tag(6, WireType.LengthDelimited).bytes(geoWriter.finish());
+    rootWriter.tag(9, WireType.Varint).uint32(1);
+    return Buffer.from(rootWriter.finish())
+      .toString('base64')
+      .replace(/\+/g, '-')
+      .replace(/\//g, '_')
+      .replace(/=+$/, '');
+  };
   const createRealTlsExitOrigin = (exitIp: string, exitCountry: string, isProxySide: boolean) =>
     https.createServer({ key: tlsKey, cert: tlsCert }, (req, res) => {
       const host = String(req.headers.host || '').split(':')[0].toLowerCase();
@@ -1384,10 +1532,87 @@ async function verifyMultiSourceConsensus(coreDir: string): Promise<void> {
       }
       if (reqPath.startsWith('/sw.js_data')) {
         res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' });
-        res.end(`)]}'\n["yt.sw.adr",null,[[["","${exitCountry}",null,"${exitIp}"]]]]`);
+        if (isProxySide && proxyGoogleMode === 'cn-songzhong-hkredirect-yt-fallback-us') {
+          // 模拟无可用 visitorData 时 YouTube 仅返回默认 GL=US 的场景
+          res.end(`)]}'\n[["yt.sw.adr",null,[[["en","US",null,"${exitIp}"]]]]]`);
+          return;
+        }
+        if (
+          isProxySide &&
+          (proxyGoogleMode === 'cn-songzhong-hkredirect' ||
+            proxyGoogleMode === 'cn-songzhong-yt-protobuf-only')
+        ) {
+          const cnVisitor = encodeTestYoutubeVisitorData('CN');
+          res.end(
+            `)]}'\n[["yt.sw.adr",null,[[["en","US",null,"${exitIp}",null,null,null,null,null,null,null,"Robot","Bot or Crawler","${cnVisitor}"]]]]]`
+          );
+          return;
+        }
+        const visitor = encodeTestYoutubeVisitorData(exitCountry);
+        res.end(
+          `)]}'\n[["yt.sw.adr",null,[[["en","${exitCountry}",null,"${exitIp}",null,null,null,null,null,null,null,"Robot","Bot or Crawler","${visitor}"]]]]]`
+        );
+        return;
+      }
+      if (host === 'notebooklm.google.com') {
+        if (
+          isProxySide &&
+          (proxyGoogleMode === 'cn-songzhong-hkredirect' ||
+            proxyGoogleMode === 'cn-songzhong-hkredirect-yt-fallback-us')
+        ) {
+          res.writeHead(302, {
+            Location: 'https://notebooklm.google?location=unsupported',
+          });
+          res.end();
+          return;
+        }
+        // 真实行为：notebooklm.google.com 正式 301 迁移至 notebook.google.com
+        res.writeHead(301, {
+          Location: 'https://notebook.google.com/',
+        });
+        res.end();
+        return;
+      }
+      if (host === 'notebook.google.com') {
+        if (isProxySide) proxyNotebookDomainMigrationHits++;
+        if (isProxySide && proxyGoogleMode === 'same-country-ai-unsupported') {
+          res.writeHead(302, {
+            Location: 'https://notebook.google?location=unsupported',
+          });
+          res.end();
+          return;
+        }
+        res.writeHead(302, {
+          Location:
+            'https://accounts.google.com/ServiceLogin?continue=https%3A%2F%2Fnotebook.google.com%2F',
+        });
+        res.end();
+        return;
+      }
+      if (host === 'www.google.com.hk') {
+        if (isProxySide) proxyGoogleHkRedirectFollowHits++;
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end('<!doctype html><html><script>var cfg=["",2,1,200,"CHN",null];</script></html>');
         return;
       }
       if (host.includes('google.com')) {
+        if (
+          isProxySide &&
+          (proxyGoogleMode === 'cn-songzhong-hkredirect' ||
+            proxyGoogleMode === 'cn-songzhong-hkredirect-yt-fallback-us')
+        ) {
+          res.writeHead(302, {
+            Location:
+              'https://www.google.com.hk/url?sa=p&hl=zh-CN&pref=hkredirect&pval=yes&q=https://www.google.com.hk/%3Fhl%3Den',
+          });
+          res.end();
+          return;
+        }
+        if (isProxySide && proxyGoogleMode === 'cn-songzhong-yt-protobuf-only') {
+          res.writeHead(502, { 'Content-Type': 'text/plain; charset=utf-8' });
+          res.end('bad gateway');
+          return;
+        }
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(`<!doctype html><html><script>var cfg={"MgUcDb":"${exitCountry}"};</script></html>`);
         return;
@@ -2113,6 +2338,98 @@ async function verifyMultiSourceConsensus(coreDir: string): Promise<void> {
           null,
           '上游恢复后后台健康检查应重新验证转发并清除 verificationError'
         );
+
+        // (0e) 验证真实私有内核 + 真实 TLS 下的 Antigravity Google 送中与 NotebookLM 域名迁移/地区受限检测：
+        //      1) 送中节点（www.google.com 首跳 302 pref=hkredirect + sw.js_data inner[1]=US/Protobuf=CN + NotebookLM unsupported）
+        //         必须单跳即识别 CN（不追踪 google.com.hk）且标记 googleAiSupported=false；
+        //      2) 离线库为 JP、Google 首跳 pref=hkredirect=CN、而 YouTube 缺失 visitorData 仅回退 GL=US 时，
+        //         必须保留明确的 CN 重定向结论，不得被备选 US 覆盖；
+        //      3) 仅 sw.js_data 可达（www.google.com 502）且 inner[1]=US/Protobuf=CN 时，仍必须识别为 CN 而非回退 US；
+        //      4) NotebookLM 经 301 迁移至 notebook.google.com 后返回 location=unsupported 时（同国），仍必须标红告警；
+        //      5) 正常受支持节点经 notebooklm.google.com -> 301 -> notebook.google.com -> 302 ServiceLogin 链路必须通过且 googleAiSupported=true。
+        try {
+          proxyGoogleHkRedirectFollowHits = 0;
+          proxyNotebookDomainMigrationHits = 0;
+          proxyGoogleMode = 'cn-songzhong-hkredirect';
+          const songzhongSnap = await agConflictEngine.probeAntigravityNodeNow();
+          assert.equal(songzhongSnap.antigravityState.nodeProbe?.countryCode, proxyCountry);
+          assert.equal(songzhongSnap.antigravityState.nodeProbe?.googleCountryCode, 'CN');
+          assert.equal(songzhongSnap.antigravityState.nodeProbe?.googleAiSupported, false);
+          assert.match(songzhongSnap.antigravityState.nodeProbe?.regionMismatchDetail || '', /CN/);
+          assert.match(
+            songzhongSnap.antigravityState.nodeProbe?.regionMismatchDetail || '',
+            /NotebookLM.*不受支持/
+          );
+          assert.equal(
+            proxyGoogleHkRedirectFollowHits,
+            0,
+            '首跳已命中 pref=hkredirect 时应立即停止重定向，避免多跳超时'
+          );
+          assert.ok(
+            getTargetServiceVerificationError(songzhongSnap.antigravityState.nodeProbe, 'antigravity'),
+            '送中节点必须触发 Antigravity 目标服务地区校验失败'
+          );
+
+          proxyGoogleHkRedirectFollowHits = 0;
+          proxyGoogleMode = 'cn-songzhong-hkredirect-yt-fallback-us';
+          const hkRedirectWinsSnap = await agConflictEngine.probeAntigravityNodeNow();
+          assert.equal(hkRedirectWinsSnap.antigravityState.nodeProbe?.countryCode, proxyCountry);
+          assert.equal(
+            hkRedirectWinsSnap.antigravityState.nodeProbe?.googleCountryCode,
+            'CN',
+            '离线库为非 US 国家时，明确的 pref=hkredirect -> CN 不得被缺少 visitorData 的 YouTube 默认 US 覆盖'
+          );
+          assert.equal(hkRedirectWinsSnap.antigravityState.nodeProbe?.googleAiSupported, false);
+          assert.equal(proxyGoogleHkRedirectFollowHits, 0);
+
+          proxyGoogleMode = 'cn-songzhong-yt-protobuf-only';
+          const protobufOnlySnap = await agConflictEngine.probeAntigravityNodeNow();
+          assert.equal(
+            protobufOnlySnap.antigravityState.nodeProbe?.googleCountryCode,
+            'CN',
+            'Google 首页失败时必须从 sw.js_data visitorData Protobuf 识别出 CN，不得回退采信 inner[1]=US'
+          );
+          assert.match(protobufOnlySnap.antigravityState.nodeProbe?.regionMismatchDetail || '', /CN/);
+
+          proxyNotebookDomainMigrationHits = 0;
+          proxyGoogleMode = 'same-country-ai-unsupported';
+          const aiUnsupportedSnap = await agConflictEngine.probeAntigravityNodeNow();
+          assert.equal(aiUnsupportedSnap.antigravityState.nodeProbe?.countryCode, proxyCountry);
+          assert.equal(aiUnsupportedSnap.antigravityState.nodeProbe?.googleCountryCode, proxyCountry);
+          assert.equal(aiUnsupportedSnap.antigravityState.nodeProbe?.googleAiSupported, false);
+          assert.ok(
+            proxyNotebookDomainMigrationHits >= 1,
+            '应跟随 notebooklm.google.com -> 301 -> notebook.google.com 正式域名迁移'
+          );
+          assert.match(
+            aiUnsupportedSnap.antigravityState.nodeProbe?.regionMismatchDetail || '',
+            /NotebookLM.*不受支持/
+          );
+          assert.ok(
+            getTargetServiceVerificationError(aiUnsupportedSnap.antigravityState.nodeProbe, 'antigravity'),
+            '同国但 NotebookLM 不支持时必须拦截/预警'
+          );
+
+          proxyNotebookDomainMigrationHits = 0;
+          proxyGoogleMode = 'normal';
+          const cleanAgSnap = await agConflictEngine.probeAntigravityNodeNow();
+          assert.equal(cleanAgSnap.antigravityState.nodeProbe?.countryCode, proxyCountry);
+          assert.equal(cleanAgSnap.antigravityState.nodeProbe?.googleCountryCode, proxyCountry);
+          assert.equal(cleanAgSnap.antigravityState.nodeProbe?.googleAiSupported, true);
+          assert.ok(
+            proxyNotebookDomainMigrationHits >= 1,
+            '正常线路应跟随 301 到达 notebook.google.com 并确认支持'
+          );
+          assert.equal(cleanAgSnap.antigravityState.nodeProbe?.regionMismatchDetail, null);
+          assert.equal(
+            getTargetServiceVerificationError(cleanAgSnap.antigravityState.nodeProbe, 'antigravity'),
+            null
+          );
+        } finally {
+          proxyGoogleMode = 'normal';
+          proxyGoogleHkRedirectFollowHits = 0;
+          proxyNotebookDomainMigrationHits = 0;
+        }
       } finally {
         holdClaudePrimary = false;
         agConflictEngine.stop();

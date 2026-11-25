@@ -54,6 +54,9 @@ export function getTargetServiceVerificationError(
     return 'Claude 出口 IP 校验未完成，请重新检测';
   }
   if (probe.regionMismatchDetail) return probe.regionMismatchDetail;
+  if (targetApp === 'antigravity' && probe.googleAiSupported === false) {
+    return 'NotebookLM 判定当前节点地区不受支持';
+  }
   const country = probe.countryCode.toUpperCase();
   if (targetApp === 'claude') {
     if (!isValidIsoCountryCode(probe.claudeTraceCountryCode)) {

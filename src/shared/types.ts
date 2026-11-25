@@ -126,6 +126,7 @@ export interface ProbeResult {
   // 目标服务地区校验，包含启动检查、心跳和运行期复核
   googleCountryCode?: string;     // Google GFE 内部识别的国家/地区代码，如 "JP" / "CN" / "HK"
   googleCountryName?: string;     // Google 识别地区中文名
+  googleAiSupported?: boolean;    // NotebookLM 地区可用性探测结果（仅供参考，不代表 Antigravity 地区或账号资格）
   claudeTraceLoc?: string;        // claude.ai/cdn-cgi/trace 边缘识别的国家代码
   claudeTraceIp?: string;         // claude.ai 看到的实际出口 IP
   claudeTraceCountryCode?: string; // claudeTraceIp 的离线 GeoIP 归属国家代码

@@ -1494,7 +1494,10 @@ export const MainDashboard: React.FC = () => {
                   {/* 所选节点出口信息展示（纯展示，无任何监控/时区拦截） */}
                   <div
                     className={`ag-node-exit-card ${
-                      antigravityState.nodeProbe?.regionMismatchDetail ? 'mismatch-card' : ''
+                      antigravityState.nodeProbe?.regionMismatchDetail ||
+                      antigravityState.nodeProbe?.googleAiSupported === false
+                        ? 'mismatch-card'
+                        : ''
                     }`}
                   >
                     {config.antigravityClashNode ? (
@@ -1511,7 +1514,9 @@ export const MainDashboard: React.FC = () => {
                                 {antigravityState.nodeProbe.countryCode}
                               </span>
                               {antigravityState.nodeProbe.regionMismatchDetail &&
-                              antigravityState.nodeProbe.googleCountryCode ? (
+                              antigravityState.nodeProbe.googleCountryCode &&
+                              antigravityState.nodeProbe.googleCountryCode.toUpperCase() !==
+                                antigravityState.nodeProbe.countryCode.toUpperCase() ? (
                                 <span
                                   className="target-verify-pill mismatch"
                                   title={antigravityState.nodeProbe.regionMismatchDetail}
@@ -1519,10 +1524,34 @@ export const MainDashboard: React.FC = () => {
                                   ⚠️ Google识别: {antigravityState.nodeProbe.googleCountryName} (
                                   {antigravityState.nodeProbe.googleCountryCode})
                                 </span>
+                              ) : antigravityState.nodeProbe.googleAiSupported === false ? (
+                                <span
+                                  className="target-verify-pill mismatch"
+                                  title={
+                                    antigravityState.nodeProbe.regionMismatchDetail ||
+                                    'NotebookLM 判定当前节点地区不受支持'
+                                  }
+                                >
+                                  ⚠️ NotebookLM 不支持
+                                  {antigravityState.nodeProbe.googleCountryCode
+                                    ? ` (${antigravityState.nodeProbe.googleCountryCode})`
+                                    : ''}
+                                </span>
+                              ) : antigravityState.nodeProbe.regionMismatchDetail ? (
+                                <span
+                                  className="target-verify-pill mismatch"
+                                  title={antigravityState.nodeProbe.regionMismatchDetail}
+                                >
+                                  ⚠️ Google地区异常
+                                </span>
                               ) : antigravityState.nodeProbe.googleCountryCode ? (
                                 <span
                                   className="target-verify-pill verified"
-                                  title="已通过 Google 目标服务真实地区校验"
+                                  title={
+                                    antigravityState.nodeProbe.googleAiSupported === true
+                                      ? '已通过 Google 地区与 NotebookLM 可用性探测（仅供参考，不含 Antigravity 账号归属地校验）'
+                                      : '已通过 Google 目标服务真实地区校验'
+                                  }
                                 >
                                   ✓ Google验证: {antigravityState.nodeProbe.googleCountryCode}
                                 </span>
@@ -1580,7 +1609,13 @@ export const MainDashboard: React.FC = () => {
                     <div className="ag-warn-banner">
                       <AlertTriangle size={14} />
                       <span>
-                        <strong>假地区 / 送中节点预警：</strong>
+                        <strong>
+                          {antigravityState.nodeProbe.googleCountryCode &&
+                          antigravityState.nodeProbe.googleCountryCode.toUpperCase() !==
+                            antigravityState.nodeProbe.countryCode.toUpperCase()
+                            ? '假地区 / 送中节点预警：'
+                            : 'NotebookLM 地区受限预警：'}
+                        </strong>
                         {antigravityState.nodeProbe.regionMismatchDetail}
                         ，Antigravity 可能会报错地区不受支持，建议更换其他节点。
                       </span>
