@@ -222,6 +222,7 @@ export function evaluateClaudeNodeProbeSafety(
     claudeRunning: boolean;
     claudeExternalBaselinePending: boolean;
     claudeLockExitIp: boolean;
+    claudeForceIpv4?: boolean;
     sessionInitialIp: string | null | undefined;
   }
 ): ClaudeSafetyCheck | null {
@@ -245,11 +246,25 @@ export function evaluateClaudeNodeProbeSafety(
     probeTraceIp &&
     probeTraceIp !== lockedSessionIp
   ) {
+    const stackSwitchNote =
+      net.isIPv4(lockedSessionIp) && net.isIPv6(probeTraceIp)
+        ? '，远端节点切至 IPv6 出口'
+        : '';
     return {
       safe: false,
-      reason: `Claude 会话出口 IP 发生变更（锁定基线 ${lockedSessionIp} → 当前 ${probeTraceIp}）`,
+      reason: `Claude 会话出口 IP 发生变更（锁定基线 ${lockedSessionIp} → 当前 ${probeTraceIp}${stackSwitchNote}）`,
       alertType: 'ip-change',
       expectedIp: lockedSessionIp,
+      actualIp: probeTraceIp,
+    };
+  }
+
+  if (options.claudeForceIpv4 && probeTraceIp && net.isIPv6(probeTraceIp)) {
+    return {
+      safe: false,
+      reason: `已开启强制仅走 IPv4 出站，但远端节点访问 Claude 返回了 IPv6 出口 (${probeTraceIp})`,
+      alertType: 'ip-change',
+      expectedIp: lockedSessionIp ?? null,
       actualIp: probeTraceIp,
     };
   }
@@ -616,12 +631,34 @@ export class ProbeEngine extends EventEmitter {
     catch (error) { return { ok: false, error: error instanceof Error ? error.message : String(error) }; }
   }
 
-  private async bindPrivateSelection(channel: PrivateChannelId, node: string | null, port: number,
-    uid: string | null, applyUpdate = false): Promise<{ ok: boolean; error?: string }> {
+  private isEffectiveClaudeForceIpv4(cfg: AppConfig = this.configStore.get()): boolean {
+    if (!cfg.claudeForceIpv4) return false;
+    const kernel = this.privateProxies.channels.claude;
+    // 升级启动时若为保护宿主机已有外部 Claude 会话而延后内核迁移，保留该运行中会话直到其退出或下次安全启动
+    if (this.claudeRunning && kernel.getSnapshot() && !kernel.getIpv4Only()) {
+      return false;
+    }
+    return true;
+  }
+
+  private async bindPrivateSelection(
+    channel: PrivateChannelId,
+    node: string | null,
+    port: number,
+    uid: string | null,
+    applyUpdate = false,
+    ipv4OnlyOverride?: boolean,
+    skipLegacyRelease = false,
+    persistSelection = true
+  ): Promise<{ ok: boolean; error?: string }> {
     const kernel = this.privateProxies.channels[channel];
     let selectionCompleted = false;
     try {
       const current = kernel.getSnapshot();
+      const targetIpv4Only =
+        channel === 'claude'
+          ? ipv4OnlyOverride ?? this.configStore.get().claudeForceIpv4
+          : false;
       if (node && !uid) throw new Error('请选择节点所属的订阅');
       let snapshot = current;
       if (!node) snapshot = null;
@@ -629,16 +666,86 @@ export class ProbeEngine extends EventEmitter {
         await this.clashMonitor.refresh();
         snapshot = this.clashMonitor.catalog.capture(uid!, node);
       }
-      if (snapshot?.fingerprint === current?.fingerprint && kernel.getState().port === port && kernel.getState().phase === 'ready') return { ok: true };
-      if (node && !kernel.getState().pid) await this.clashMonitor.releaseLegacyListeners(port);
-      await kernel.select(snapshot, port);
+      if (
+        snapshot?.fingerprint === current?.fingerprint &&
+        kernel.getState().port === port &&
+        kernel.getState().phase === 'ready' &&
+        kernel.getIpv4Only() === targetIpv4Only
+      ) {
+        return { ok: true };
+      }
+      if (node && !kernel.getState().pid && !skipLegacyRelease) {
+        await this.clashMonitor.releaseLegacyListeners(port);
+      }
+      await kernel.select(snapshot, port, { ipv4Only: targetIpv4Only });
       selectionCompleted = true;
       kernel.refreshSource(this.clashMonitor.catalog);
       return { ok: true };
     } catch (error) {
       return { ok: false, error: error instanceof Error ? error.message : String(error) };
     } finally {
-      if (kernel.getSnapshot() || selectionCompleted) this.persistPrivateSelection(channel);
+      if (persistSelection && (kernel.getSnapshot() || selectionCompleted)) {
+        this.persistPrivateSelection(channel);
+      }
+    }
+  }
+
+  private async migrateDeferredClaudeIpv4IfIdle(): Promise<void> {
+    if (this.stopped || this.claudeRunning || this.applicationChanges.size > 0) return;
+    const cfg = this.configStore.get();
+    const kernel = this.privateProxies.channels.claude;
+    if (!cfg.selectedClashNode || !kernel.getSnapshot() || kernel.getIpv4Only() === cfg.claudeForceIpv4) {
+      return;
+    }
+    try {
+      await this.runApplicationChange(async () => {
+        if (this.stopped || this.claudeRunning) return;
+        const latestCfg = this.configStore.get();
+        if (
+          !latestCfg.selectedClashNode ||
+          !kernel.getSnapshot() ||
+          kernel.getIpv4Only() === latestCfg.claudeForceIpv4
+        ) {
+          return;
+        }
+        this.claudeProbeSeq++;
+        this.abortActiveClaudeProbe('执行延后的 Claude 私有内核 IPv4 模式迁移');
+        this.lastClaudeProbeCompletedAt = 0;
+        this.claudeNodeProbe = null;
+        this.claudeNodeProbeError = null;
+        this.claudeSwitchingCount++;
+        let bindRes: { ok: boolean; error?: string };
+        try {
+          bindRes = await this.bindPrivateSelection(
+            'claude',
+            latestCfg.selectedClashNode,
+            latestCfg.dedicatedProxyPort,
+            latestCfg.selectedClashProfileUid,
+            false,
+            latestCfg.claudeForceIpv4,
+            true
+          );
+        } finally {
+          this.claudeSwitchingCount--;
+        }
+        if (!bindRes.ok) {
+          const message = `延后迁移 Claude 私有内核 IPv4 模式失败：${bindRes.error || '未知错误'}`;
+          this.claudeNodeProbeError = message;
+          this.addLog('danger', message);
+          this.emitState();
+          return;
+        }
+        this.addLog(
+          'success',
+          latestCfg.claudeForceIpv4
+            ? `外部 Claude 会话已退出，已自动将私有内核切换至强制仅走 IPv4 出站 (127.0.0.1:${latestCfg.dedicatedProxyPort})`
+            : `外部 Claude 会话已退出，已自动将私有内核切换至双栈出站 (127.0.0.1:${latestCfg.dedicatedProxyPort})`
+        );
+        this.emitState();
+        void this.probeClaudeNodeNow('应用延后的 Claude IPv4 出站模式迁移');
+      }, 'claude');
+    } catch {
+      // 并发变更进行中时自动交由下次巡检或下次启动完成迁移
     }
   }
 
@@ -646,9 +753,40 @@ export class ProbeEngine extends EventEmitter {
     await this.privateProxies.restore();
     for (const channel of ['claude', 'antigravity'] as const) {
       const kernel = this.privateProxies.channels[channel];
-      if (kernel.getSnapshot()) { this.persistPrivateSelection(channel); continue; }
-      if (kernel.getState().phase !== 'idle') continue;
       const cfg = this.configStore.get();
+      if (kernel.getSnapshot()) {
+        if (
+          channel === 'claude' &&
+          kernel.getIpv4Only() !== cfg.claudeForceIpv4 &&
+          kernel.getState().port
+        ) {
+          if (this.claudeRunning) {
+            // 升级启动时宿主机已有运行中的 Claude 会话：不中断外部会话，同时保留用户的 claudeForceIpv4 设置，
+            // 待外部会话退出或下次从面板安全启动前自动完成私有内核迁移。
+            this.addLog(
+              'warn',
+              '检测到已有运行中的 Claude 会话，已暂留现有私有内核出站模式以避免中断外部会话；待 Claude 退出或下次从专栏启动前将自动应用「强制通道仅走 IPv4 出站」设置'
+            );
+          } else {
+            this.abortActiveClaudeProbe('升级 Claude 私有内核 IPv4 模式');
+            try {
+              await kernel.select(kernel.getSnapshot(), kernel.getState().port!, {
+                ipv4Only: cfg.claudeForceIpv4,
+              });
+              kernel.refreshSource(this.clashMonitor.catalog);
+            } catch (error) {
+              const detail = error instanceof Error ? error.message : String(error);
+              const message = `claude 私有内核切换 IPv4 模式失败：${detail}`;
+              this.claudeNodeProbeError = message;
+              this.addLog('danger', message);
+              this.emit('trigger-alert', this.systemAlert('kernel-error', message));
+            }
+          }
+        }
+        this.persistPrivateSelection(channel);
+        continue;
+      }
+      if (kernel.getState().phase !== 'idle') continue;
       const node = channel === 'claude' ? cfg.selectedClashNode : cfg.antigravityClashNode;
       if (!node) continue;
       const uid = channel === 'claude' ? cfg.selectedClashProfileUid : cfg.antigravityClashProfileUid;
@@ -1076,7 +1214,8 @@ export class ProbeEngine extends EventEmitter {
       this.claudeProbeSeq === sequence &&
       current.selectedClashNode === config.selectedClashNode &&
       current.selectedClashProfileUid === config.selectedClashProfileUid &&
-      current.dedicatedProxyPort === config.dedicatedProxyPort
+      current.dedicatedProxyPort === config.dedicatedProxyPort &&
+      current.claudeForceIpv4 === config.claudeForceIpv4
     );
   }
 
@@ -1292,6 +1431,28 @@ export class ProbeEngine extends EventEmitter {
   private async ensurePrivateChannelReadyForLaunch(
     channel: PrivateChannelId
   ): Promise<{ ok: boolean; error?: string }> {
+    if (channel === 'claude') {
+      const cfg = this.configStore.get();
+      const kernel = this.privateProxies.channels.claude;
+      if (
+        cfg.selectedClashNode &&
+        kernel.getSnapshot() &&
+        kernel.getIpv4Only() !== cfg.claudeForceIpv4
+      ) {
+        const migrated = await this.bindPrivateSelection(
+          'claude',
+          cfg.selectedClashNode,
+          cfg.dedicatedProxyPort,
+          cfg.selectedClashProfileUid,
+          false,
+          cfg.claudeForceIpv4,
+          true
+        );
+        if (!migrated.ok) {
+          return migrated;
+        }
+      }
+    }
     let bindRes = await this.checkPrivateReady(channel);
     if (!bindRes.ok || this.privateProxies.channels[channel].getState().verificationError) {
       const recovered = await this.privateProxies.channels[channel].recoverListenerIfNeeded();
@@ -1535,6 +1696,7 @@ export class ProbeEngine extends EventEmitter {
       claudeRunning: hasSessionBaseline,
       claudeExternalBaselinePending: this.claudeExternalBaselinePending,
       claudeLockExitIp: curCfg.claudeLockExitIp,
+      claudeForceIpv4: this.isEffectiveClaudeForceIpv4(curCfg),
       sessionInitialIp: this.claudeSessionInitialIp,
     });
     if (probeCheck && probeCheck.alertType !== 'verification-unavailable') {
@@ -1764,7 +1926,9 @@ export class ProbeEngine extends EventEmitter {
                 ? `${curCfg.selectedClashProfileName} / ${targetNode}`
                 : targetNode;
               const proxyUrl = `http://127.0.0.1:${curCfg.dedicatedProxyPort}`;
-              channelDesc = `Claude 专属节点 [${label}] (127.0.0.1:${curCfg.dedicatedProxyPort})`;
+              channelDesc = `Claude 专属节点 [${label}] (127.0.0.1:${curCfg.dedicatedProxyPort}${
+                this.privateProxies.channels.claude.getIpv4Only() ? ' · 仅IPv4' : ''
+              })`;
 
               const activeEndpoints = selectProbeEndpointsForTransportHosts(
                 BUILTIN_TRACE_ENDPOINTS,
@@ -1893,7 +2057,16 @@ export class ProbeEngine extends EventEmitter {
             if (!verificationError) {
               this.privateProxies.channels.claude.clearForwardingError();
             }
-            if (!verificationError && !this.privateProxies.channels.claude.getState().verificationError) {
+            const unexpectedIpv6Violation = Boolean(
+              this.isEffectiveClaudeForceIpv4(curCfg) &&
+                normalizedTraceIp &&
+                net.isIPv6(normalizedTraceIp)
+            );
+            if (
+              !verificationError &&
+              !unexpectedIpv6Violation &&
+              !this.privateProxies.channels.claude.getState().verificationError
+            ) {
               this.claudeLastVerificationSuccessAt =
                 probeSuccess.claudeTraceCheckedAt || probeSuccess.checkedAt;
               this.claudeLastVerifiedRegion = {
@@ -1934,11 +2107,12 @@ export class ProbeEngine extends EventEmitter {
             const willTriggerIpDriftKill = Boolean(
               !this.claudeActiveProbeSkipSafety &&
                 this.claudeRunning &&
-                !this.claudeExternalBaselinePending &&
-                curCfg.claudeLockExitIp &&
-                normalizedLockedIp &&
-                normalizedTraceIp &&
-                normalizedTraceIp !== normalizedLockedIp
+                (unexpectedIpv6Violation ||
+                  (!this.claudeExternalBaselinePending &&
+                    curCfg.claudeLockExitIp &&
+                    normalizedLockedIp &&
+                    normalizedTraceIp &&
+                    normalizedTraceIp !== normalizedLockedIp))
             );
 
             if (verificationError) {
@@ -2023,7 +2197,7 @@ export class ProbeEngine extends EventEmitter {
     if (!install.exePath) {
       return { ok: false, message: '未检测到 Claude Desktop 安装路径', state: this.getSnapshot() };
     }
-    const killReport = await this.stopClaudeBeforeRoutingChange();
+    const killReport = await this.stopClaudeBeforeRoutingChange(true);
 
     // 2. 若已选择节点，确保专属端口绑定就绪
     if (cfg.selectedClashNode) {
@@ -2114,7 +2288,8 @@ export class ProbeEngine extends EventEmitter {
     const ipLockTag = cfg.claudeLockExitIp
       ? `锁定出口 IP ${initialClaudeIp}`
       : `初始出口 IP ${initialClaudeIp}`;
-    const okMsg = `三重校验通过！已通过专属节点 [${fullNodeLabel}] (127.0.0.1:${cfg.dedicatedProxyPort} · ${proxyCountryName} · ${ipLockTag}) 安全启动 Claude`;
+    const ipv4Tag = cfg.claudeForceIpv4 ? ' · 仅IPv4' : '';
+    const okMsg = `三重校验通过！已通过专属节点 [${fullNodeLabel}] (127.0.0.1:${cfg.dedicatedProxyPort}${ipv4Tag} · ${proxyCountryName} · ${ipLockTag}) 安全启动 Claude`;
     this.addLog('success', okMsg);
     this.emitState();
     return {
@@ -2174,11 +2349,27 @@ export class ProbeEngine extends EventEmitter {
     }
   }
 
-  private async stopClaudeBeforeRoutingChange(): Promise<ProcessKillReport> {
+  private async stopClaudeBeforeRoutingChange(forceTerminate = false): Promise<ProcessKillReport> {
     this.claudeVerificationRecovery.clear();
     this.abortActiveClaudeProbe('调整 Claude 专属代理配置');
-    const report = await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS);
-    await assertProcessesStopped(CLAUDE_DESKTOP_PROCESS_PATTERNS, report);
+    const shouldTerminateClaude =
+      forceTerminate ||
+      this.started ||
+      this.claudeRunning ||
+      this.claudeAuthorizedSession ||
+      this.configStore.get().claudeExclusiveGuard;
+    const report: ProcessKillReport = shouldTerminateClaude
+      ? await this.executeProcessKillSafely(CLAUDE_DESKTOP_PROCESS_PATTERNS)
+      : {
+          killedSummary: [],
+          killedCount: 0,
+          failedSummary: [],
+          failedPids: [],
+          accessDenied: false,
+        };
+    if (shouldTerminateClaude) {
+      await assertProcessesStopped(CLAUDE_DESKTOP_PROCESS_PATTERNS, report);
+    }
     this.unsetClaudeAuthLock();
     this.claudeLastVerificationSuccessAt = null;
     this.claudeLastVerifiedRegion = null;
@@ -2189,25 +2380,165 @@ export class ProbeEngine extends EventEmitter {
     return report;
   }
 
-  public async updateConfig(partial: Partial<AppConfig>): Promise<AppConfig> {
+  public async updateConfig(
+    partial: Partial<AppConfig>,
+    options?: { confirmTerminateClaude?: boolean }
+  ): Promise<AppConfig> {
     return this.runApplicationChange(async () => {
       const previous = this.configStore.get();
       const requested = this.configStore.preview(partial);
-      const claudeChanged =
+      const claudeNodeOrPortChanged =
         previous.selectedClashNode !== requested.selectedClashNode ||
         previous.selectedClashProfileUid !== requested.selectedClashProfileUid ||
         previous.dedicatedProxyPort !== requested.dedicatedProxyPort;
+      const claudeIpv4Changed = previous.claudeForceIpv4 !== requested.claudeForceIpv4;
+      const claudeChanged = claudeNodeOrPortChanged || claudeIpv4Changed;
+      const needsClaudeChannelRebuild =
+        (claudeNodeOrPortChanged &&
+          (Boolean(previous.selectedClashNode) || Boolean(requested.selectedClashNode))) ||
+        (claudeIpv4Changed && Boolean(requested.selectedClashNode));
       const antigravityChanged =
         previous.antigravityClashNode !== requested.antigravityClashNode ||
         previous.antigravityClashProfileUid !== requested.antigravityClashProfileUid ||
         previous.antigravityDedicatedPort !== requested.antigravityDedicatedPort;
-      if (claudeChanged) await this.stopClaudeBeforeRoutingChange();
-      const next = this.configStore.update(partial);
+
+      // 仅在确实需要重建 Claude 通道时检查并停止关联进程；纯 IPv4 开关切换且未显式确认时，
+      // 在主进程实时核验是否有运行中的 Claude 会话，绝不未经确认终止进程。
+      if (needsClaudeChannelRebuild) {
+        if (claudeIpv4Changed && !claudeNodeOrPortChanged && !options?.confirmTerminateClaude) {
+          if (this.started) {
+            const liveProc = await countRunningClaudeProcesses(true);
+            this.claudeRunning = liveProc.running;
+            this.claudeProcessCount = liveProc.count;
+            this.claudeRunningPids = liveProc.pids;
+          }
+          if (this.claudeRunning || this.claudeAuthorizedSession) {
+            this.emitState();
+            throw new Error(
+              'CLAUDE_RUNNING_CONFIRM_REQUIRED:检测到正在运行的 Claude 会话，切换 IPv4 出站模式将终止并重建代理通道，请先确认'
+            );
+          }
+          // 实时核验当前无运行中的 Claude：仅重置校验状态，不向宿主机发出无确认的进程终止指令
+          this.claudeVerificationRecovery.clear();
+          this.abortActiveClaudeProbe('调整 Claude 专属代理配置');
+          this.unsetClaudeAuthLock();
+          this.claudeLastVerificationSuccessAt = null;
+          this.claudeLastVerifiedRegion = null;
+          this.lastClaudeProbeCompletedAt = 0;
+        } else {
+          await this.stopClaudeBeforeRoutingChange();
+        }
+      }
+
+      // 切换 Claude 强制 IPv4 开关且已绑定节点时，必须先完成私有内核重建（不触碰外部 Clash 控制接口），
+      // 成功后再持久化配置文件；若配置文件落盘失败则立即回滚私有内核至原模式，确保配置与监听原子一致。
+      const rebuiltClaudeForIpv4 = Boolean(claudeIpv4Changed && requested.selectedClashNode);
+      if (rebuiltClaudeForIpv4) {
+        this.claudeProbeSeq++;
+        this.abortActiveClaudeProbe('切换 Claude 通道 IPv4 出站模式');
+        this.lastClaudeProbeCompletedAt = 0;
+        this.claudeNodeProbe = null;
+        this.claudeNodeProbeError = null;
+        this.claudeSwitchingCount++;
+        let bindRes: { ok: boolean; error?: string };
+        try {
+          bindRes = await this.bindPrivateSelection(
+            'claude',
+            requested.selectedClashNode,
+            requested.dedicatedProxyPort,
+            requested.selectedClashProfileUid,
+            false,
+            requested.claudeForceIpv4,
+            !claudeNodeOrPortChanged,
+            false
+          );
+        } finally {
+          this.claudeSwitchingCount--;
+        }
+        if (!bindRes.ok) {
+          // 私有内核重建失败时保持先前已生效的 claudeForceIpv4，绝不提交未生效配置
+          const errText = bindRes.error || '切换 Claude 通道 IPv4 出站模式失败';
+          this.claudeNodeProbeError = errText;
+          this.addLog('danger', errText);
+          this.emitState();
+          throw new Error(errText);
+        }
+      }
+
+      let next: AppConfig;
+      try {
+        const finalPartial: Partial<AppConfig> = rebuiltClaudeForIpv4
+          ? {
+              ...partial,
+              ...(this.privateProxies.channels.claude.getState().profileName
+                ? {
+                    selectedClashProfileName:
+                      this.privateProxies.channels.claude.getState().profileName,
+                  }
+                : {}),
+            }
+          : partial;
+        next = this.configStore.update(finalPartial);
+      } catch (saveError) {
+        if (rebuiltClaudeForIpv4) {
+          this.claudeSwitchingCount++;
+          try {
+            if (previous.selectedClashNode) {
+              await this.bindPrivateSelection(
+                'claude',
+                previous.selectedClashNode,
+                previous.dedicatedProxyPort,
+                previous.selectedClashProfileUid,
+                false,
+                previous.claudeForceIpv4,
+                true,
+                false
+              );
+            } else {
+              await this.privateProxies.channels.claude
+                .select(null, previous.dedicatedProxyPort)
+                .catch(() => undefined);
+            }
+          } finally {
+            this.claudeSwitchingCount--;
+          }
+          const detail = saveError instanceof Error ? saveError.message : String(saveError);
+          const errText = `保存配置文件失败，已撤销 Claude IPv4 模式切换：${detail}`;
+          this.claudeNodeProbeError = errText;
+          this.addLog('danger', errText);
+          this.emitState();
+        }
+        throw saveError;
+      }
       if (previous.heartbeatIntervalSec !== next.heartbeatIntervalSec && this.started) {
         this.restartHeartbeatTimer();
       }
       if (claudeChanged) {
-        await this.selectClashNodeInternal(next.selectedClashNode, next.selectedClashProfileUid);
+        if (claudeIpv4Changed && !next.selectedClashNode) {
+          if (claudeNodeOrPortChanged) {
+            await this.selectClashNodeInternal(null, null);
+          }
+          this.addLog(
+            'info',
+            next.claudeForceIpv4
+              ? '已开启 Claude 通道强制仅走 IPv4 出站'
+              : '已关闭 Claude 通道强制仅走 IPv4 出站（允许双栈/IPv6 节点）'
+          );
+          this.emitState();
+        } else if (claudeIpv4Changed && next.selectedClashNode) {
+          this.addLog(
+            'success',
+            next.claudeForceIpv4
+              ? `已开启 Claude 通道强制仅走 IPv4 出站 (127.0.0.1:${next.dedicatedProxyPort})`
+              : `已关闭 Claude 通道强制仅走 IPv4 出站，允许双栈/IPv6 出站 (127.0.0.1:${next.dedicatedProxyPort})`
+          );
+          this.emitState();
+          await this.probeClaudeNodeNow(
+            next.claudeForceIpv4 ? '开启 Claude 仅 IPv4 出站' : '关闭 Claude 仅 IPv4 出站'
+          );
+        } else {
+          await this.selectClashNodeInternal(next.selectedClashNode, next.selectedClashProfileUid);
+        }
       } else if (previous.claudeLockExitIp !== next.claudeLockExitIp) {
         this.addLog(
           'info',
@@ -2368,6 +2699,13 @@ export class ProbeEngine extends EventEmitter {
               scheduleNext(1500);
               return;
             }
+          } else if (
+            cfg.selectedClashNode &&
+            this.privateProxies.channels.claude.getSnapshot() &&
+            this.privateProxies.channels.claude.getIpv4Only() !== cfg.claudeForceIpv4 &&
+            this.applicationChanges.size === 0
+          ) {
+            void this.migrateDeferredClaudeIpv4IfIdle();
           }
 
           if (prevRunning !== this.claudeRunning || prevCount !== this.claudeProcessCount) {
@@ -2639,6 +2977,7 @@ export class ProbeEngine extends EventEmitter {
           this.claudeRunning || this.claudeAuthorizedSession || this.claudeSessionInitialIp !== null,
         claudeExternalBaselinePending: this.claudeExternalBaselinePending,
         claudeLockExitIp: cfg.claudeLockExitIp,
+        claudeForceIpv4: this.isEffectiveClaudeForceIpv4(cfg),
         sessionInitialIp: this.claudeSessionInitialIp,
       });
       if (probeCheck) return probeCheck;
@@ -2711,9 +3050,14 @@ export class ProbeEngine extends EventEmitter {
       : false;
 
     const verificationError = getTargetServiceVerificationError(this.claudeNodeProbe);
+    const normalizedClaudeTraceIp = normalizeIpAddress(this.claudeNodeProbe?.claudeTraceIp);
+    const unexpectedIpv6Exit = Boolean(
+      cfg.claudeForceIpv4 && normalizedClaudeTraceIp && net.isIPv6(normalizedClaudeTraceIp)
+    );
     const threeWayMatched = Boolean(
       proxyCountryCode &&
         !verificationError &&
+        !unexpectedIpv6Exit &&
         winRegionMatched &&
         winTimeZoneMatched
     );
@@ -2735,6 +3079,8 @@ export class ProbeEngine extends EventEmitter {
       }`;
     } else if (verificationError) {
       launchBlockReason = `地区校验未通过：${verificationError}`;
+    } else if (unexpectedIpv6Exit) {
+      launchBlockReason = `已开启强制仅走 IPv4 出站，但远端节点访问 Claude 仍返回 IPv6 (${normalizedClaudeTraceIp})，请更换节点或关闭该开关`;
     } else if (!winRegionMatched) {
       launchBlockReason = `系统区域（${this.winLocale.regionName}）与节点地区（${proxyCountryName}）不一致`;
     } else if (!winTimeZoneMatched) {
@@ -3241,6 +3587,7 @@ export class ProbeEngine extends EventEmitter {
           this.claudeRunning || this.claudeAuthorizedSession || this.claudeSessionInitialIp !== null,
         claudeExternalBaselinePending: this.claudeExternalBaselinePending,
         claudeLockExitIp: cfg.claudeLockExitIp,
+        claudeForceIpv4: this.isEffectiveClaudeForceIpv4(cfg),
         sessionInitialIp: this.claudeSessionInitialIp,
       });
       if (probeCheck && probeCheck.alertType !== 'verification-unavailable') {
@@ -4313,13 +4660,19 @@ export class ProbeEngine extends EventEmitter {
       );
     };
 
+    const isForcedIpv4Violated = (ip: string | null | undefined): boolean => {
+      if (!this.isEffectiveClaudeForceIpv4(cfg)) return false;
+      const currentIp = normalizeIpAddress(ip);
+      return Boolean(currentIp && net.isIPv6(currentIp));
+    };
+
     const isClaudeSelfViolatingRunningSession = (
       outcome: Extract<ClaudeSampleOutcome, { kind: 'ok' }>
     ): boolean => {
       if (!hasSessionBaseline) {
         return false;
       }
-      if (isLockedIpDrifted(outcome.ip)) {
+      if (isLockedIpDrifted(outcome.ip) || isForcedIpv4Violated(outcome.ip)) {
         return true;
       }
       return isClaudeCountryViolatingRunningSession(outcome.countryCode);
@@ -4332,6 +4685,7 @@ export class ProbeEngine extends EventEmitter {
       if (outcome.kind === 'trace-error') {
         return (
           isLockedIpDrifted(outcome.claudeTraceIp) ||
+          (hasSessionBaseline && isForcedIpv4Violated(outcome.claudeTraceIp)) ||
           isClaudeCountryViolatingRunningSession(outcome.claudeTraceCountryCode)
         );
       }

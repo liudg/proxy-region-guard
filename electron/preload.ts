@@ -28,7 +28,8 @@ const api: GuardBridgeAPI = {
   checkNow: (reason?: string) => ipcRenderer.invoke('guard:check-now', reason),
   setDefaultCurrent: () => ipcRenderer.invoke('guard:set-default-current'),
   setDefaultRegion: (code: string | null) => ipcRenderer.invoke('guard:set-default-region', code),
-  updateConfig: (partial: Partial<AppConfig>) => ipcRenderer.invoke('guard:update-config', partial),
+  updateConfig: (partial: Partial<AppConfig>, options?: { confirmTerminateClaude?: boolean }) =>
+    ipcRenderer.invoke('guard:update-config', partial, options),
   clearLogs: () => ipcRenderer.invoke('guard:clear-logs'),
   syncSystemLocaleToDefault: (targetSource?: 'monitor' | 'claude') =>
     ipcRenderer.invoke('guard:sync-locale', targetSource),

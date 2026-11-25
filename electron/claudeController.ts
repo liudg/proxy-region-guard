@@ -248,7 +248,7 @@ export async function spawnClaudeWithDedicatedProxy(
   const cleanProxy = proxyUrl.trim();
   const hostPort = cleanProxy.replace(/^[a-z0-9+.-]+:\/\//i, '');
   const httpProxy = `http://${hostPort}`;
-  const socksProxy = `socks5://${hostPort}`;
+  const socksProxy = `socks5h://${hostPort}`;
 
   const args = [
     `--proxy-server=${httpProxy}`,

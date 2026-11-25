@@ -1152,9 +1152,15 @@ function registerIpcHandlers(): void {
     updaterService.openReleasePageInBrowser()
   );
 
-  ipcMain.handle('guard:update-config', async (_e, partial: Partial<AppConfig>) => {
-    const prevCfg = configStore.get();
-    let nextCfg = await probeEngine.updateConfig(partial);
+  ipcMain.handle(
+    'guard:update-config',
+    async (
+      _e,
+      partial: Partial<AppConfig>,
+      options?: { confirmTerminateClaude?: boolean }
+    ) => {
+      const prevCfg = configStore.get();
+      let nextCfg = await probeEngine.updateConfig(partial, options);
 
     if (!nextCfg.monitorAlertEnabled && latestAlertPayload?.source === 'monitor') {
       hideAlertWindow();
@@ -1191,7 +1197,8 @@ function registerIpcHandlers(): void {
     const claudeChanged =
       prevCfg.selectedClashNode !== nextCfg.selectedClashNode ||
       prevCfg.selectedClashProfileUid !== nextCfg.selectedClashProfileUid ||
-      prevCfg.dedicatedProxyPort !== nextCfg.dedicatedProxyPort;
+      prevCfg.dedicatedProxyPort !== nextCfg.dedicatedProxyPort ||
+      prevCfg.claudeForceIpv4 !== nextCfg.claudeForceIpv4;
 
     if (agChanged || claudeChanged) {
       return probeEngine.getSnapshot();

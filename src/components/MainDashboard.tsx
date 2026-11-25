@@ -109,6 +109,7 @@ export const MainDashboard: React.FC = () => {
     | { type: 'kill' }
     | { type: 'switch-node'; nodeName: string | null; profileUid: string | null }
     | { type: 'change-port'; port: number }
+    | { type: 'toggle-ipv4'; enabled: boolean }
     | null
   >(null);
 
@@ -327,11 +328,12 @@ export const MainDashboard: React.FC = () => {
 
   const updateConfigSafe = async (
     partial: Partial<AppConfig>,
-    target: 'ag' | 'claude' | 'locale' | 'global' = 'global'
+    target: 'ag' | 'claude' | 'locale' | 'global' = 'global',
+    options?: { confirmTerminateClaude?: boolean }
   ): Promise<AppStateSnapshot | null> => {
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const next = await window.guardAPI.updateConfig(partial);
+        const next = await window.guardAPI.updateConfig(partial, options);
         setState(next);
         return next;
       } catch (err) {
@@ -339,6 +341,18 @@ export const MainDashboard: React.FC = () => {
         if (attempt < 2 && msg.includes('正在进行')) {
           await new Promise((r) => setTimeout(r, 320));
           continue;
+        }
+        if (
+          msg.includes('CLAUDE_RUNNING_CONFIRM_REQUIRED:') &&
+          typeof partial.claudeForceIpv4 === 'boolean'
+        ) {
+          const fresh = await window.guardAPI.getState().catch(() => null);
+          if (fresh) setState(fresh);
+          setPendingClaudeConfirm({
+            type: 'toggle-ipv4',
+            enabled: partial.claudeForceIpv4,
+          });
+          return null;
         }
         notifyError(err, target);
         return null;
@@ -511,6 +525,40 @@ export const MainDashboard: React.FC = () => {
       return;
     }
     void executeTerminateAntigravity();
+  };
+
+  const executeToggleClaudeForceIpv4 = async (
+    enabled: boolean,
+    confirmTerminateClaude = false
+  ) => {
+    setPendingClaudeConfirm(null);
+    setIsSwitchingNode(true);
+    try {
+      const next = await updateConfigSafe(
+        { claudeForceIpv4: enabled },
+        'claude',
+        { confirmTerminateClaude }
+      );
+      if (next) {
+        showTimedClaudeFeedback(
+          true,
+          enabled
+            ? '已开启 Claude 通道强制仅走 IPv4 出站'
+            : '已关闭强制仅走 IPv4 出站（允许双栈/IPv6 节点）'
+        );
+      }
+    } finally {
+      setIsSwitchingNode(false);
+    }
+  };
+
+  const handleToggleClaudeForceIpv4 = (enabled: boolean) => {
+    if (enabled === config.claudeForceIpv4) return;
+    if (claudeState.running && config.selectedClashNode) {
+      setPendingClaudeConfirm({ type: 'toggle-ipv4', enabled });
+      return;
+    }
+    void executeToggleClaudeForceIpv4(enabled, false);
   };
 
   const executeSaveDedicatedPort = async (portNum: number) => {
@@ -2241,6 +2289,12 @@ export const MainDashboard: React.FC = () => {
                               }] 将先终止 Claude，新节点校验通过后可重启。`
                             : pendingClaudeConfirm.type === 'change-port'
                             ? `修改端口为 ${pendingClaudeConfirm.port} 将先终止当前 Claude。`
+                            : pendingClaudeConfirm.type === 'toggle-ipv4'
+                            ? `${
+                                pendingClaudeConfirm.enabled
+                                  ? '开启强制仅走 IPv4 出站'
+                                  : '关闭强制仅走 IPv4 出站'
+                              }将先终止当前 Claude 并重建专属通道。`
                             : '确定立即终止全部 Claude 进程？'}
                         </span>
                       </div>
@@ -2257,6 +2311,11 @@ export const MainDashboard: React.FC = () => {
                               );
                             } else if (pendingClaudeConfirm.type === 'change-port') {
                               void executeSaveDedicatedPort(pendingClaudeConfirm.port);
+                            } else if (pendingClaudeConfirm.type === 'toggle-ipv4') {
+                              void executeToggleClaudeForceIpv4(
+                                pendingClaudeConfirm.enabled,
+                                true
+                              );
                             } else {
                               void executeTerminateClaude();
                             }
@@ -2266,6 +2325,8 @@ export const MainDashboard: React.FC = () => {
                             ? '确认切换'
                             : pendingClaudeConfirm.type === 'change-port'
                             ? '确认修改'
+                            : pendingClaudeConfirm.type === 'toggle-ipv4'
+                            ? '确认生效'
                             : '确认终止'}
                         </button>
                         <button
@@ -2369,7 +2430,8 @@ export const MainDashboard: React.FC = () => {
                     <div className="collapsible-header-right">
                       <span className="mini-badge neutral">
                         {config.claudeExclusiveGuard ? '唯一入口' : '允许外启'} ·{' '}
-                        {config.claudeLockExitIp ? '锁IP' : '不锁IP'} · 127.0.0.1:
+                        {config.claudeLockExitIp ? '锁IP' : '不锁IP'} ·{' '}
+                        {config.claudeForceIpv4 ? '仅IPv4' : '双栈'} · 127.0.0.1:
                         {config.dedicatedProxyPort} · {installTypeLabel}
                       </span>
                       <span className="collapse-chevron">
@@ -2417,6 +2479,22 @@ export const MainDashboard: React.FC = () => {
                               'claude'
                             )
                           }
+                        />
+                      </div>
+
+                      <div className="setting-row">
+                        <div>
+                          <strong>强制通道仅走 IPv4 出站</strong>
+                          <p>
+                            经代理内 DoH 锁定 IPv4 并拦截 IPv6，防止双栈节点切栈误杀与风控；纯 IPv6 出口节点可关闭
+                          </p>
+                        </div>
+                        <input
+                          type="checkbox"
+                          className="toggle-switch"
+                          disabled={isSwitchingNode}
+                          checked={config.claudeForceIpv4}
+                          onChange={(e) => handleToggleClaudeForceIpv4(e.target.checked)}
                         />
                       </div>
 

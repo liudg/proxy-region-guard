@@ -13,7 +13,8 @@ export function mihomoRequest<T>(
   route: string,
   method = 'GET',
   body?: unknown,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  timeoutMs = 3000
 ): Promise<T> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -60,7 +61,7 @@ export function mihomoRequest<T>(
       );
     };
     signal?.addEventListener('abort', onAbort, { once: true });
-    const deadline = setTimeout(() => request.destroy(new Error('内核控制接口请求超时')), 3000);
+    const deadline = setTimeout(() => request.destroy(new Error('内核控制接口请求超时')), Math.max(100, timeoutMs));
     request.on('close', () => {
       clearTimeout(deadline);
       signal?.removeEventListener('abort', onAbort);

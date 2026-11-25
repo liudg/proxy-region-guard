@@ -32,6 +32,7 @@ export const DEFAULT_CONFIG: AppConfig = {
   claudeExePath: '',
   claudeExclusiveGuard: true,
   claudeLockExitIp: true,
+  claudeForceIpv4: true,
   antigravityClashNode: null,
   antigravityClashProfileUid: null,
   antigravityClashProfileName: null,
@@ -123,6 +124,11 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
       ? raw.claudeLockExitIp
       : DEFAULT_CONFIG.claudeLockExitIp;
 
+  const claudeForceIpv4 =
+    typeof raw.claudeForceIpv4 === 'boolean'
+      ? raw.claudeForceIpv4
+      : DEFAULT_CONFIG.claudeForceIpv4;
+
   const antigravityClashNode =
     typeof raw.antigravityClashNode === 'string' && raw.antigravityClashNode.trim()
       ? raw.antigravityClashNode.trim()
@@ -208,6 +214,7 @@ function normalizeConfig(raw: Partial<AppConfig>): AppConfig {
     claudeExePath,
     claudeExclusiveGuard,
     claudeLockExitIp,
+    claudeForceIpv4,
     antigravityClashNode,
     antigravityClashProfileUid,
     antigravityClashProfileName,

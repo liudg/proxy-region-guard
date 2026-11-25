@@ -39,6 +39,7 @@ export interface AppConfig {
   claudeExePath: string;                   // 自定义 Claude Desktop 启动路径（留空则自动探测）
   claudeExclusiveGuard: boolean;           // 唯一入口守护：禁止任何外部途径启动 Claude，不一致立杀
   claudeLockExitIp: boolean;               // 会话出口 IP 锁定：运行期 claude.ai 识别出口 IP 变更即强杀
+  claudeForceIpv4: boolean;                // 强制 Claude 专属通道仅走 IPv4 出站（防止双栈节点 IPv4/IPv6 漂移）
 
   // Antigravity 启动器专栏配置（纯代理绑定，无监控/预警/强杀）
   antigravityClashNode: string | null;        // Antigravity 独立指定的 Clash 节点名称
@@ -291,12 +292,19 @@ export interface AntigravityLaunchResult {
   state: AppStateSnapshot;
 }
 
+export interface UpdateConfigOptions {
+  confirmTerminateClaude?: boolean;
+}
+
 export interface GuardBridgeAPI {
   getState: () => Promise<AppStateSnapshot>;
   checkNow: (reason?: string) => Promise<AppStateSnapshot>;
   setDefaultCurrent: () => Promise<AppStateSnapshot>;
   setDefaultRegion: (code: string | null) => Promise<AppStateSnapshot>;
-  updateConfig: (partial: Partial<AppConfig>) => Promise<AppStateSnapshot>;
+  updateConfig: (
+    partial: Partial<AppConfig>,
+    options?: UpdateConfigOptions
+  ) => Promise<AppStateSnapshot>;
   clearLogs: () => Promise<AppStateSnapshot>;
   syncSystemLocaleToDefault: (targetSource?: 'monitor' | 'claude') => Promise<LocaleSyncResult>;
   restoreDefaultChinaLocale: () => Promise<LocaleSyncResult>;

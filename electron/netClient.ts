@@ -8,6 +8,7 @@ import * as tls from 'node:tls';
 import { setTimeout as delay } from 'node:timers/promises';
 import { HttpsProxyAgent } from 'https-proxy-agent';
 import { SocksProxyAgent } from 'socks-proxy-agent';
+import { isRegisteredBridgeUpstreamRefusedHeader } from './ipv4ProxyBridge';
 import { getRawFs } from './updateCrypto';
 
 const rawFs = getRawFs();
@@ -292,6 +293,20 @@ class ScopedHttpsProxyAgent extends HttpsProxyAgent<string> {
       connectRequest.once('connect', (response, socket, head) => {
         if (response.statusCode !== 200) {
           socket.destroy();
+          if (
+            response.statusCode === 503 &&
+            isRegisteredBridgeUpstreamRefusedHeader(this.proxy.href, response.headers)
+          ) {
+            const proxyHost = String(this.connectOpts.host || '127.0.0.1');
+            const proxyPort = Number(this.connectOpts.port);
+            reject(
+              Object.assign(
+                new Error(`connect ECONNREFUSED ${proxyHost}:${proxyPort}`),
+                { code: 'ECONNREFUSED', address: proxyHost, port: proxyPort }
+              )
+            );
+            return;
+          }
           reject(new Error(`HTTP 状态码 ${response.statusCode}`));
           return;
         }
@@ -669,6 +684,26 @@ async function requestHttpViaProxyOnce(
 
       if (code < 200 || code >= 300) {
         res.destroy();
+        if (
+          normalizedProxy &&
+          code === 503 &&
+          isRegisteredBridgeUpstreamRefusedHeader(normalizedProxy, res.headers)
+        ) {
+          try {
+            const p = new URL(normalizedProxy);
+            const pHost = p.hostname.replace(/^\[|\]$/g, '');
+            const pPort = Number(p.port || (p.protocol === 'https:' ? 443 : 80));
+            finish(
+              Object.assign(
+                new Error(`connect ECONNREFUSED ${pHost}:${pPort}`),
+                { code: 'ECONNREFUSED', address: pHost, port: pPort }
+              )
+            );
+            return;
+          } catch {
+            // fall through to generic status error
+          }
+        }
         finish(new Error(`HTTP 状态码 ${code}`));
         return;
       }
