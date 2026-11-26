@@ -1,240 +1,28 @@
-import React, { useEffect, useState } from 'react';
+import React from 'react';
 import {
   Activity,
   AlertTriangle,
-  Ban,
   Bot,
   Check,
-  CheckCircle2,
-  ChevronDown,
-  ChevronUp,
-  Clock,
-  Copy,
-  Cpu,
-  Download,
-  ExternalLink,
-  FolderOpen,
-  Globe,
-  History,
-  Info,
-  Lock,
-  Minus,
-  Play,
-  Plus,
-  Radio,
   RefreshCw,
   Rocket,
-  RotateCcw,
-  Settings,
-  Shield,
   ShieldAlert,
-  ShieldCheck,
-  Sparkles,
-  Square,
-  Trash2,
-  Unlock,
-  WifiOff,
-  X,
-  XCircle,
 } from 'lucide-react';
-import { AppConfig, AppStateSnapshot } from '../shared/types';
-import { COMMON_COUNTRIES, getCountryNameZh, isValidIsoCountryCode } from '../shared/countries';
-import { inspectProcessPattern } from '../shared/processPattern';
-import { getTargetServiceVerificationError } from '../shared/probeValidation';
-import {
-  DEFAULT_CHINA_REGION_CODE,
-  DEFAULT_CHINA_TIMEZONE_ID,
-  isWindowsLocaleMatchingCountry,
-} from '../shared/timezones';
-import { CountryFlag } from './CountryFlag';
-import { ClashNodeSelector } from './ClashNodeSelector';
-import { PrivateKernelStatus } from './PrivateKernelStatus';
-
-type ActiveTab = 'launcher' | 'monitor' | 'settings' | 'logs';
-type LauncherSubTab = 'antigravity' | 'claude';
-type MonitorSubTab = 'status' | 'guard';
+import { AntigravityLauncherPane } from './dashboard/AntigravityLauncherPane';
+import { ClaudeLauncherPane } from './dashboard/ClaudeLauncherPane';
+import { DashboardNavTabs } from './dashboard/DashboardNavTabs';
+import { DashboardTitlebar } from './dashboard/DashboardTitlebar';
+import { LogsPane } from './dashboard/LogsPane';
+import { MonitorStatusPane } from './dashboard/MonitorStatusPane';
+import { ProcessGuardPane } from './dashboard/ProcessGuardPane';
+import { SettingsPane } from './dashboard/SettingsPane';
+import { UpdateModalDialog } from './dashboard/UpdateModalDialog';
+import { useDashboardController } from './dashboard/useDashboardController';
 
 export const MainDashboard: React.FC = () => {
-  const [state, setState] = useState<AppStateSnapshot | null>(null);
-  const [activeTab, setActiveTab] = useState<ActiveTab>('launcher');
-  const [launcherSubTab, setLauncherSubTab] = useState<LauncherSubTab>('antigravity');
-  const [monitorSubTab, setMonitorSubTab] = useState<MonitorSubTab>('status');
-  const [copiedIp, setCopiedIp] = useState(false);
-  const [copiedAgIp, setCopiedAgIp] = useState(false);
+  const ctrl = useDashboardController();
 
-  // 手动代理表单本地编辑态
-  const [pendingManualMode, setPendingManualMode] = useState(false);
-  const [manualProto, setManualProto] = useState<'http' | 'socks5'>('http');
-  const [manualHost, setManualHost] = useState('127.0.0.1');
-  const [manualPort, setManualPort] = useState('7890');
-  const [dedicatedPortInput, setDedicatedPortInput] = useState('27897');
-  const [agDedicatedPortInput, setAgDedicatedPortInput] = useState('27898');
-
-  const [customProbe, setCustomProbe] = useState('');
-  const [probeUrlErr, setProbeUrlErr] = useState<string | null>(null);
-
-  // 进程匹配规则输入态
-  const [patternInput, setPatternInput] = useState('');
-  const [patternSubmitErr, setPatternSubmitErr] = useState<string | null>(null);
-
-  // 时区同步/还原即时反馈提示
-  const [localeFeedback, setLocaleFeedback] = useState<{
-    ok: boolean;
-    text: string;
-  } | null>(null);
-
-  // Claude 启动/终止操作状态与反馈
-  const [isLaunchingClaude, setIsLaunchingClaude] = useState(false);
-  const [isSwitchingNode, setIsSwitchingNode] = useState(false);
-  const [claudeFeedback, setClaudeFeedback] = useState<{
-    ok: boolean;
-    text: string;
-  } | null>(null);
-
-  // Antigravity 启动/终止操作状态与反馈
-  const [isLaunchingAg, setIsLaunchingAg] = useState(false);
-  const [isSwitchingAgNode, setIsSwitchingAgNode] = useState(false);
-  const [agFeedback, setAgFeedback] = useState<{
-    ok: boolean;
-    text: string;
-  } | null>(null);
-
-  // 低频路径与端口设置折叠态（未检测到安装路径时自动展开）
-  const [agSettingsOpen, setAgSettingsOpen] = useState(false);
-  const [claudeSettingsOpen, setClaudeSettingsOpen] = useState(false);
-
-  // 运行中应用破坏性操作（重启/强杀/切换节点/改端口）二次确认态
-  const [pendingAgConfirm, setPendingAgConfirm] = useState<'restart' | 'kill' | null>(null);
-  const [pendingClaudeConfirm, setPendingClaudeConfirm] = useState<
-    | { type: 'kill' }
-    | { type: 'switch-node'; nodeName: string | null; profileUid: string | null }
-    | { type: 'change-port'; port: number }
-    | { type: 'toggle-ipv4'; enabled: boolean }
-    | null
-  >(null);
-
-  // 全局非启动器页操作提示/错误反馈
-  const [globalNotice, setGlobalNotice] = useState<{
-    ok: boolean;
-    text: string;
-  } | null>(null);
-
-  // 版本更新弹窗、二次确认（Claude 运行时）、本地重入锁与内联反馈
-  const [updateModalOpen, setUpdateModalOpen] = useState(false);
-  const [pendingUpdateConfirm, setPendingUpdateConfirm] = useState(false);
-  const [isApplyingUpdate, setIsApplyingUpdate] = useState(false);
-  const [updateFeedback, setUpdateFeedback] = useState<{
-    ok: boolean;
-    text: string;
-  } | null>(null);
-
-  useEffect(() => {
-    const initialHash = window.location.hash.replace(/^#/, '');
-    if (initialHash === 'update-modal' || initialHash === 'update-confirm') {
-      setUpdateModalOpen(true);
-      if (initialHash === 'update-confirm') {
-        setPendingUpdateConfirm(true);
-      }
-      window.history.replaceState(
-        null,
-        '',
-        window.location.pathname + window.location.search
-      );
-    }
-
-    void window.guardAPI
-      .getState()
-      .then((initial) => {
-        setState(initial);
-        syncFormFromConfig(initial.config);
-      })
-      .catch(() => {
-        // ignore initial load error
-      });
-
-    const unsubState = window.guardAPI.onStateChanged((next) => {
-      setState(next);
-      if (next.updateState.status !== 'applying') {
-        setIsApplyingUpdate(false);
-      }
-    });
-
-    const unsubOpenUpdate = window.guardAPI.onOpenUpdateModal(({ confirmClaude }) => {
-      setPendingUpdateConfirm(Boolean(confirmClaude));
-      setUpdateModalOpen(true);
-    });
-
-    return () => {
-      unsubState();
-      unsubOpenUpdate();
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!updateModalOpen) return;
-    const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === 'Escape' && !isApplyingUpdate && state?.updateState.status !== 'applying') {
-        setUpdateModalOpen(false);
-        setPendingUpdateConfirm(false);
-      }
-    };
-    window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [updateModalOpen, isApplyingUpdate, state?.updateState.status]);
-
-  const syncFormFromConfig = (cfg: AppConfig) => {
-    setManualProto(cfg.manualProxy.protocol);
-    setManualHost(cfg.manualProxy.host);
-    setManualPort(String(cfg.manualProxy.port));
-    setDedicatedPortInput(String(cfg.dedicatedProxyPort));
-    setAgDedicatedPortInput(String(cfg.antigravityDedicatedPort));
-    setCustomProbe(cfg.customProbeUrl);
-  };
-
-  useEffect(() => {
-    if (!state) return;
-    setDedicatedPortInput(String(state.config.dedicatedProxyPort));
-    setAgDedicatedPortInput(String(state.config.antigravityDedicatedPort));
-    setCustomProbe(state.config.customProbeUrl);
-    if (!pendingManualMode) {
-      setManualProto(state.config.manualProxy.protocol);
-      setManualHost(state.config.manualProxy.host);
-      setManualPort(String(state.config.manualProxy.port));
-    }
-  }, [
-    state?.config.dedicatedProxyPort,
-    state?.config.antigravityDedicatedPort,
-    state?.config.customProbeUrl,
-    state?.config.manualProxy.protocol,
-    state?.config.manualProxy.host,
-    state?.config.manualProxy.port,
-    pendingManualMode,
-  ]);
-
-  useEffect(() => {
-    if (!state?.antigravityState.running && pendingAgConfirm) {
-      setPendingAgConfirm(null);
-    }
-  }, [state?.antigravityState.running, pendingAgConfirm]);
-
-  useEffect(() => {
-    if (!state) return;
-    const claudeActive = Boolean(
-      state.claudeState.running || state.claudeState.authorizedSession
-    );
-    if (!claudeActive && pendingClaudeConfirm) {
-      setPendingClaudeConfirm(null);
-    }
-    if (!claudeActive && pendingUpdateConfirm) {
-      setPendingUpdateConfirm(false);
-    }
-  }, [
-    state,
-    pendingClaudeConfirm,
-    pendingUpdateConfirm,
-  ]);
-
-  if (!state) {
+  if (!ctrl.ready) {
     return (
       <div className="app-loading">
         <RefreshCw className="spin" size={24} />
@@ -243,1148 +31,78 @@ export const MainDashboard: React.FC = () => {
     );
   }
 
-  const {
-    status,
-    isChecking,
-    isSyncingLocale,
-    config,
-    winLocale,
-    lastProbe,
-    lastError,
-    clashInfo,
-    claudeState,
-    antigravityState,
-    updateState,
-    logs,
-  } = state;
-  const claudeVerificationError = getTargetServiceVerificationError(claudeState.nodeProbe);
-  const claudeFallbackDetectedCode = claudeState.nodeProbe
-    ? isValidIsoCountryCode(claudeState.nodeProbe.claudeTraceCountryCode)
-      ? claudeState.nodeProbe.claudeTraceCountryCode.toUpperCase()
-      : isValidIsoCountryCode(claudeState.nodeProbe.claudeTraceLoc)
-      ? claudeState.nodeProbe.claudeTraceLoc.toUpperCase()
-      : null
-    : null;
-
-  const displayedProxyMode = pendingManualMode ? 'manual' : config.proxyMode;
-
-  const handleCopyIp = () => {
-    if (!lastProbe?.ip) return;
-    void navigator.clipboard.writeText(lastProbe.ip);
-    setCopiedIp(true);
-    setTimeout(() => setCopiedIp(false), 1600);
-  };
-
-  const handleCopyAgIp = () => {
-    if (!antigravityState.nodeProbe?.ip) return;
-    void navigator.clipboard.writeText(antigravityState.nodeProbe.ip);
-    setCopiedAgIp(true);
-    setTimeout(() => setCopiedAgIp(false), 1600);
-  };
-
-  const extractErrorMessage = (err: unknown): string => {
-    const raw = err instanceof Error ? err.message : String(err || '操作失败');
-    return raw.replace(/^Error invoking remote method '[^']+':\s*(Error:\s*)?/i, '').trim();
-  };
-
-  const showTimedClaudeFeedback = (ok: boolean, text: string) => {
-    setClaudeFeedback({ ok, text });
-    setTimeout(() => {
-      setClaudeFeedback((prev) => (prev && prev.text === text ? null : prev));
-    }, 6000);
-  };
-
-  const showTimedAgFeedback = (ok: boolean, text: string) => {
-    setAgFeedback({ ok, text });
-    setTimeout(() => {
-      setAgFeedback((prev) => (prev && prev.text === text ? null : prev));
-    }, 6000);
-  };
-
-  const showTimedLocaleFeedback = (ok: boolean, text: string) => {
-    setLocaleFeedback({ ok, text });
-    setTimeout(() => {
-      setLocaleFeedback((prev) => (prev && prev.text === text ? null : prev));
-    }, 5500);
-  };
-
-  const showTimedGlobalNotice = (ok: boolean, text: string) => {
-    setGlobalNotice({ ok, text });
-    setTimeout(() => {
-      setGlobalNotice((prev) => (prev && prev.text === text ? null : prev));
-    }, 5000);
-  };
-
-  const notifyError = (
-    err: unknown,
-    target: 'ag' | 'claude' | 'locale' | 'global' = 'global'
-  ) => {
-    const msg = extractErrorMessage(err);
-    if (target === 'ag') showTimedAgFeedback(false, msg);
-    else if (target === 'claude') showTimedClaudeFeedback(false, msg);
-    else if (target === 'locale') showTimedLocaleFeedback(false, msg);
-    else showTimedGlobalNotice(false, msg);
-  };
-
-  const updateConfigSafe = async (
-    partial: Partial<AppConfig>,
-    target: 'ag' | 'claude' | 'locale' | 'global' = 'global',
-    options?: { confirmTerminateClaude?: boolean }
-  ): Promise<AppStateSnapshot | null> => {
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const next = await window.guardAPI.updateConfig(partial, options);
-        setState(next);
-        return next;
-      } catch (err) {
-        const msg = extractErrorMessage(err);
-        if (attempt < 2 && msg.includes('正在进行')) {
-          await new Promise((r) => setTimeout(r, 320));
-          continue;
-        }
-        if (
-          msg.includes('CLAUDE_RUNNING_CONFIRM_REQUIRED:') &&
-          typeof partial.claudeForceIpv4 === 'boolean'
-        ) {
-          const fresh = await window.guardAPI.getState().catch(() => null);
-          if (fresh) setState(fresh);
-          setPendingClaudeConfirm({
-            type: 'toggle-ipv4',
-            enabled: partial.claudeForceIpv4,
-          });
-          return null;
-        }
-        notifyError(err, target);
-        return null;
-      }
-    }
-    return null;
-  };
-
-  const executeSelectClaudeNode = async (
-    nodeName: string | null,
-    profileUid: string | null
-  ) => {
-    setPendingClaudeConfirm(null);
-    setIsSwitchingNode(true);
-    try {
-      const next = await window.guardAPI.selectClashNode(nodeName, profileUid);
-      setState(next);
-    } catch (err) {
-      notifyError(err, 'claude');
-    } finally {
-      setIsSwitchingNode(false);
-    }
-  };
-
-  const handleSelectClaudeNode = async (
-    nodeName: string | null,
-    profileUid: string | null
-  ) => {
-    const isSame =
-      nodeName === config.selectedClashNode &&
-      (profileUid || null) === (config.selectedClashProfileUid || null);
-    if (isSame) return;
-
-    if (claudeState.running) {
-      setPendingClaudeConfirm({
-        type: 'switch-node',
-        nodeName,
-        profileUid,
-      });
-      return;
-    }
-
-    await executeSelectClaudeNode(nodeName, profileUid);
-  };
-
-  const handleSelectAntigravityNode = async (
-    nodeName: string | null,
-    profileUid: string | null
-  ) => {
-    const wasRunning = antigravityState.running && antigravityState.proxiedSession;
-    setIsSwitchingAgNode(true);
-    setAgFeedback(null);
-    try {
-      const next = await window.guardAPI.selectAntigravityClashNode(nodeName, profileUid);
-      setState(next);
-      if (!nodeName) return;
-
-      const selectedNode = nodeName.trim();
-      const selectedProfileUid = profileUid?.trim() || next.config.antigravityClashProfileUid;
-      const bindingMatched =
-        next.privateChannels.antigravity.phase === 'ready' &&
-        next.privateChannels.antigravity.nodeName === selectedNode &&
-        next.privateChannels.antigravity.profileUid === selectedProfileUid &&
-        next.privateChannels.antigravity.port === next.config.antigravityDedicatedPort;
-      if (!bindingMatched || next.antigravityState.nodeProbeError) {
-        showTimedAgFeedback(
-          false,
-          next.antigravityState.nodeProbeError || `节点 [${selectedNode}] 的专属代理绑定未就绪`
-        );
-        return;
-      }
-
-      if (wasRunning) {
-        showTimedAgFeedback(
-          true,
-          `专属端口已绑定至节点 [${selectedNode}]`
-        );
-      }
-    } catch (err) {
-      notifyError(err, 'ag');
-    } finally {
-      setIsSwitchingAgNode(false);
-    }
-  };
-
-  const handleLaunchClaude = async () => {
-    setPendingClaudeConfirm(null);
-    setIsLaunchingClaude(true);
-    setClaudeFeedback(null);
-    try {
-      const res = await window.guardAPI.launchClaude();
-      setState(res.state);
-      showTimedClaudeFeedback(res.ok, res.message);
-    } catch (err) {
-      notifyError(err, 'claude');
-    } finally {
-      setIsLaunchingClaude(false);
-    }
-  };
-
-  const executeTerminateClaude = async () => {
-    setPendingClaudeConfirm(null);
-    setClaudeFeedback(null);
-    try {
-      const res = await window.guardAPI.terminateClaudeNow();
-      setState(res.state);
-      showTimedClaudeFeedback(res.ok, res.message);
-    } catch (err) {
-      notifyError(err, 'claude');
-    }
-  };
-
-  const handleTerminateClaude = () => {
-    if (claudeState.running) {
-      setPendingClaudeConfirm({ type: 'kill' });
-      return;
-    }
-    void executeTerminateClaude();
-  };
-
-  const handleSyncLocaleFromClaude = async () => {
-    setClaudeFeedback(null);
-    try {
-      const res = await window.guardAPI.syncSystemLocaleToDefault('claude');
-      setState(res.state);
-      showTimedClaudeFeedback(res.ok, res.message);
-    } catch (err) {
-      notifyError(err, 'claude');
-    }
-  };
-
-  const executeLaunchAntigravity = async () => {
-    setPendingAgConfirm(null);
-    setIsLaunchingAg(true);
-    setAgFeedback(null);
-    try {
-      const res = await window.guardAPI.launchAntigravity();
-      setState(res.state);
-      showTimedAgFeedback(res.ok, res.message);
-    } catch (err) {
-      notifyError(err, 'ag');
-    } finally {
-      setIsLaunchingAg(false);
-    }
-  };
-
-  const handleLaunchAntigravity = () => {
-    if (antigravityState.running) {
-      setPendingAgConfirm('restart');
-      return;
-    }
-    void executeLaunchAntigravity();
-  };
-
-  const executeTerminateAntigravity = async () => {
-    setPendingAgConfirm(null);
-    setAgFeedback(null);
-    try {
-      const res = await window.guardAPI.terminateAntigravityNow();
-      setState(res.state);
-      showTimedAgFeedback(res.ok, res.message);
-    } catch (err) {
-      notifyError(err, 'ag');
-    }
-  };
-
-  const handleTerminateAntigravity = () => {
-    if (antigravityState.running) {
-      setPendingAgConfirm('kill');
-      return;
-    }
-    void executeTerminateAntigravity();
-  };
-
-  const executeToggleClaudeForceIpv4 = async (
-    enabled: boolean,
-    confirmTerminateClaude = false
-  ) => {
-    setPendingClaudeConfirm(null);
-    setIsSwitchingNode(true);
-    try {
-      const next = await updateConfigSafe(
-        { claudeForceIpv4: enabled },
-        'claude',
-        { confirmTerminateClaude }
-      );
-      if (next) {
-        showTimedClaudeFeedback(
-          true,
-          enabled
-            ? '已开启 Claude 通道强制仅走 IPv4 出站'
-            : '已关闭强制仅走 IPv4 出站（允许双栈/IPv6 节点）'
-        );
-      }
-    } finally {
-      setIsSwitchingNode(false);
-    }
-  };
-
-  const handleToggleClaudeForceIpv4 = (enabled: boolean) => {
-    if (enabled === config.claudeForceIpv4) return;
-    if (claudeState.running && config.selectedClashNode) {
-      setPendingClaudeConfirm({ type: 'toggle-ipv4', enabled });
-      return;
-    }
-    void executeToggleClaudeForceIpv4(enabled, false);
-  };
-
-  const executeSaveDedicatedPort = async (portNum: number) => {
-    setPendingClaudeConfirm(null);
-    setIsSwitchingNode(true);
-    try {
-      const next = await updateConfigSafe(
-        { dedicatedProxyPort: portNum },
-        'claude'
-      );
-      if (next) {
-        showTimedClaudeFeedback(
-          true,
-          `Claude 专属代理端口已更新为 127.0.0.1:${portNum}`
-        );
-      }
-    } finally {
-      setIsSwitchingNode(false);
-    }
-  };
-
-  const handleSaveDedicatedPort = async () => {
-    let portNum = Math.max(
-      1024,
-      Math.min(65535, Math.round(Number(dedicatedPortInput) || 27897))
-    );
-    if (portNum === config.antigravityDedicatedPort) {
-      portNum = portNum === 27897 ? 27896 : 27897;
-      showTimedClaudeFeedback(
-        false,
-        `端口不能与 Antigravity 专属端口 (${config.antigravityDedicatedPort}) 相同，已自动调整为 ${portNum}`
-      );
-    }
-    setDedicatedPortInput(String(portNum));
-    if (portNum === config.dedicatedProxyPort) return;
-    if (claudeState.running) {
-      setPendingClaudeConfirm({ type: 'change-port', port: portNum });
-      return;
-    }
-    await executeSaveDedicatedPort(portNum);
-  };
-
-  const handleSaveAgDedicatedPort = async () => {
-    let portNum = Math.max(
-      1024,
-      Math.min(65535, Math.round(Number(agDedicatedPortInput) || 27898))
-    );
-    if (portNum === config.dedicatedProxyPort) {
-      portNum = portNum === 27898 ? 27899 : 27898;
-      showTimedAgFeedback(
-        false,
-        `端口不能与 Claude 专属端口 (${config.dedicatedProxyPort}) 相同，已自动调整为 ${portNum}`
-      );
-    }
-    setAgDedicatedPortInput(String(portNum));
-    if (portNum === config.antigravityDedicatedPort) return;
-    setIsSwitchingAgNode(true);
-    try {
-      const next = await updateConfigSafe(
-        { antigravityDedicatedPort: portNum },
-        'ag'
-      );
-      if (next) {
-        showTimedAgFeedback(
-          true,
-          `Antigravity 专属代理端口已更新为 127.0.0.1:${portNum}${
-            antigravityState.running
-              ? '（运行中的 Antigravity 需重启后才使用新端口）'
-              : ''
-          }`
-        );
-      }
-    } finally {
-      setIsSwitchingAgNode(false);
-    }
-  };
-
-  const handleSwitchNonManualMode = async (mode: 'auto' | 'direct') => {
-    setPendingManualMode(false);
-    if (config.proxyMode === mode) return;
-    await updateConfigSafe({ proxyMode: mode }, 'global');
-  };
-
-  const handleSaveManualProxy = async () => {
-    const cleanHost = manualHost.trim() || '127.0.0.1';
-    const portNum = Math.max(1, Math.min(65535, Math.round(Number(manualPort) || 7890)));
-    setManualHost(cleanHost);
-    setManualPort(String(portNum));
-    setPendingManualMode(false);
-
-    await updateConfigSafe(
-      {
-        proxyMode: 'manual',
-        manualProxy: {
-          protocol: manualProto,
-          host: cleanHost,
-          port: portNum,
-        },
-      },
-      'global'
-    );
-  };
-
-  const handleSaveCustomProbe = async () => {
-    const trimmed = customProbe.trim();
-    if (trimmed) {
-      try {
-        const parsed = new URL(trimmed);
-        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-          setProbeUrlErr('探测地址必须以 https:// 或 http:// 开头');
-          return;
-        }
-      } catch {
-        setProbeUrlErr('请输入合法的完整 URL，例如 https://cp.cloudflare.com/cdn-cgi/trace');
-        return;
-      }
-    }
-    setProbeUrlErr(null);
-    setCustomProbe(trimmed);
-    const next = await updateConfigSafe({ customProbeUrl: trimmed }, 'global');
-    if (next) {
-      showTimedGlobalNotice(true, trimmed ? '已更新自定义探测源并重新检测' : '已恢复默认全球探测源');
-    }
-  };
-
-  const handleSyncLocale = async () => {
-    setLocaleFeedback(null);
-    try {
-      const res = await window.guardAPI.syncSystemLocaleToDefault('monitor');
-      setState(res.state);
-      showTimedLocaleFeedback(res.ok, res.message);
-    } catch (err) {
-      notifyError(err, 'locale');
-    }
-  };
-
-  const handleRestoreLocale = async () => {
-    setLocaleFeedback(null);
-    try {
-      const res = await window.guardAPI.restoreDefaultChinaLocale();
-      setState(res.state);
-      showTimedLocaleFeedback(res.ok, res.message);
-    } catch (err) {
-      notifyError(err, 'locale');
-    }
-  };
-
-  const handleAddPattern = async () => {
-    const check = inspectProcessPattern(patternInput);
-    if (!check.valid) {
-      setPatternSubmitErr(check.error || '规则格式不正确');
-      return;
-    }
-
-    const exists = config.protectedProcessPatterns.some(
-      (p) => p.toLowerCase() === check.normalized.toLowerCase()
-    );
-    if (exists) {
-      setPatternSubmitErr('该规则已在守护列表中');
-      return;
-    }
-
-    setPatternSubmitErr(null);
-    setPatternInput('');
-    await updateConfigSafe(
-      {
-        protectedProcessPatterns: [...config.protectedProcessPatterns, check.normalized],
-      },
-      'global'
-    );
-  };
-
-  const handleRemovePattern = async (target: string) => {
-    const filtered = config.protectedProcessPatterns.filter((p) => p !== target);
-    await updateConfigSafe({ protectedProcessPatterns: filtered }, 'global');
-  };
-
-  const showTimedUpdateFeedback = (ok: boolean, text: string) => {
-    setUpdateFeedback({ ok, text });
-    setTimeout(() => {
-      setUpdateFeedback((cur) => (cur?.text === text ? null : cur));
-    }, 5500);
-  };
-
-  const closeUpdateModal = () => {
-    if (isApplyingUpdate || updateState.status === 'applying') {
-      return;
-    }
-    setUpdateModalOpen(false);
-    setPendingUpdateConfirm(false);
-  };
-
-  const handleOpenReleasePage = () => {
-    void window.guardAPI.openReleasePage().catch((err) => {
-      showTimedUpdateFeedback(false, extractErrorMessage(err));
-    });
-  };
-
-  const handleSwitchMainTab = (nextTab: ActiveTab) => {
-    if (nextTab !== activeTab) {
-      setPendingUpdateConfirm(false);
-    }
-    setActiveTab(nextTab);
-  };
-
-  const handleCheckForUpdates = async () => {
-    setUpdateFeedback(null);
-    try {
-      const res = await window.guardAPI.checkForUpdates();
-      setState(res.state);
-      showTimedUpdateFeedback(res.ok, res.message);
-    } catch (err) {
-      showTimedUpdateFeedback(false, extractErrorMessage(err));
-    }
-  };
-
-  const handleDownloadUpdate = async () => {
-    setUpdateFeedback(null);
-    try {
-      const res = await window.guardAPI.downloadUpdate();
-      setState(res.state);
-      showTimedUpdateFeedback(res.ok, res.message);
-    } catch (err) {
-      showTimedUpdateFeedback(false, extractErrorMessage(err));
-    }
-  };
-
-  const executeApplyUpdate = async (allowTerminateClaude: boolean) => {
-    if (isApplyingUpdate || updateState.status === 'applying') {
-      return;
-    }
-    setIsApplyingUpdate(true);
-    setPendingUpdateConfirm(false);
-    setUpdateFeedback(null);
-    try {
-      const res = await window.guardAPI.applyUpdateNow(allowTerminateClaude);
-      setState(res.state);
-      if (!res.ok) {
-        setIsApplyingUpdate(false);
-      }
-      showTimedUpdateFeedback(res.ok, res.message);
-    } catch (err) {
-      setIsApplyingUpdate(false);
-      showTimedUpdateFeedback(false, extractErrorMessage(err));
-    }
-  };
-
-  const isClaudeActiveForUpdate =
-    claudeState.running || claudeState.authorizedSession;
-
-  const handleClickApplyUpdate = () => {
-    if (isApplyingUpdate || updateState.status === 'applying') {
-      return;
-    }
-    if (isClaudeActiveForUpdate) {
-      setPendingUpdateConfirm(true);
-      return;
-    }
-    void executeApplyUpdate(false);
-  };
-
-  const isUpdateBusy =
-    isApplyingUpdate ||
-    updateState.status === 'checking' ||
-    updateState.status === 'downloading' ||
-    updateState.status === 'applying';
-
-  const hasNewUpdate = updateState.hasUpdate && Boolean(updateState.latestVersion);
-
-  const canLockCurrentProbe = Boolean(lastProbe && isValidIsoCountryCode(lastProbe.countryCode));
-
-  const isCurrentAlreadyDefault =
-    canLockCurrentProbe &&
-    Boolean(config.defaultCountryCode) &&
-    lastProbe?.countryCode === config.defaultCountryCode;
-
-  const isCustomCountryOutsideCommon = Boolean(
-    config.defaultCountryCode &&
-      !COMMON_COUNTRIES.some((c) => c.code === config.defaultCountryCode)
-  );
-
-  const probeValid = Boolean(lastProbe && isValidIsoCountryCode(lastProbe.countryCode));
-
-  const effectiveTargetCode =
-    config.defaultCountryCode || (probeValid ? lastProbe?.countryCode : null) || null;
-
-  const effectiveTargetName =
-    config.defaultCountryName || (probeValid ? lastProbe?.countryName : null) || null;
-
-  const isWinLocaleMatched = effectiveTargetCode
-    ? isWindowsLocaleMatchingCountry(
-        winLocale.timeZoneId,
-        winLocale.regionCode,
-        effectiveTargetCode
-      )
-    : true;
-
-  const isLocaleOnlyMismatch =
-    status === 'mismatch' &&
-    (!config.defaultCountryCode ||
-      lastProbe?.countryCode?.toUpperCase() === config.defaultCountryCode.toUpperCase()) &&
-    !isWinLocaleMatched;
-
-  const statusMeta = {
-    ok: {
-      badge: isWinLocaleMatched
-        ? '状态正常 · 代理与时区一致'
-        : '代理通道正常 · 未锁定保护地区',
-      cls: 'status-ok',
-      icon: <ShieldCheck size={18} />,
-    },
-    mismatch: isLocaleOnlyMismatch
-      ? {
-          badge: '提醒 · 代理地区正常，系统时区尚未同步',
-          cls: 'status-locale-warn',
-          icon: <AlertTriangle size={18} />,
-        }
-      : {
-          badge: '警告 · 代理出口偏离默认保护地区！',
-          cls: 'status-mismatch',
-          icon: <ShieldAlert size={18} />,
-        },
-    error: {
-      badge: '异常 · 代理连接失败',
-      cls: 'status-error',
-      icon: <WifiOff size={18} />,
-    },
-    unset: {
-      badge: '待选择节点或保护地区',
-      cls: 'status-unset',
-      icon: <Shield size={18} />,
-    },
-    checking: {
-      badge: '正在检测出口地区...',
-      cls: 'status-checking',
-      icon: <RefreshCw className="spin" size={18} />,
-    },
-  }[status];
-
-  const isAlreadyChinaDefaultLocale =
-    winLocale.regionCode.toUpperCase() === DEFAULT_CHINA_REGION_CODE &&
-    winLocale.timeZoneId.toLowerCase() === DEFAULT_CHINA_TIMEZONE_ID.toLowerCase();
-
-  const livePatternCheck = patternInput.trim() ? inspectProcessPattern(patternInput) : null;
-
-  const installTypeLabel = {
-    'msix-alias': 'MSIX 别名',
-    'msix-direct': 'MSIX 直连',
-    squirrel: '独立版',
-    custom: '自定义路径',
-    'not-found': '未找到路径',
-  }[claudeState.installType];
-
-  const agInstallTypeLabel = {
-    standard: '已自动识别安装路径',
-    custom: '手动指定路径',
-    'not-found': '未找到安装路径',
-  }[antigravityState.installType];
-
-  const isAgSettingsExpanded =
-    agSettingsOpen || antigravityState.installType === 'not-found';
-  const isClaudeSettingsExpanded =
-    claudeSettingsOpen || claudeState.installType === 'not-found';
-
-  const launcherTabDotClass =
-    (antigravityState.running && antigravityState.proxiedSession) || claudeState.running
-      ? 'running'
-      : antigravityState.canLaunch || claudeState.canLaunch
-      ? 'ready'
-      : 'locked';
-
-  const monitorTabDotClass =
-    status === 'ok'
-      ? 'running'
-      : status === 'error' || (status === 'mismatch' && !isLocaleOnlyMismatch)
-      ? 'locked'
-      : isLocaleOnlyMismatch
-      ? 'external'
-      : status === 'checking'
-      ? 'checking'
-      : 'ready';
-
-  const titlebarDotClass =
-    activeTab === 'launcher'
-      ? launcherSubTab === 'antigravity'
-        ? (antigravityState.running && antigravityState.proxiedSession) ||
-          antigravityState.canLaunch
-          ? 'status-ok'
-          : statusMeta.cls
-        : claudeState.running || claudeState.canLaunch
-        ? 'status-ok'
-        : statusMeta.cls
-      : statusMeta.cls;
-
-  const clashHeaderBadgeText = `${clashInfo.profileGroups.length} 个本地订阅 · ${clashInfo.availableNodes.length} 个节点`;
-
-  const closeButtonTitle = config.closeToTray
-    ? '隐藏到系统托盘'
-    : '关闭管理界面（后台、私有代理和安全检查继续运行）';
-
-  const renderUpdateReleaseBox = (inModal: boolean) => {
-    if (!hasNewUpdate || !updateState.latestVersion) {
-      return null;
-    }
-    return (
-      <div className={`update-release-box ${inModal ? 'in-modal' : ''}`}>
-        <div className="update-release-top">
-          <div className="update-version-jump">
-            <span className="ver-old">v{updateState.currentVersion}</span>
-            <span className="ver-arrow">→</span>
-            <span className="ver-new">v{updateState.latestVersion}</span>
-            {updateState.publishedAt && formatReleaseDate(updateState.publishedAt) && (
-              <span className="update-pub-date">
-                {formatReleaseDate(updateState.publishedAt)}
-              </span>
-            )}
-          </div>
-          <div className="update-badges-row">
-            {!updateState.isPackaged ? (
-              <span className="update-tag source-mode">🛠️ 源码模式 · 仅提示</span>
-            ) : (
-              updateState.deliveryMode && (
-                <span className="update-tag mode">
-                  {updateState.deliveryMode === 'asar'
-                    ? `⚡ 增量热更 · ${formatBytes(updateState.downloadTotalBytes)}${
-                        updateState.includeMmdbUpdate ? ' (含新离线库)' : ''
-                      }`
-                    : `📦 完整包 · ${formatBytes(updateState.downloadTotalBytes)}`}
-                </span>
-              )
-            )}
-            {updateState.signatureVerified && (
-              <span className="update-tag verified">
-                <ShieldCheck size={11} />
-                <span>Ed25519 已验签</span>
-              </span>
-            )}
-          </div>
-        </div>
-
-        <div className={`update-notes-box ${inModal ? 'in-modal' : ''}`}>
-          {updateState.releaseNotes || '暂无版本更新日志说明'}
-        </div>
-
-        {updateState.status === 'downloading' && (
-          <div className="update-progress-wrap">
-            <div className="update-progress-track">
-              <div
-                className="update-progress-fill"
-                style={{
-                  width: `${Math.max(2, updateState.progressPercent ?? 0)}%`,
-                }}
-              />
-            </div>
-            <div className="update-progress-meta">
-              <span>正在下载并校验完整性...</span>
-              <span>
-                {updateState.progressPercent ?? 0}% (
-                {formatBytes(updateState.downloadedBytes)} /{' '}
-                {formatBytes(updateState.downloadTotalBytes)})
-              </span>
-            </div>
-          </div>
-        )}
-
-        {pendingUpdateConfirm && isClaudeActiveForUpdate && (
-          <div className="inline-confirm-bar">
-            <div className="confirm-bar-text">
-              <AlertTriangle size={15} />
-              <span>
-                Claude 正在受控守护运行中，重启更新将先安全终止当前 Claude 会话（保持 Antigravity 正常运行），并在完成替换后自动重新启动本程序。
-              </span>
-            </div>
-            <div className="confirm-bar-actions">
-              <button
-                type="button"
-                className="btn-confirm-danger"
-                disabled={isApplyingUpdate || updateState.status === 'applying'}
-                onClick={() => void executeApplyUpdate(true)}
-              >
-                确认终止 Claude 并立即更新
-              </button>
-              <button
-                type="button"
-                className="btn-confirm-cancel"
-                disabled={isApplyingUpdate || updateState.status === 'applying'}
-                onClick={() => setPendingUpdateConfirm(false)}
-              >
-                取消
-              </button>
-            </div>
-          </div>
-        )}
-
-        <div className="update-action-row">
-          {!updateState.isPackaged ? (
-            <button
-              type="button"
-              className="btn-update-primary"
-              onClick={handleOpenReleasePage}
-            >
-              <ExternalLink size={14} />
-              <span>前往 GitHub Release 下载正式包</span>
-            </button>
-          ) : updateState.status === 'downloaded' || updateState.status === 'applying' ? (
-            <button
-              type="button"
-              className="btn-update-ready"
-              disabled={isApplyingUpdate || updateState.status === 'applying'}
-              onClick={handleClickApplyUpdate}
-            >
-              <Rocket size={14} />
-              <span>
-                {isApplyingUpdate || updateState.status === 'applying'
-                  ? '正在启动更新助手并重启...'
-                  : `立即重启并更新至 v${updateState.latestVersion}`}
-              </span>
-            </button>
-          ) : updateState.status === 'downloading' ? (
-            <button type="button" className="btn-update-primary" disabled>
-              <RefreshCw className="spin" size={14} />
-              <span>正在后台下载更新包...</span>
-            </button>
-          ) : updateState.status === 'checking' ? (
-            <button type="button" className="btn-update-primary" disabled>
-              <RefreshCw className="spin" size={14} />
-              <span>正在刷新版本信息...</span>
-            </button>
-          ) : (
-            <button
-              type="button"
-              className="btn-update-primary"
-              disabled={isUpdateBusy}
-              onClick={() => void handleDownloadUpdate()}
-            >
-              <Download size={14} />
-              <span>
-                {updateState.status === 'error'
-                  ? `重试下载更新包 (${formatBytes(updateState.downloadTotalBytes)})`
-                  : `下载更新包 (${formatBytes(updateState.downloadTotalBytes)})`}
-              </span>
-            </button>
-          )}
-
-          {inModal && (
-            <button
-              type="button"
-              className="btn-update-secondary"
-              disabled={isApplyingUpdate || updateState.status === 'applying'}
-              onClick={closeUpdateModal}
-            >
-              稍后
-            </button>
-          )}
-        </div>
-      </div>
-    );
-  };
+  const { state } = ctrl;
+  const { config, claudeState, antigravityState, updateState, logs } = state;
 
   return (
     <div className="dashboard-window">
-      {/* 自绘无边框标题栏 */}
-      <header className="titlebar drag-region">
-        <div className="titlebar-brand">
-          <span className={`brand-dot ${titlebarDotClass}`} />
-          <span className="brand-name">代理地区卫士</span>
-          {!hasNewUpdate && <span className="brand-sub">Proxy Region Guard</span>}
-          <span className="brand-version">v{updateState.currentVersion}</span>
-        </div>
-        <div className="titlebar-controls no-drag">
-          {hasNewUpdate && updateState.latestVersion && (
-            <button
-              type="button"
-              className={`titlebar-update-pill ${
-                updateState.status === 'downloaded' || updateState.status === 'applying'
-                  ? 'ready'
-                  : updateState.status === 'downloading'
-                  ? 'downloading'
-                  : 'available'
-              } ${updateModalOpen ? 'active' : ''}`}
-              onClick={() => {
-                if (updateModalOpen) {
-                  closeUpdateModal();
-                } else {
-                  setPendingUpdateConfirm(false);
-                  setUpdateModalOpen(true);
-                }
-              }}
-              title={
-                updateState.status === 'downloaded'
-                  ? `新版本 v${updateState.latestVersion} 已验签就绪，点击打开更新浮层`
-                  : updateState.status === 'downloading'
-                  ? `正在后台下载新版本 v${updateState.latestVersion} (${
-                      updateState.progressPercent ?? 0
-                    }%)`
-                  : `发现新版本 v${updateState.latestVersion}，点击查看详情并更新`
-              }
-            >
-              {updateState.status === 'downloaded' || updateState.status === 'applying' ? (
-                <>
-                  <Sparkles size={11} />
-                  <span className="update-pill-label">新版 v{updateState.latestVersion} 已就绪</span>
-                </>
-              ) : updateState.status === 'downloading' ? (
-                <>
-                  <RefreshCw className="spin" size={11} />
-                  <span className="update-pill-label">
-                    更新下载 {updateState.progressPercent ?? 0}%
-                  </span>
-                </>
-              ) : (
-                <>
-                  <span className="update-pill-dot" />
-                  <Download size={11} />
-                  <span className="update-pill-label">发现 v{updateState.latestVersion}</span>
-                </>
-              )}
-            </button>
-          )}
-          <button
-            className="win-btn"
-            onClick={() => window.guardAPI.minimizeMain()}
-            title="最小化"
-          >
-            <Minus size={15} />
-          </button>
-          <button
-            className="win-btn win-close"
-            onClick={() => window.guardAPI.closeMain()}
-            title={closeButtonTitle}
-          >
-            <X size={15} />
-          </button>
-        </div>
-      </header>
+      <DashboardTitlebar
+        titlebarDotClass={ctrl.titlebarDotClass}
+        hasNewUpdate={ctrl.hasNewUpdate}
+        updateState={updateState}
+        updateModalOpen={ctrl.updateModalOpen}
+        closeButtonTitle={ctrl.closeButtonTitle}
+        onToggleUpdateModal={() => {
+          if (ctrl.updateModalOpen) {
+            ctrl.closeUpdateModal();
+          } else {
+            ctrl.setPendingUpdateConfirm(false);
+            ctrl.setUpdateModalOpen(true);
+          }
+        }}
+        onMinimize={() => window.guardAPI.minimizeMain()}
+        onClose={() => window.guardAPI.closeMain()}
+      />
 
-      {/* 右上角轻量版本更新浮层弹窗（不切换底部当前标签页） */}
-      {updateModalOpen && (
-        <div
-          className="update-modal-backdrop"
-          onMouseDown={(e) => {
-            if (e.target === e.currentTarget) {
-              closeUpdateModal();
-            }
-          }}
-        >
-          <div className="update-modal-dialog" role="dialog" aria-modal="true">
-            <div className="update-modal-header">
-              <div className="panel-title">
-                <Sparkles size={15} />
-                <span>
-                  {hasNewUpdate
-                    ? updateState.status === 'downloaded' ||
-                      updateState.status === 'applying'
-                      ? '新版本已验签就绪'
-                      : '发现新版本更新'
-                    : '版本更新检查'}
-                </span>
-              </div>
-              <div className="update-header-actions">
-                <button
-                  type="button"
-                  className="btn-link-clear"
-                  onClick={handleOpenReleasePage}
-                  title="在浏览器中打开 GitHub Releases 页面"
-                >
-                  <ExternalLink size={12} />
-                  <span>GitHub</span>
-                </button>
-                <button
-                  type="button"
-                  className="update-modal-close"
-                  disabled={isApplyingUpdate || updateState.status === 'applying'}
-                  onClick={closeUpdateModal}
-                  title="关闭"
-                >
-                  <X size={15} />
-                </button>
-              </div>
-            </div>
+      <UpdateModalDialog
+        open={ctrl.updateModalOpen}
+        hasNewUpdate={ctrl.hasNewUpdate}
+        updateState={updateState}
+        updateFeedback={ctrl.updateFeedback}
+        isApplyingUpdate={ctrl.isApplyingUpdate}
+        isUpdateBusy={ctrl.isUpdateBusy}
+        pendingUpdateConfirm={ctrl.pendingUpdateConfirm}
+        isClaudeActiveForUpdate={ctrl.isClaudeActiveForUpdate}
+        onCloseModal={ctrl.closeUpdateModal}
+        onOpenReleasePage={ctrl.handleOpenReleasePage}
+        onCheckForUpdates={() => void ctrl.handleCheckForUpdates()}
+        onDownloadUpdate={() => void ctrl.handleDownloadUpdate()}
+        onClickApplyUpdate={ctrl.handleClickApplyUpdate}
+        onConfirmApplyUpdate={() => void ctrl.executeApplyUpdate(true)}
+        onCancelUpdateConfirm={() => ctrl.setPendingUpdateConfirm(false)}
+      />
 
-            {updateFeedback && (
-              <div className={`locale-feedback ${updateFeedback.ok ? 'ok' : 'err'}`}>
-                {updateFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
-                <span>{updateFeedback.text}</span>
-              </div>
-            )}
+      <DashboardNavTabs
+        activeTab={ctrl.activeTab}
+        launcherTabDotClass={ctrl.launcherTabDotClass}
+        killProcessesEnabled={config.killProcessesEnabled}
+        protectedPatternCount={config.protectedProcessPatterns.length}
+        hasNewUpdate={ctrl.hasNewUpdate}
+        updateStatus={updateState.status}
+        logsCount={logs.length}
+        onSelectTab={ctrl.handleSwitchMainTab}
+      />
 
-            {hasNewUpdate && Boolean(updateState.error) && !updateFeedback && (
-              <div className="locale-feedback err">
-                <AlertTriangle size={14} />
-                <span>{updateState.error}</span>
-              </div>
-            )}
-
-            {hasNewUpdate ? (
-              renderUpdateReleaseBox(true)
-            ) : (
-              <div className="update-modal-empty">
-                {updateState.status === 'checking' ? (
-                  <div className="update-modal-status-row">
-                    <RefreshCw className="spin" size={18} />
-                    <span>正在连接更新源并校验 Ed25519 数字签名...</span>
-                  </div>
-                ) : updateState.status === 'error' ? (
-                  <div className="update-modal-status-row is-error">
-                    <AlertTriangle size={18} />
-                    <div>
-                      <strong>版本更新检查未通过</strong>
-                      <p>{updateState.error || '连接更新服务器失败，请检查网络或代理状态后重试'}</p>
-                    </div>
-                  </div>
-                ) : updateState.lastSuccessfulCheckAt !== null ? (
-                  <div className="update-modal-status-row">
-                    <CheckCircle2 size={18} className="pulse-green" />
-                    <div>
-                      <strong>当前已是最新版本 (v{updateState.currentVersion})</strong>
-                      {updateState.lastCheckedAt && (
-                        <p>上次检查于 {formatTime(updateState.lastCheckedAt)}</p>
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="update-modal-status-row">
-                    <Info size={18} />
-                    <div>
-                      <strong>当前版本 v{updateState.currentVersion}</strong>
-                      <p>尚未执行检查，点击下方按钮可立即检测最新版本</p>
-                    </div>
-                  </div>
-                )}
-                <div className="update-action-row">
-                  <button
-                    type="button"
-                    className="btn-refresh"
-                    disabled={isUpdateBusy}
-                    onClick={() => void handleCheckForUpdates()}
-                  >
-                    <RefreshCw
-                      size={13}
-                      className={updateState.status === 'checking' ? 'spin' : ''}
-                    />
-                    <span>
-                      {updateState.status === 'checking'
-                        ? '正在检查...'
-                        : updateState.lastCheckedAt
-                        ? '重新检查'
-                        : '立即检查'}
-                    </span>
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-update-secondary"
-                    onClick={closeUpdateModal}
-                  >
-                    关闭
-                  </button>
-                </div>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* 顶部导航栏（精简为 4 个一级 Tab：启动器 / 实时监控 / 设置 / 日志） */}
-      <nav className="nav-tabs">
-        <button
-          className={`nav-tab ${activeTab === 'launcher' ? 'active' : ''}`}
-          onClick={() => handleSwitchMainTab('launcher')}
-        >
-          <Rocket size={14} />
-          <span>启动器</span>
-          <span className={`tab-status-dot ${launcherTabDotClass}`} />
-        </button>
-        <button
-          className={`nav-tab ${activeTab === 'monitor' ? 'active' : ''}`}
-          onClick={() => handleSwitchMainTab('monitor')}
-        >
-          <Activity size={14} />
-          <span>实时监控</span>
-          {config.killProcessesEnabled && config.protectedProcessPatterns.length > 0 && (
-            <span className="tab-count">{config.protectedProcessPatterns.length}</span>
-          )}
-        </button>
-        <button
-          className={`nav-tab ${activeTab === 'settings' ? 'active' : ''}`}
-          onClick={() => handleSwitchMainTab('settings')}
-        >
-          <Settings size={14} />
-          <span>设置</span>
-          {hasNewUpdate && (
-            <span
-              className={`tab-status-dot ${
-                updateState.status === 'downloaded' ? 'running' : 'external'
-              }`}
-            />
-          )}
-        </button>
-        <button
-          className={`nav-tab ${activeTab === 'logs' ? 'active' : ''}`}
-          onClick={() => handleSwitchMainTab('logs')}
-        >
-          <History size={14} />
-          <span>日志</span>
-          {logs.length > 0 && <span className="tab-count">{logs.length}</span>}
-        </button>
-      </nav>
-
-      {/* 内容主体 */}
       <main className="dashboard-content">
-        {globalNotice && activeTab !== 'launcher' && (
-          <div className={`locale-feedback global-top-notice ${globalNotice.ok ? 'ok' : 'err'}`}>
-            {globalNotice.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
-            <span>{globalNotice.text}</span>
+        {ctrl.globalNotice && ctrl.activeTab !== 'launcher' && (
+          <div
+            className={`locale-feedback global-top-notice ${
+              ctrl.globalNotice.ok ? 'ok' : 'err'
+            }`}
+          >
+            {ctrl.globalNotice.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
+            <span>{ctrl.globalNotice.text}</span>
           </div>
         )}
 
-        {activeTab === 'launcher' && (
+        {ctrl.activeTab === 'launcher' && (
           <div className="tab-pane">
-            {/* 启动器内部二级切换器：Antigravity 启动器 vs Claude 专栏 */}
             <div className="launcher-subtabs">
               <button
                 className={`launcher-subtab ${
-                  launcherSubTab === 'antigravity' ? 'active' : ''
+                  ctrl.launcherSubTab === 'antigravity' ? 'active' : ''
                 }`}
-                onClick={() => setLauncherSubTab('antigravity')}
+                onClick={() => ctrl.setLauncherSubTab('antigravity')}
               >
                 <Rocket size={14} />
                 <span>Antigravity 启动器</span>
@@ -1403,8 +121,10 @@ export const MainDashboard: React.FC = () => {
               </button>
 
               <button
-                className={`launcher-subtab ${launcherSubTab === 'claude' ? 'active' : ''}`}
-                onClick={() => setLauncherSubTab('claude')}
+                className={`launcher-subtab ${
+                  ctrl.launcherSubTab === 'claude' ? 'active' : ''
+                }`}
+                onClick={() => ctrl.setLauncherSubTab('claude')}
               >
                 <Bot size={14} />
                 <span>Claude 专栏</span>
@@ -1425,1182 +145,145 @@ export const MainDashboard: React.FC = () => {
               </button>
             </div>
 
-            {launcherSubTab === 'antigravity' ? (
-              <>
-                {/* 1. Antigravity 专属 Clash 节点选择卡（置顶首位，展开下拉列表空间充足） */}
-                <section className="panel-card">
-                  <div className="panel-card-header">
-                    <div className="panel-title">
-                      <Radio
-                        size={15}
-                        className={state.privateChannels.antigravity.phase === 'ready' ? 'pulse-green' : ''}
-                      />
-                      <span>1. Antigravity 私有代理节点</span>
-                    </div>
-                    <span
-                      className={`mini-badge ${
-                        clashInfo.availableNodes.length ? 'connected' : 'warn-badge'
-                      }`}
-                    >
-                      {clashHeaderBadgeText}
-                    </span>
-                  </div>
-
-                  <ClashNodeSelector
-                    appLabel="Antigravity"
-                    clashInfo={clashInfo}
-                    selectedNode={config.antigravityClashNode}
-                    selectedProfileUid={config.antigravityClashProfileUid}
-                    selectedProfileName={config.antigravityClashProfileName}
-                    boundProfileUid={state.privateChannels.antigravity.profileUid}
-                    boundProfileName={state.privateChannels.antigravity.profileName}
-                    dedicatedPort={config.antigravityDedicatedPort}
-                    portListening={state.privateChannels.antigravity.phase === 'ready'}
-                    isSwitching={isSwitchingAgNode}
-                    onSelectNode={(node, profUid) =>
-                      void handleSelectAntigravityNode(node, profUid)
-                    }
-                  />
-                  <PrivateKernelStatus channel="antigravity" state={state.privateChannels.antigravity} onState={setState} />
-                  {state.clashInfo.catalogErrors.map((error) => <p className="private-kernel-error" key={error}>订阅读取失败：{error}</p>)}
-                </section>
-
-                {/* 2. Antigravity 纯代理启动主控卡 */}
-                <section
-                  className={`hero-card ag-hero-card ${
-                    antigravityState.running && antigravityState.proxiedSession
-                      ? 'status-ok'
-                      : antigravityState.canLaunch
-                      ? 'status-checking'
-                      : ''
-                  }`}
-                >
-                  <div className="hero-top-row">
-                    <div
-                      className={`status-pill ${
-                        antigravityState.running && antigravityState.proxiedSession
-                          ? 'status-ok'
-                          : antigravityState.running
-                          ? 'status-error'
-                          : antigravityState.canLaunch
-                          ? 'status-checking'
-                          : 'status-unset'
-                      }`}
-                    >
-                      {antigravityState.running && antigravityState.proxiedSession ? (
-                        <>
-                          <CheckCircle2 size={17} />
-                          <span>
-                            Antigravity 代理运行中 ({antigravityState.totalProcessCount} 个进程)
-                          </span>
-                        </>
-                      ) : antigravityState.running ? (
-                        <>
-                          <Info size={17} />
-                          <span>
-                            Antigravity 外部运行中 ({antigravityState.totalProcessCount} 个进程)
-                          </span>
-                        </>
-                      ) : antigravityState.canLaunch ? (
-                        <>
-                          <Rocket size={17} />
-                          <span>专属代理已就绪 · 可启动 Antigravity</span>
-                        </>
-                      ) : (
-                        <>
-                          <Radio size={17} />
-                          <span>待配置 Antigravity 启动代理节点</span>
-                        </>
-                      )}
-                    </div>
-
-                    <button
-                      className="btn-refresh"
-                      disabled={
-                        !config.antigravityClashNode ||
-                        antigravityState.isProbingNode ||
-                        isSwitchingAgNode
-                      }
-                      onClick={() =>
-                        void window.guardAPI
-                          .probeAntigravityNode()
-                          .then(setState)
-                          .catch((err) => notifyError(err, 'ag'))
-                      }
-                      title="仅测试所选节点的出口 IP 与国家，不触发任何报警或拦截"
-                    >
-                      <RefreshCw
-                        className={antigravityState.isProbingNode ? 'spin' : ''}
-                        size={14}
-                      />
-                      <span>
-                        {antigravityState.isProbingNode ? '测速中...' : '刷新节点出口'}
-                      </span>
-                    </button>
-                  </div>
-
-                  {/* 所选节点出口信息展示（纯展示，无任何监控/时区拦截） */}
-                  <div
-                    className={`ag-node-exit-card ${
-                      antigravityState.nodeProbe?.regionMismatchDetail ||
-                      antigravityState.nodeProbe?.googleAiSupported === false
-                        ? 'mismatch-card'
-                        : ''
-                    }`}
-                  >
-                    {config.antigravityClashNode ? (
-                      antigravityState.nodeProbe ? (
-                        <div className="ag-exit-main">
-                          <CountryFlag
-                            code={antigravityState.nodeProbe.countryCode}
-                            size="md"
-                          />
-                          <div className="ag-exit-text">
-                            <div className="ag-exit-title-row">
-                              <strong>{antigravityState.nodeProbe.countryName}</strong>
-                              <span className="iso-pill">
-                                {antigravityState.nodeProbe.countryCode}
-                              </span>
-                              {antigravityState.nodeProbe.regionMismatchDetail &&
-                              antigravityState.nodeProbe.googleCountryCode &&
-                              antigravityState.nodeProbe.googleCountryCode.toUpperCase() !==
-                                antigravityState.nodeProbe.countryCode.toUpperCase() ? (
-                                <span
-                                  className="target-verify-pill mismatch"
-                                  title={antigravityState.nodeProbe.regionMismatchDetail}
-                                >
-                                  ⚠️ Google识别: {antigravityState.nodeProbe.googleCountryName} (
-                                  {antigravityState.nodeProbe.googleCountryCode})
-                                </span>
-                              ) : antigravityState.nodeProbe.googleAiSupported === false ? (
-                                <span
-                                  className="target-verify-pill mismatch"
-                                  title={
-                                    antigravityState.nodeProbe.regionMismatchDetail ||
-                                    'NotebookLM 判定当前节点地区不受支持'
-                                  }
-                                >
-                                  ⚠️ NotebookLM 不支持
-                                  {antigravityState.nodeProbe.googleCountryCode
-                                    ? ` (${antigravityState.nodeProbe.googleCountryCode})`
-                                    : ''}
-                                </span>
-                              ) : antigravityState.nodeProbe.regionMismatchDetail ? (
-                                <span
-                                  className="target-verify-pill mismatch"
-                                  title={antigravityState.nodeProbe.regionMismatchDetail}
-                                >
-                                  ⚠️ Google地区异常
-                                </span>
-                              ) : antigravityState.nodeProbe.googleCountryCode ? (
-                                <span
-                                  className="target-verify-pill verified"
-                                  title={
-                                    antigravityState.nodeProbe.googleAiSupported === true
-                                      ? '已通过 Google 地区与 NotebookLM 可用性探测（仅供参考，不含 Antigravity 账号归属地校验）'
-                                      : '已通过 Google 目标服务真实地区校验'
-                                  }
-                                >
-                                  ✓ Google验证: {antigravityState.nodeProbe.googleCountryCode}
-                                </span>
-                              ) : null}
-                              <span className="ag-node-tag ellipsis">
-                                {config.antigravityClashNode}
-                              </span>
-                            </div>
-                            <div className="ag-exit-ip-row">
-                              <span className="ip-label">节点出口 IP:</span>
-                              <code className="ip-code">
-                                {antigravityState.nodeProbe.ip}
-                              </code>
-                              <button
-                                className="btn-icon-tiny"
-                                onClick={handleCopyAgIp}
-                                title="复制节点出口 IP"
-                              >
-                                {copiedAgIp ? <Check size={12} /> : <Copy size={12} />}
-                              </button>
-                              <span className="latency-tag">
-                                {antigravityState.nodeProbe.latencyMs} ms
-                              </span>
-                            </div>
-                          </div>
-                        </div>
-                      ) : antigravityState.isProbingNode ? (
-                        <div className="ag-exit-placeholder">
-                          <RefreshCw className="spin" size={15} />
-                          <span>
-                            正在通过专属端口 127.0.0.1:{config.antigravityDedicatedPort}{' '}
-                            获取节点 [{config.antigravityClashNode}] 出口信息并校验 Google 真实地区...
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="ag-exit-placeholder">
-                          <Info size={15} />
-                          <span>
-                            {antigravityState.nodeProbeError ||
-                              `已选定节点 [${config.antigravityClashNode}]，点击右上角「刷新节点出口」可查看出口 IP`}
-                          </span>
-                        </div>
-                      )
-                    ) : (
-                      <div className="ag-exit-placeholder">
-                        <Radio size={15} />
-                        <span>
-                          请先在上方下拉框选择要为 Antigravity 绑定的 Clash 代理节点
-                        </span>
-                      </div>
-                    )}
-                  </div>
-
-                  {antigravityState.nodeProbe?.regionMismatchDetail && (
-                    <div className="ag-warn-banner">
-                      <AlertTriangle size={14} />
-                      <span>
-                        <strong>
-                          {antigravityState.nodeProbe.googleCountryCode &&
-                          antigravityState.nodeProbe.googleCountryCode.toUpperCase() !==
-                            antigravityState.nodeProbe.countryCode.toUpperCase()
-                            ? '假地区 / 送中节点预警：'
-                            : 'NotebookLM 地区受限预警：'}
-                        </strong>
-                        {antigravityState.nodeProbe.regionMismatchDetail}
-                        ，Antigravity 可能会报错地区不受支持，建议更换其他节点。
-                      </span>
-                    </div>
-                  )}
-
-                  {/* 全进程代理覆盖状态明细：Antigravity.exe + language_server.exe */}
-                  <div className="ag-process-grid">
-                    <div
-                      className={`ag-proc-box ${
-                        antigravityState.uiProcessCount > 0 ? 'active' : ''
-                      }`}
-                    >
-                      <div className="ag-proc-header">
-                        <code>Antigravity.exe</code>
-                        <span
-                          className={`ag-proc-badge ${
-                            antigravityState.uiProcessCount > 0 ? 'on' : 'off'
-                          }`}
-                        >
-                          {antigravityState.uiProcessCount > 0
-                            ? `运行中 ×${antigravityState.uiProcessCount}`
-                            : '未运行'}
-                        </span>
-                      </div>
-                    </div>
-
-                    <div
-                      className={`ag-proc-box ${
-                        antigravityState.languageServerCount > 0 ? 'active' : ''
-                      }`}
-                    >
-                      <div className="ag-proc-header">
-                        <code>language_server.exe</code>
-                        <span
-                          className={`ag-proc-badge ${
-                            antigravityState.languageServerCount > 0 ? 'on' : 'off'
-                          }`}
-                        >
-                          {antigravityState.languageServerCount > 0
-                            ? `运行中 ×${antigravityState.languageServerCount}`
-                            : '未运行'}
-                        </span>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* 外部直连运行提示或未就绪指引 */}
-                  {antigravityState.running && !antigravityState.proxiedSession && (
-                    <div className="ag-info-banner">
-                      <Info size={14} />
-                      <span>
-                        当前 Antigravity 由外部启动，可点击下方按钮重启以绑定专属代理通道。
-                      </span>
-                    </div>
-                  )}
-
-                  {!antigravityState.canLaunch && antigravityState.launchHint && (
-                    <div className="ag-info-banner">
-                      <Info size={14} />
-                      <span>{antigravityState.launchHint}</span>
-                    </div>
-                  )}
-
-                  {/* 运行中重启/强杀二次确认栏 */}
-                  {pendingAgConfirm && (
-                    <div className="inline-confirm-bar">
-                      <div className="confirm-bar-text">
-                        <AlertTriangle size={15} />
-                        <span>
-                          {pendingAgConfirm === 'restart'
-                            ? '重启将强制终止当前 Antigravity.exe 与 language_server.exe 进程树并重新拉起，请确认已保存代码更改。'
-                            : '将强制终止全部 Antigravity.exe 与 language_server.exe 进程，请确认已保存工作内容。'}
-                        </span>
-                      </div>
-                      <div className="confirm-bar-actions">
-                        <button
-                          type="button"
-                          className="btn-confirm-danger"
-                          disabled={isLaunchingAg}
-                          onClick={() =>
-                            void (pendingAgConfirm === 'restart'
-                              ? executeLaunchAntigravity()
-                              : executeTerminateAntigravity())
-                          }
-                        >
-                          {pendingAgConfirm === 'restart' ? '确认重启' : '确认关闭'}
-                        </button>
-                        <button
-                          type="button"
-                          className="btn-confirm-cancel"
-                          onClick={() => setPendingAgConfirm(null)}
-                        >
-                          取消
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* 启动 / 重启 / 停止按钮行 */}
-                  <div className="claude-launch-actions">
-                    <button
-                      className={`btn-launch-claude ${
-                        antigravityState.canLaunch ? 'ready' : 'disabled'
-                      }`}
-                      disabled={
-                        !antigravityState.canLaunch || isLaunchingAg || isSwitchingAgNode
-                      }
-                      onClick={handleLaunchAntigravity}
-                    >
-                      {isLaunchingAg ? (
-                        <>
-                          <RefreshCw className="spin" size={16} />
-                          <span>正在绑定代理并拉起 Antigravity...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Play size={16} />
-                          <span>
-                            {antigravityState.running && antigravityState.proxiedSession
-                              ? '重启 Antigravity（重新拉起）'
-                              : antigravityState.running
-                              ? '重启 Antigravity 并注入专属代理参数'
-                              : '通过指定节点启动 Antigravity'}
-                          </span>
-                        </>
-                      )}
-                    </button>
-
-                    {antigravityState.running && (
-                      <button
-                        className="btn-kill-claude"
-                        onClick={handleTerminateAntigravity}
-                        title="关闭 Antigravity.exe 及 language_server.exe 进程"
-                      >
-                        <Square size={14} />
-                        <span>关闭进程</span>
-                      </button>
-                    )}
-                  </div>
-
-                  {agFeedback && (
-                    <div className={`locale-feedback ${agFeedback.ok ? 'ok' : 'err'}`}>
-                      {agFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
-                      <span>{agFeedback.text}</span>
-                    </div>
-                  )}
-                </section>
-
-                {/* 3. Antigravity 客户端路径与专属端口设置卡（默认折叠，节省首屏纵向空间） */}
-                <section className={`panel-card collapsible-card ${isAgSettingsExpanded ? 'expanded' : 'collapsed'}`}>
-                  <div
-                    className="panel-card-header collapsible-header"
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => setAgSettingsOpen((prev) => !prev)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        setAgSettingsOpen((prev) => !prev);
-                      }
-                    }}
-                  >
-                    <div className="panel-title">
-                      <Cpu size={15} />
-                      <span>客户端路径与专属端口设置</span>
-                    </div>
-                    <div className="collapsible-header-right">
-                      <span className="mini-badge neutral">
-                        127.0.0.1:{config.antigravityDedicatedPort} · {agInstallTypeLabel}
-                      </span>
-                      <span className="collapse-chevron">
-                        {isAgSettingsExpanded ? <ChevronUp size={15} /> : <ChevronDown size={15} />}
-                      </span>
-                    </div>
-                  </div>
-
-                  {isAgSettingsExpanded && (
-                    <div className="collapsible-body">
-                      <div className="claude-exe-path-box">
-                        <div className="exe-path-header">
-                          <span>Antigravity 专属代理监听端口（与 Claude 端口独立）：</span>
-                        </div>
-                        <div className="exe-path-row">
-                          <code className="exe-path-code">127.0.0.1 :</code>
-                          <input
-                            type="number"
-                            className="dedicated-port-input"
-                            min={1024}
-                            max={65535}
-                            value={agDedicatedPortInput}
-                            onChange={(e) => setAgDedicatedPortInput(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') void handleSaveAgDedicatedPort();
-                            }}
-                          />
-                          <button
-                            className="btn-save-inline"
-                            disabled={isSwitchingAgNode}
-                            onClick={() => void handleSaveAgDedicatedPort()}
-                          >
-                            <span>保存端口</span>
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="claude-exe-path-box">
-                        <div className="exe-path-header">
-                          <span>Antigravity.exe 路径：</span>
-                          {config.antigravityExePath && (
-                            <button
-                              className="btn-link-clear"
-                              onClick={() =>
-                                void updateConfigSafe({ antigravityExePath: '' }, 'ag')
-                              }
-                            >
-                              恢复自动探测
-                            </button>
-                          )}
-                        </div>
-                        <div className="exe-path-row">
-                          <code
-                            className="exe-path-code ellipsis"
-                            title={
-                              antigravityState.detectedExePath || '未检测到 Antigravity.exe'
-                            }
-                          >
-                            {antigravityState.detectedExePath ||
-                              '未检测到 Antigravity.exe，请点击右侧手动浏览选择'}
-                          </code>
-                          <button
-                            className="btn-save-inline"
-                            onClick={() =>
-                              void window.guardAPI
-                                .browseAntigravityExe()
-                                .then(setState)
-                                .catch((err) => notifyError(err, 'ag'))
-                            }
-                          >
-                            <FolderOpen size={13} />
-                            <span>浏览...</span>
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </section>
-              </>
+            {ctrl.launcherSubTab === 'antigravity' ? (
+              <AntigravityLauncherPane
+                state={state}
+                clashHeaderBadgeText={ctrl.clashHeaderBadgeText}
+                isSwitchingAgNode={ctrl.isSwitchingAgNode}
+                isLaunchingAg={ctrl.isLaunchingAg}
+                copiedAgIp={ctrl.copiedAgIp}
+                agFeedback={ctrl.agFeedback}
+                pendingAgConfirm={ctrl.pendingAgConfirm}
+                isAgSettingsExpanded={ctrl.isAgSettingsExpanded}
+                agInstallTypeLabel={ctrl.agInstallTypeLabel}
+                agDedicatedPortInput={ctrl.agDedicatedPortInput}
+                onState={ctrl.setState}
+                onSelectNode={(node, profUid) =>
+                  void ctrl.handleSelectAntigravityNode(node, profUid)
+                }
+                onProbeNode={() =>
+                  void window.guardAPI
+                    .probeAntigravityNode()
+                    .then(ctrl.setState)
+                    .catch((err) => ctrl.notifyError(err, 'ag'))
+                }
+                onCopyIp={ctrl.handleCopyAgIp}
+                onLaunch={ctrl.handleLaunchAntigravity}
+                onTerminate={ctrl.handleTerminateAntigravity}
+                onConfirmAction={() =>
+                  void (ctrl.pendingAgConfirm === 'restart'
+                    ? ctrl.executeLaunchAntigravity()
+                    : ctrl.executeTerminateAntigravity())
+                }
+                onCancelConfirm={() => ctrl.setPendingAgConfirm(null)}
+                onToggleSettings={() => ctrl.setAgSettingsOpen((prev) => !prev)}
+                onChangeDedicatedPortInput={ctrl.setAgDedicatedPortInput}
+                onSaveDedicatedPort={() => void ctrl.handleSaveAgDedicatedPort()}
+                onClearExePath={() =>
+                  void ctrl.updateConfigSafe({ antigravityExePath: '' }, 'ag')
+                }
+                onBrowseExePath={() =>
+                  void window.guardAPI
+                    .browseAntigravityExe()
+                    .then(ctrl.setState)
+                    .catch((err) => ctrl.notifyError(err, 'ag'))
+                }
+              />
             ) : (
-              <>
-                {/* 1. Clash Verge Rev 全订阅组专属节点选择卡片（置顶首位，展开下拉列表空间充足） */}
-                <section className="panel-card">
-                  <div className="panel-card-header">
-                    <div className="panel-title">
-                      <Radio
-                        size={15}
-                        className={state.privateChannels.claude.phase === 'ready' ? 'pulse-green' : ''}
-                      />
-                      <span>1. Claude 私有代理节点</span>
-                    </div>
-                    <span
-                      className={`mini-badge ${
-                        clashInfo.availableNodes.length ? 'connected' : 'warn-badge'
-                      }`}
-                    >
-                      {clashHeaderBadgeText}
-                    </span>
-                  </div>
-
-                  <ClashNodeSelector
-                    appLabel="Claude"
-                    clashInfo={clashInfo}
-                    selectedNode={config.selectedClashNode}
-                    selectedProfileUid={config.selectedClashProfileUid}
-                    selectedProfileName={config.selectedClashProfileName}
-                    boundProfileUid={state.privateChannels.claude.profileUid}
-                    boundProfileName={state.privateChannels.claude.profileName}
-                    dedicatedPort={config.dedicatedProxyPort}
-                    portListening={state.privateChannels.claude.phase === 'ready'}
-                    isSwitching={isSwitchingNode}
-                    onSelectNode={(node, profUid) =>
-                      void handleSelectClaudeNode(node, profUid)
-                    }
-                  />
-                  <PrivateKernelStatus channel="claude" state={state.privateChannels.claude} onState={setState} />
-                  {state.clashInfo.catalogErrors.map((error) => <p className="private-kernel-error" key={error}>订阅读取失败：{error}</p>)}
-                </section>
-
-                {/* 2. Claude 唯一启动入口 & 三重一致性校验主控卡 */}
-                <section
-                  className={`hero-card claude-hero-card ${
-                    claudeState.verificationFailure
-                      ? 'status-checking'
-                      : claudeState.running || claudeState.canLaunch
-                      ? 'status-ok'
-                      : claudeState.isProbingNode &&
-                        !claudeState.nodeProbe &&
-                        !claudeState.nodeProbeError
-                      ? 'status-checking'
-                      : 'status-mismatch'
-                  }`}
-                >
-                  <div className="hero-top-row">
-                    <div
-                      className={`status-pill ${
-                        claudeState.verificationFailure
-                          ? 'status-checking'
-                          : claudeState.running || claudeState.canLaunch
-                          ? 'status-ok'
-                          : claudeState.isProbingNode &&
-                            !claudeState.nodeProbe &&
-                            !claudeState.nodeProbeError
-                          ? 'status-checking'
-                          : 'status-mismatch'
-                      }`}
-                    >
-                      {claudeState.verificationFailure ? (
-                        <>
-                          <Clock size={17} />
-                          <span>地区校验中断 · 后台复核中</span>
-                        </>
-                      ) : claudeState.running ? (
-                        <>
-                          <ShieldCheck size={17} />
-                          <span>
-                            Claude 受控运行中 ({claudeState.processCount} 个进程)
-                          </span>
-                        </>
-                      ) : claudeState.canLaunch ? (
-                        <>
-                          <CheckCircle2 size={17} />
-                          <span>三重校验一致 · 允许启动 Claude</span>
-                        </>
-                      ) : claudeState.isProbingNode &&
-                        !claudeState.nodeProbe &&
-                        !claudeState.nodeProbeError ? (
-                        <>
-                          <RefreshCw className="spin" size={17} />
-                          <span>正在校验节点与环境...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Lock size={17} />
-                          <span>未通过校验 · 禁止启动 Claude</span>
-                        </>
-                      )}
-                    </div>
-
-                    <button
-                      className="btn-refresh"
-                      disabled={claudeState.isProbingNode || isSwitchingNode}
-                      onClick={() =>
-                        void window.guardAPI
-                          .probeClaudeNode('Claude 专栏手动重测')
-                          .then(setState)
-                          .catch((err) => notifyError(err, 'claude'))
-                      }
-                    >
-                      <RefreshCw
-                        className={claudeState.isProbingNode ? 'spin' : ''}
-                        size={14}
-                      />
-                      <span>{claudeState.isProbingNode ? '校验中...' : '重新校验'}</span>
-                    </button>
-                  </div>
-
-                  {claudeState.verificationFailure && (
-                    <div className="claude-verification-notice">
-                      <Clock size={15} className="verification-notice-icon" />
-                      <div className="verification-notice-body">
-                        <strong className="verification-notice-reason">
-                          {claudeState.verificationFailure.reason}
-                        </strong>
-                        <p>
-                          {formatTime(claudeState.verificationFailure.startedAt)} 起异常 ·{' '}
-                          每隔 5 秒后台复核，恢复后自动清除提示
-                        </p>
-                        <small>
-                          {claudeState.lockedSessionIp
-                            ? `🔒 ${claudeState.lockedSessionIp} · `
-                            : ''}
-                          上次通过：{claudeState.lastVerificationSuccessAt
-                            ? formatTime(claudeState.lastVerificationSuccessAt) : '无'}
-                        </small>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* 三重一致性对比矩阵：指定代理出口 vs 系统区域 vs 系统时区 */}
-                  <div className="three-way-check-grid">
-                    <div
-                      className={`check-step-card ${
-                        claudeState.proxyCountryCode &&
-                        config.selectedClashNode &&
-                        !claudeVerificationError
-                          ? 'matched'
-                          : 'unmatched'
-                      }`}
-                    >
-                      <div className="check-step-header">
-                        <span className="step-num">1. 指定代理出口</span>
-                        {claudeState.proxyCountryCode &&
-                        config.selectedClashNode &&
-                        !claudeVerificationError ? (
-                          <CheckCircle2 size={14} className="step-icon-ok" />
-                        ) : (
-                          <XCircle size={14} className="step-icon-err" />
-                        )}
-                      </div>
-                      <div className="check-step-body">
-                        {claudeState.proxyCountryCode && claudeState.nodeProbe ? (
-                          <>
-                            <div className="step-main-line">
-                              <CountryFlag code={claudeState.proxyCountryCode} size="sm" />
-                              <strong>
-                                {claudeState.proxyCountryName} ({claudeState.proxyCountryCode})
-                              </strong>
-                            </div>
-                            {claudeState.nodeProbe.regionMismatchDetail ? (
-                              <small
-                                className="ellipsis text-danger"
-                                title={claudeState.nodeProbe.regionMismatchDetail}
-                              >
-                                ⚠️ Claude 识别: {claudeState.nodeProbe.claudeTraceLoc}
-                              </small>
-                            ) : claudeVerificationError ? (
-                              <small
-                                className="ellipsis text-danger"
-                                title={claudeVerificationError}
-                              >
-                                {claudeVerificationError}
-                              </small>
-                            ) : claudeState.running && claudeState.lockedSessionIp ? (
-                              <small
-                                className="ellipsis"
-                                title={`锁定出口 IP: ${claudeState.lockedSessionIp}${
-                                  claudeState.nodeProbe.claudeTraceIp &&
-                                  claudeState.nodeProbe.claudeTraceIp !== claudeState.nodeProbe.ip
-                                    ? ` · 常规 IP: ${claudeState.nodeProbe.ip}`
-                                    : ''
-                                } (${claudeState.nodeProbe.latencyMs}ms)`}
-                              >
-                                🔒 {claudeState.lockedSessionIp} ·{' '}
-                                {claudeState.nodeProbe.latencyMs}ms
-                              </small>
-                            ) : (
-                              <small
-                                className="ellipsis"
-                                title={`Claude 出口 IP: ${
-                                  claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip
-                                }${
-                                  claudeState.nodeProbe.claudeTraceIp &&
-                                  claudeState.nodeProbe.claudeTraceIp !== claudeState.nodeProbe.ip
-                                    ? ` · 常规 IP: ${claudeState.nodeProbe.ip} (同国分流)`
-                                    : ''
-                                } (${claudeState.nodeProbe.latencyMs}ms)`}
-                              >
-                                {claudeState.nodeProbe.claudeTraceIp || claudeState.nodeProbe.ip}
-                                {claudeState.nodeProbe.claudeTraceIp &&
-                                claudeState.nodeProbe.claudeTraceIp !== claudeState.nodeProbe.ip
-                                  ? ' (分流)'
-                                  : ''}{' '}
-                                · {claudeState.nodeProbe.latencyMs}ms
-                              </small>
-                            )}
-                          </>
-                        ) : claudeState.nodeProbe ? (
-                          <>
-                            <div className="step-main-line">
-                              {claudeFallbackDetectedCode && (
-                                <CountryFlag code={claudeFallbackDetectedCode} size="sm" />
-                              )}
-                              <strong
-                                className="ellipsis"
-                                title={
-                                  claudeState.nodeProbe.claudeTraceIp
-                                    ? `Claude 出口 IP: ${claudeState.nodeProbe.claudeTraceIp}${
-                                        claudeFallbackDetectedCode
-                                          ? ` · ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode})`
-                                          : ''
-                                      } (${claudeState.nodeProbe.latencyMs}ms)`
-                                    : `Claude 出口未知${
-                                        claudeFallbackDetectedCode
-                                          ? ` · ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode})`
-                                          : ''
-                                      }${
-                                        claudeState.nodeProbe.ip
-                                          ? ` · 常规回显 IP: ${claudeState.nodeProbe.ip}`
-                                          : ''
-                                      } (${claudeState.nodeProbe.latencyMs}ms)`
-                                }
-                              >
-                                {claudeState.nodeProbe.claudeTraceIp
-                                  ? claudeFallbackDetectedCode
-                                    ? `Claude ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode}) · ${claudeState.nodeProbe.claudeTraceIp}`
-                                    : `Claude 出口 ${claudeState.nodeProbe.claudeTraceIp}`
-                                  : claudeFallbackDetectedCode
-                                  ? `Claude ${getCountryNameZh(claudeFallbackDetectedCode)} (${claudeFallbackDetectedCode}) · 出口未知`
-                                  : 'Claude 出口未知'}
-                              </strong>
-                            </div>
-                            <small
-                              className="ellipsis text-danger"
-                              title={claudeVerificationError || undefined}
-                            >
-                              {claudeVerificationError}
-                            </small>
-                          </>
-                        ) : (
-                          <>
-                            <strong className="text-warn">
-                              {!config.selectedClashNode
-                                ? '未选节点'
-                                : claudeState.isProbingNode
-                                ? '探测中...'
-                                : '节点未连通'}
-                            </strong>
-                            <small
-                              className="ellipsis"
-                              title={claudeState.nodeProbeError || undefined}
-                            >
-                              {config.selectedClashNode
-                                ? claudeState.nodeProbeError || '请检查连通性'
-                                : '请先选择节点'}
-                            </small>
-                          </>
-                        )}
-                      </div>
-                    </div>
-
-                    <div
-                      className={`check-step-card ${
-                        claudeState.winRegionMatched ? 'matched' : 'unmatched'
-                      }`}
-                    >
-                      <div className="check-step-header">
-                        <span className="step-num">2. 系统国家/区域</span>
-                        {claudeState.winRegionMatched ? (
-                          <CheckCircle2 size={14} className="step-icon-ok" />
-                        ) : (
-                          <XCircle size={14} className="step-icon-err" />
-                        )}
-                      </div>
-                      <div className="check-step-body">
-                        <div className="step-main-line">
-                          <CountryFlag code={winLocale.regionCode} size="sm" />
-                          <strong>
-                            {winLocale.regionName} ({winLocale.regionCode})
-                          </strong>
-                        </div>
-                        <small>
-                          {claudeState.winRegionMatched ? '与代理一致' : '与代理不符'}
-                        </small>
-                      </div>
-                    </div>
-
-                    <div
-                      className={`check-step-card ${
-                        claudeState.winTimeZoneMatched ? 'matched' : 'unmatched'
-                      }`}
-                    >
-                      <div className="check-step-header">
-                        <span className="step-num">3. 系统时区</span>
-                        {claudeState.winTimeZoneMatched ? (
-                          <CheckCircle2 size={14} className="step-icon-ok" />
-                        ) : (
-                          <XCircle size={14} className="step-icon-err" />
-                        )}
-                      </div>
-                      <div className="check-step-body">
-                        <strong
-                          className="ellipsis"
-                          title={winLocale.timeZoneDisplayName}
-                        >
-                          {winLocale.timeZoneDisplayName}
-                        </strong>
-                        <small>
-                          {claudeState.winTimeZoneMatched ? '与代理一致' : '与代理不符'}
-                        </small>
-                      </div>
-                    </div>
-                  </div>
-
-                  {/* 校验未通过原因提示 */}
-                  {claudeState.launchBlockReason && (
-                    <div className="claude-block-banner">
-                      <div className="block-banner-text">
-                        <AlertTriangle size={15} />
-                        <span>{claudeState.launchBlockReason}</span>
-                      </div>
-                      {claudeState.proxyCountryCode &&
-                        !claudeVerificationError &&
-                        (!claudeState.winRegionMatched ||
-                          !claudeState.winTimeZoneMatched) && (
-                          <button
-                            className="btn-banner-quick-sync"
-                            disabled={isSyncingLocale}
-                            onClick={() => void handleSyncLocaleFromClaude()}
-                          >
-                            <RefreshCw
-                              className={isSyncingLocale ? 'spin' : ''}
-                              size={13}
-                            />
-                            <span>
-                              {isSyncingLocale
-                                ? '正在同步...'
-                                : `一键同步至 [${claudeState.proxyCountryName}]`}
-                            </span>
-                          </button>
-                        )}
-                    </div>
-                  )}
-
-                  {/* 运行中切换节点 / 修改端口 / 强杀二次确认栏 */}
-                  {pendingClaudeConfirm && (
-                    <div className="inline-confirm-bar">
-                      <div className="confirm-bar-text">
-                        <AlertTriangle size={15} />
-                        <span>
-                          {pendingClaudeConfirm.type === 'switch-node'
-                            ? `切换至 [${
-                                pendingClaudeConfirm.nodeName || '未绑定'
-                              }] 将先终止 Claude，新节点校验通过后可重启。`
-                            : pendingClaudeConfirm.type === 'change-port'
-                            ? `修改端口为 ${pendingClaudeConfirm.port} 将先终止当前 Claude。`
-                            : pendingClaudeConfirm.type === 'toggle-ipv4'
-                            ? `${
-                                pendingClaudeConfirm.enabled
-                                  ? '开启强制仅走 IPv4 出站'
-                                  : '关闭强制仅走 IPv4 出站'
-                              }将先终止当前 Claude 并重建专属通道。`
-                            : '确定立即终止全部 Claude 进程？'}
-                        </span>
-                      </div>
-                      <div className="confirm-bar-actions">
-                        <button
-                          type="button"
-                          className="btn-confirm-danger"
-                          disabled={isSwitchingNode}
-                          onClick={() => {
-                            if (pendingClaudeConfirm.type === 'switch-node') {
-                              void executeSelectClaudeNode(
-                                pendingClaudeConfirm.nodeName,
-                                pendingClaudeConfirm.profileUid
-                              );
-                            } else if (pendingClaudeConfirm.type === 'change-port') {
-                              void executeSaveDedicatedPort(pendingClaudeConfirm.port);
-                            } else if (pendingClaudeConfirm.type === 'toggle-ipv4') {
-                              void executeToggleClaudeForceIpv4(
-                                pendingClaudeConfirm.enabled,
-                                true
-                              );
-                            } else {
-                              void executeTerminateClaude();
-                            }
-                          }}
-                        >
-                          {pendingClaudeConfirm.type === 'switch-node'
-                            ? '确认切换'
-                            : pendingClaudeConfirm.type === 'change-port'
-                            ? '确认修改'
-                            : pendingClaudeConfirm.type === 'toggle-ipv4'
-                            ? '确认生效'
-                            : '确认终止'}
-                        </button>
-                        <button
-                          type="button"
-                          className="btn-confirm-cancel"
-                          onClick={() => {
-                            if (pendingClaudeConfirm.type === 'change-port') {
-                              setDedicatedPortInput(String(config.dedicatedProxyPort));
-                            }
-                            setPendingClaudeConfirm(null);
-                          }}
-                        >
-                          取消
-                        </button>
-                      </div>
-                    </div>
-                  )}
-
-                  {/* 唯一启动入口主按钮与强杀按钮 */}
-                  <div className="claude-launch-actions">
-                    <button
-                      className={`btn-launch-claude ${
-                        claudeState.canLaunch ? 'ready' : 'disabled'
-                      }`}
-                      disabled={
-                        !claudeState.canLaunch || isLaunchingClaude || isSwitchingNode
-                      }
-                      onClick={() => void handleLaunchClaude()}
-                    >
-                      {isLaunchingClaude ? (
-                        <>
-                          <RefreshCw className="spin" size={16} />
-                          <span>正在校验并启动 Claude...</span>
-                        </>
-                      ) : (
-                        <>
-                          <Play size={16} />
-                          <span>
-                            {claudeState.running
-                              ? '重新唤起 Claude Desktop'
-                              : '安全启动 Claude Desktop'}
-                          </span>
-                        </>
-                      )}
-                    </button>
-
-                    {claudeState.running && (
-                      <button
-                        className="btn-kill-claude"
-                        onClick={handleTerminateClaude}
-                        title="立即终止全部 Claude 进程"
-                      >
-                        <Square size={14} />
-                        <span>终止 Claude</span>
-                      </button>
-                    )}
-                  </div>
-
-                  {claudeState.nodeProbe && (
-                    <div className="hero-footer-meta">
-                      <span className="ellipsis" title={claudeState.nodeProbe.viaChannel}>
-                        专属通道：127.0.0.1:{config.dedicatedProxyPort}
-                        {config.selectedClashNode ? ` · ${config.selectedClashNode}` : ''}
-                      </span>
-                      <span>{formatTime(claudeState.nodeProbe.checkedAt)} 更新</span>
-                    </div>
-                  )}
-
-                  {claudeFeedback && (
-                    <div
-                      className={`locale-feedback ${claudeFeedback.ok ? 'ok' : 'err'}`}
-                    >
-                      {claudeFeedback.ok ? (
-                        <Check size={14} />
-                      ) : (
-                        <AlertTriangle size={14} />
-                      )}
-                      <span>{claudeFeedback.text}</span>
-                    </div>
-                  )}
-                </section>
-
-                {/* 3. 启动保护与客户端设置（默认折叠，节省首屏纵向空间） */}
-                <section className={`panel-card collapsible-card ${isClaudeSettingsExpanded ? 'expanded' : 'collapsed'}`}>
-                  <div
-                    className="panel-card-header collapsible-header"
-                    role="button"
-                    tabIndex={0}
-                    onClick={() => setClaudeSettingsOpen((prev) => !prev)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter' || e.key === ' ') {
-                        e.preventDefault();
-                        setClaudeSettingsOpen((prev) => !prev);
-                      }
-                    }}
-                  >
-                    <div className="panel-title">
-                      <Ban size={15} />
-                      <span>启动保护与客户端设置</span>
-                    </div>
-                    <div className="collapsible-header-right">
-                      <span className="mini-badge neutral">
-                        {config.claudeExclusiveGuard ? '唯一入口' : '允许外启'} ·{' '}
-                        {config.claudeLockExitIp ? '锁IP' : '不锁IP'} ·{' '}
-                        {config.claudeForceIpv4 ? '仅IPv4' : '双栈'} · 127.0.0.1:
-                        {config.dedicatedProxyPort} · {installTypeLabel}
-                      </span>
-                      <span className="collapse-chevron">
-                        {isClaudeSettingsExpanded ? (
-                          <ChevronUp size={15} />
-                        ) : (
-                          <ChevronDown size={15} />
-                        )}
-                      </span>
-                    </div>
-                  </div>
-
-                  {isClaudeSettingsExpanded && (
-                    <div className="collapsible-body">
-                      <div className="setting-row">
-                        <div>
-                          <strong>仅允许从本面板启动 Claude</strong>
-                          <p>拦截外部直接启动，防止绕过环境校验</p>
-                        </div>
-                        <input
-                          type="checkbox"
-                          className="toggle-switch"
-                          checked={config.claudeExclusiveGuard}
-                          onChange={(e) =>
-                            void updateConfigSafe(
-                              { claudeExclusiveGuard: e.target.checked },
-                              'claude'
-                            )
-                          }
-                        />
-                      </div>
-
-                      <div className="setting-row">
-                        <div>
-                          <strong>锁定会话出口 IP</strong>
-                          <p>运行期出口 IP 变动立即强杀；动态住宅代理可关闭</p>
-                        </div>
-                        <input
-                          type="checkbox"
-                          className="toggle-switch"
-                          checked={config.claudeLockExitIp}
-                          onChange={(e) =>
-                            void updateConfigSafe(
-                              { claudeLockExitIp: e.target.checked },
-                              'claude'
-                            )
-                          }
-                        />
-                      </div>
-
-                      <div className="setting-row">
-                        <div>
-                          <strong>强制通道仅走 IPv4 出站</strong>
-                          <p>
-                            经代理内 DoH 锁定 IPv4 并拦截 IPv6，防止双栈节点切栈误杀与风控；纯 IPv6 出口节点可关闭
-                          </p>
-                        </div>
-                        <input
-                          type="checkbox"
-                          className="toggle-switch"
-                          disabled={isSwitchingNode}
-                          checked={config.claudeForceIpv4}
-                          onChange={(e) => handleToggleClaudeForceIpv4(e.target.checked)}
-                        />
-                      </div>
-
-                      <div className="setting-row">
-                        <div>
-                          <strong>Claude 保护终止提醒</strong>
-                          <p>IP、地区或时区异常立即终止进程并弹窗；校验中断时持续后台复核</p>
-                        </div>
-                        <span className="mini-badge connected" style={{ flexShrink: 0 }}>
-                          始终开启
-                        </span>
-                      </div>
-
-                      <div className="claude-exe-path-box">
-                        <div className="exe-path-header">
-                          <span>专属监听端口：</span>
-                        </div>
-                        <div className="exe-path-row">
-                          <code className="exe-path-code">127.0.0.1 :</code>
-                          <input
-                            type="number"
-                            className="dedicated-port-input"
-                            min={1024}
-                            max={65535}
-                            value={dedicatedPortInput}
-                            onChange={(e) => setDedicatedPortInput(e.target.value)}
-                            onKeyDown={(e) => {
-                              if (e.key === 'Enter') void handleSaveDedicatedPort();
-                            }}
-                          />
-                          <button
-                            className="btn-save-inline"
-                            disabled={isSwitchingNode}
-                            onClick={() => void handleSaveDedicatedPort()}
-                          >
-                            <span>保存端口</span>
-                          </button>
-                        </div>
-                      </div>
-
-                      <div className="claude-exe-path-box">
-                        <div className="exe-path-header">
-                          <span>客户端路径：</span>
-                          {config.claudeExePath && (
-                            <button
-                              className="btn-link-clear"
-                              onClick={() =>
-                                void updateConfigSafe({ claudeExePath: '' }, 'claude')
-                              }
-                            >
-                              恢复自动探测
-                            </button>
-                          )}
-                        </div>
-                        <div className="exe-path-row">
-                          <code
-                            className="exe-path-code ellipsis"
-                            title={claudeState.detectedExePath || '未检测到 Claude.exe'}
-                          >
-                            {claudeState.detectedExePath ||
-                              '未检测到客户端，请点击右侧选择'}
-                          </code>
-                          <button
-                            className="btn-save-inline"
-                            onClick={() =>
-                              void window.guardAPI
-                                .browseClaudeExe()
-                                .then(setState)
-                                .catch((err) => notifyError(err, 'claude'))
-                            }
-                          >
-                            <FolderOpen size={13} />
-                            <span>浏览...</span>
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-                  )}
-                </section>
-              </>
+              <ClaudeLauncherPane
+                state={state}
+                clashHeaderBadgeText={ctrl.clashHeaderBadgeText}
+                isSwitchingNode={ctrl.isSwitchingNode}
+                isLaunchingClaude={ctrl.isLaunchingClaude}
+                claudeVerificationError={ctrl.claudeVerificationError}
+                claudeFallbackDetectedCode={ctrl.claudeFallbackDetectedCode}
+                claudeFeedback={ctrl.claudeFeedback}
+                pendingClaudeConfirm={ctrl.pendingClaudeConfirm}
+                isClaudeSettingsExpanded={ctrl.isClaudeSettingsExpanded}
+                installTypeLabel={ctrl.installTypeLabel}
+                dedicatedPortInput={ctrl.dedicatedPortInput}
+                onState={ctrl.setState}
+                onSelectNode={(node, profUid) =>
+                  void ctrl.handleSelectClaudeNode(node, profUid)
+                }
+                onProbeNode={() =>
+                  void window.guardAPI
+                    .probeClaudeNode('Claude 专栏手动重测')
+                    .then(ctrl.setState)
+                    .catch((err) => ctrl.notifyError(err, 'claude'))
+                }
+                onSyncLocaleFromClaude={() => void ctrl.handleSyncLocaleFromClaude()}
+                onConfirmClaudeAction={() => {
+                  const pending = ctrl.pendingClaudeConfirm;
+                  if (!pending) return;
+                  if (pending.type === 'switch-node') {
+                    void ctrl.executeSelectClaudeNode(
+                      pending.nodeName,
+                      pending.profileUid
+                    );
+                  } else if (pending.type === 'change-port') {
+                    void ctrl.executeSaveDedicatedPort(pending.port);
+                  } else if (pending.type === 'toggle-ipv4') {
+                    void ctrl.executeToggleClaudeForceIpv4(pending.enabled, true);
+                  } else {
+                    void ctrl.executeTerminateClaude();
+                  }
+                }}
+                onCancelClaudeConfirm={() => {
+                  if (ctrl.pendingClaudeConfirm?.type === 'change-port') {
+                    ctrl.setDedicatedPortInput(String(config.dedicatedProxyPort));
+                  }
+                  ctrl.setPendingClaudeConfirm(null);
+                }}
+                onLaunchClaude={() => void ctrl.handleLaunchClaude()}
+                onTerminateClaude={ctrl.handleTerminateClaude}
+                onToggleSettings={() => ctrl.setClaudeSettingsOpen((prev) => !prev)}
+                onUpdateClaudeConfig={(partial) =>
+                  void ctrl.updateConfigSafe(partial, 'claude')
+                }
+                onToggleForceIpv4={ctrl.handleToggleClaudeForceIpv4}
+                onChangeDedicatedPortInput={ctrl.setDedicatedPortInput}
+                onSaveDedicatedPort={() => void ctrl.handleSaveDedicatedPort()}
+                onClearExePath={() =>
+                  void ctrl.updateConfigSafe({ claudeExePath: '' }, 'claude')
+                }
+                onBrowseExePath={() =>
+                  void window.guardAPI
+                    .browseClaudeExe()
+                    .then(ctrl.setState)
+                    .catch((err) => ctrl.notifyError(err, 'claude'))
+                }
+              />
             )}
           </div>
         )}
 
-        {activeTab === 'monitor' && (
+        {ctrl.activeTab === 'monitor' && (
           <div className="tab-pane">
-            {/* 实时监控内部二级切换器：状态与时区 vs 联动进程强杀 */}
             <div className="launcher-subtabs">
               <button
-                className={`launcher-subtab ${monitorSubTab === 'status' ? 'active' : ''}`}
-                onClick={() => setMonitorSubTab('status')}
+                className={`launcher-subtab ${
+                  ctrl.monitorSubTab === 'status' ? 'active' : ''
+                }`}
+                onClick={() => ctrl.setMonitorSubTab('status')}
               >
                 <Activity size={14} />
                 <span>状态与时区</span>
-                <span className={`tab-status-dot ${monitorTabDotClass}`} />
+                <span className={`tab-status-dot ${ctrl.monitorTabDotClass}`} />
               </button>
 
               <button
-                className={`launcher-subtab ${monitorSubTab === 'guard' ? 'active' : ''}`}
-                onClick={() => setMonitorSubTab('guard')}
+                className={`launcher-subtab ${
+                  ctrl.monitorSubTab === 'guard' ? 'active' : ''
+                }`}
+                onClick={() => ctrl.setMonitorSubTab('guard')}
               >
                 <ShieldAlert size={14} />
                 <span>联动进程强杀</span>
                 <span
                   className={`subtab-mode-badge ${
-                    config.killProcessesEnabled && config.protectedProcessPatterns.length > 0
+                    config.killProcessesEnabled &&
+                    config.protectedProcessPatterns.length > 0
                       ? 'guard'
                       : 'muted'
                   }`}
@@ -2614,897 +297,114 @@ export const MainDashboard: React.FC = () => {
               </button>
             </div>
 
-            {monitorSubTab === 'status' ? (
-              <>
-                {/* 1. 当前出口状态主卡片 */}
-                <section className={`hero-card ${statusMeta.cls}`}>
-                  <div className="hero-top-row">
-                    <div className={`status-pill ${statusMeta.cls}`}>
-                      {statusMeta.icon}
-                      <span>{statusMeta.badge}</span>
-                    </div>
-                    <button
-                      className="btn-refresh"
-                      disabled={isChecking}
-                      onClick={() =>
-                        void window.guardAPI
-                          .checkNow('手动立即刷新')
-                          .then(setState)
-                          .catch((err) => notifyError(err, 'global'))
-                      }
-                    >
-                      <RefreshCw className={isChecking ? 'spin' : ''} size={14} />
-                      <span>{isChecking ? '检测中...' : '立即检测'}</span>
-                    </button>
-                  </div>
-
-                  {lastProbe ? (
-                    <div className="hero-main-info">
-                      <div className="hero-country-row">
-                        <CountryFlag code={lastProbe.countryCode} size="lg" />
-                        <div className="hero-country-titles">
-                          <div className="country-primary">
-                            <h1>{lastProbe.countryName}</h1>
-                            <span className="iso-pill">{lastProbe.countryCode}</span>
-                            {lastProbe.edgeLoc &&
-                              isValidIsoCountryCode(lastProbe.countryCode) &&
-                              lastProbe.edgeLoc !== lastProbe.countryCode && (
-                                <span
-                                  className="edge-hint-pill"
-                                  title="IP 离线库归属地与 CDN 边缘节点物理位置不同（常见于广播 IP 或跨区路由）"
-                                >
-                                  路由点: {lastProbe.edgeLoc}
-                                </span>
-                              )}
-                          </div>
-                          <div className="ip-row">
-                            <span className="ip-label">出口 IP:</span>
-                            <code className="ip-code">{lastProbe.ip}</code>
-                            <button
-                              className="btn-icon-tiny"
-                              onClick={handleCopyIp}
-                              title="复制出口 IP"
-                            >
-                              {copiedIp ? <Check size={13} /> : <Copy size={13} />}
-                            </button>
-                            <span className="latency-tag">{lastProbe.latencyMs} ms</span>
-                          </div>
-                        </div>
-                      </div>
-
-                      {lastError && status === 'error' && (
-                        <div className="inline-error-banner">
-                          <WifiOff size={14} />
-                          <span>最新检测异常：{lastError}</span>
-                        </div>
-                      )}
-
-                      <div className="hero-footer-meta">
-                        <span className="ellipsis" title={lastProbe.viaChannel}>
-                          检测通道：{lastProbe.viaChannel}
-                        </span>
-                        <span>更新于 {formatTime(lastProbe.checkedAt)}</span>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="hero-empty-state">
-                      {lastError ? (
-                        <div className="error-empty-box">
-                          <WifiOff size={28} />
-                          <p>{lastError}</p>
-                          <small>请确认 Clash Verge 已连接并选择有效节点</small>
-                        </div>
-                      ) : (
-                        <p>正在通过代理隧道验证真实出口 IP...</p>
-                      )}
-                    </div>
-                  )}
-                </section>
-
-                {/* 2. Windows 时区与区域同步卡片 */}
-                <section className="panel-card">
-                  <div className="panel-card-header">
-                    <div className="panel-title">
-                      <Globe size={15} />
-                      <span>Windows 时区与区域</span>
-                    </div>
-                    {effectiveTargetCode && (
-                      <span
-                        className={`mini-badge ${
-                          isWinLocaleMatched
-                            ? 'connected'
-                            : config.defaultCountryCode
-                            ? 'warn-badge'
-                            : 'neutral'
-                        }`}
-                      >
-                        {isWinLocaleMatched
-                          ? '已与目标地区一致'
-                          : config.defaultCountryCode
-                          ? '与保护地区不一致'
-                          : '与当前出口不同 (可选同步)'}
-                      </span>
-                    )}
-                  </div>
-
-                  <div className="win-locale-grid">
-                    <div className="win-locale-box">
-                      <div className="win-locale-icon">
-                        <Clock size={16} />
-                      </div>
-                      <div className="win-locale-info">
-                        <span className="win-locale-label">时区</span>
-                        <strong
-                          className="win-locale-val ellipsis"
-                          title={winLocale.timeZoneDisplayName}
-                        >
-                          {winLocale.timeZoneDisplayName}
-                        </strong>
-                      </div>
-                    </div>
-
-                    <div className="win-locale-box region-box">
-                      <div className="win-locale-icon">
-                        <CountryFlag code={winLocale.regionCode} size="sm" />
-                      </div>
-                      <div className="win-locale-info">
-                        <span className="win-locale-label">区域</span>
-                        <strong className="win-locale-val">{winLocale.regionName}</strong>
-                      </div>
-                    </div>
-                  </div>
-
-                  <div className="locale-actions-row">
-                    <button
-                      className="btn-sync-locale"
-                      disabled={!effectiveTargetCode || isSyncingLocale}
-                      onClick={() => void handleSyncLocale()}
-                      title={
-                        effectiveTargetCode
-                          ? '将 Windows 时区与区域同步至目标保护地区（多时区大国自动匹配城市时区）'
-                          : '请先选择代理节点或设置保护地区'
-                      }
-                    >
-                      <RefreshCw className={isSyncingLocale ? 'spin' : ''} size={14} />
-                      <span>
-                        {isSyncingLocale
-                          ? '正在设置系统时区...'
-                          : effectiveTargetName
-                          ? `一键同步至 [${effectiveTargetName}]`
-                          : '请先选择代理节点'}
-                      </span>
-                    </button>
-
-                    <button
-                      className="btn-restore-locale"
-                      disabled={isSyncingLocale || isAlreadyChinaDefaultLocale}
-                      onClick={() => void handleRestoreLocale()}
-                      title={
-                        isAlreadyChinaDefaultLocale
-                          ? '当前系统已处于默认中国时区与区域'
-                          : '若当前代理非中国，将先强杀 Claude 与守护进程后再还原回中国时区与区域'
-                      }
-                    >
-                      <RotateCcw size={14} />
-                      <span>
-                        {isAlreadyChinaDefaultLocale ? '已是中国时区' : '还原默认时区'}
-                      </span>
-                    </button>
-                  </div>
-
-                  {localeFeedback && (
-                    <div className={`locale-feedback ${localeFeedback.ok ? 'ok' : 'err'}`}>
-                      {localeFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
-                      <span>{localeFeedback.text}</span>
-                    </div>
-                  )}
-                </section>
-
-                {/* 3. 默认保护地区卡片 */}
-                <section className="panel-card">
-                  <div className="panel-card-header">
-                    <div className="panel-title">
-                      <Lock size={15} />
-                      <span>默认保护地区设置</span>
-                    </div>
-                    {config.defaultCountryCode && (
-                      <button
-                        className="btn-link-clear"
-                        onClick={() =>
-                          void window.guardAPI
-                            .setDefaultRegion(null)
-                            .then(setState)
-                            .catch((err) => notifyError(err, 'global'))
-                        }
-                        title="取消固定默认地区限制"
-                      >
-                        <Unlock size={13} />
-                        <span>清除默认</span>
-                      </button>
-                    )}
-                  </div>
-
-                  <div className="default-region-body">
-                    <div className="default-current-display">
-                      {config.defaultCountryCode ? (
-                        <>
-                          <CountryFlag code={config.defaultCountryCode} size="md" />
-                          <div className="default-text">
-                            <strong>
-                              {config.defaultCountryName} ({config.defaultCountryCode})
-                            </strong>
-                            <small>出口偏离该地区时立即告警并拦截受保护进程</small>
-                          </div>
-                        </>
-                      ) : (
-                        <div className="default-unset-hint">
-                          <span>未锁定固定地区，仅展示实时出口信息（不触发地区偏离红灯）</span>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="default-actions-row">
-                      <button
-                        className={`btn-primary-set ${
-                          isCurrentAlreadyDefault ? 'btn-already' : ''
-                        }`}
-                        disabled={!canLockCurrentProbe || isCurrentAlreadyDefault}
-                        onClick={() =>
-                          void window.guardAPI
-                            .setDefaultCurrent()
-                            .then(setState)
-                            .catch((err) => notifyError(err, 'global'))
-                        }
-                      >
-                        <Sparkles size={15} />
-                        <span>
-                          {isCurrentAlreadyDefault
-                            ? `当前 [${lastProbe?.countryName}] 已是默认`
-                            : canLockCurrentProbe && lastProbe
-                            ? `将当前 [${lastProbe.countryName}] 设为默认`
-                            : '等待检测有效地区...'}
-                        </span>
-                      </button>
-
-                      <select
-                        className="region-select"
-                        value={config.defaultCountryCode || ''}
-                        onChange={(e) => {
-                          const val = e.target.value || null;
-                          void window.guardAPI
-                            .setDefaultRegion(val)
-                            .then(setState)
-                            .catch((err) => notifyError(err, 'global'));
-                        }}
-                        title="也可直接手动指定期望的国家/地区"
-                      >
-                        <option value="">手动指定地区...</option>
-                        {isCustomCountryOutsideCommon && config.defaultCountryCode && (
-                          <option value={config.defaultCountryCode}>
-                            {config.defaultCountryName} ({config.defaultCountryCode})
-                          </option>
-                        )}
-                        {COMMON_COUNTRIES.map((c) => (
-                          <option key={c.code} value={c.code}>
-                            {c.name} ({c.code})
-                          </option>
-                        ))}
-                      </select>
-                    </div>
-                  </div>
-                </section>
-              </>
+            {ctrl.monitorSubTab === 'status' ? (
+              <MonitorStatusPane
+                state={state}
+                statusMeta={ctrl.statusMeta}
+                copiedIp={ctrl.copiedIp}
+                effectiveTargetCode={ctrl.effectiveTargetCode}
+                effectiveTargetName={ctrl.effectiveTargetName}
+                isWinLocaleMatched={ctrl.isWinLocaleMatched}
+                isAlreadyChinaDefaultLocale={ctrl.isAlreadyChinaDefaultLocale}
+                localeFeedback={ctrl.localeFeedback}
+                canLockCurrentProbe={ctrl.canLockCurrentProbe}
+                isCurrentAlreadyDefault={ctrl.isCurrentAlreadyDefault}
+                isCustomCountryOutsideCommon={ctrl.isCustomCountryOutsideCommon}
+                onCheckNow={() =>
+                  void window.guardAPI
+                    .checkNow('手动立即刷新')
+                    .then(ctrl.setState)
+                    .catch((err) => ctrl.notifyError(err, 'global'))
+                }
+                onCopyIp={ctrl.handleCopyIp}
+                onSyncLocale={() => void ctrl.handleSyncLocale()}
+                onRestoreLocale={() => void ctrl.handleRestoreLocale()}
+                onSetDefaultRegion={(code) =>
+                  void window.guardAPI
+                    .setDefaultRegion(code)
+                    .then(ctrl.setState)
+                    .catch((err) => ctrl.notifyError(err, 'global'))
+                }
+                onSetDefaultCurrent={() =>
+                  void window.guardAPI
+                    .setDefaultCurrent()
+                    .then(ctrl.setState)
+                    .catch((err) => ctrl.notifyError(err, 'global'))
+                }
+              />
             ) : (
-              <>
-                {/* 1. 强杀触发策略卡片 */}
-                <section className="panel-card">
-                  <div className="panel-card-header">
-                    <div className="panel-title">
-                      <ShieldAlert size={15} />
-                      <span>实时监控联动拦截条件</span>
-                    </div>
-                  </div>
-
-                  <div className="setting-row">
-                    <div>
-                      <strong>启用实时监控联动进程强杀</strong>
-                      <p>
-                        当实时监控通道异常时按进程树强杀下方列表应用（Claude 已由启动器专栏独立保护）
-                      </p>
-                    </div>
-                    <input
-                      type="checkbox"
-                      className="toggle-switch"
-                      checked={config.killProcessesEnabled}
-                      onChange={(e) =>
-                        void updateConfigSafe(
-                          { killProcessesEnabled: e.target.checked },
-                          'global'
-                        )
-                      }
-                    />
-                  </div>
-
-                  <div className="setting-row">
-                    <div>
-                      <strong>代理断连或超时时强杀</strong>
-                      <p>实时监控代理连接断开或探测超时期间禁止运行</p>
-                    </div>
-                    <input
-                      type="checkbox"
-                      className="toggle-switch"
-                      disabled={!config.killProcessesEnabled}
-                      checked={config.killOnDisconnect}
-                      onChange={(e) =>
-                        void updateConfigSafe(
-                          { killOnDisconnect: e.target.checked },
-                          'global'
-                        )
-                      }
-                    />
-                  </div>
-
-                  <div className="setting-row no-border-bottom">
-                    <div>
-                      <strong>系统时区/区域不一致时强杀</strong>
-                      <p>系统时区或国家区域与实时监控保护地区不符时立即终止</p>
-                    </div>
-                    <input
-                      type="checkbox"
-                      className="toggle-switch"
-                      disabled={!config.killProcessesEnabled}
-                      checked={config.killOnLocaleMismatch}
-                      onChange={(e) =>
-                        void updateConfigSafe(
-                          { killOnLocaleMismatch: e.target.checked },
-                          'global'
-                        )
-                      }
-                    />
-                  </div>
-                </section>
-
-                {/* 2. 进程匹配规则列表卡片 */}
-                <section className="panel-card">
-                  <div className="panel-card-header">
-                    <div className="panel-title">
-                      <Lock size={15} />
-                      <span>联动守护进程列表</span>
-                    </div>
-                    <span className="mini-badge neutral">
-                      共 {config.protectedProcessPatterns.length} 条
-                    </span>
-                  </div>
-
-                  <div className="pattern-input-group">
-                    <div className="pattern-input-row">
-                      <input
-                        type="text"
-                        value={patternInput}
-                        onChange={(e) => {
-                          setPatternInput(e.target.value);
-                          if (patternSubmitErr) setPatternSubmitErr(null);
-                        }}
-                        onKeyDown={(e) => {
-                          if (e.key === 'Enter') {
-                            void handleAddPattern();
-                          }
-                        }}
-                        placeholder="输入进程名、通配符或正则，如 *cursor*"
-                      />
-                      <button
-                        className="btn-save-inline"
-                        onClick={() => void handleAddPattern()}
-                      >
-                        <Plus size={14} />
-                        <span>添加</span>
-                      </button>
-                    </div>
-
-                    {patternSubmitErr ? (
-                      <div className="pattern-hint err">
-                        <AlertTriangle size={12} />
-                        <span>{patternSubmitErr}</span>
-                      </div>
-                    ) : livePatternCheck ? (
-                      livePatternCheck.valid ? (
-                        <div className="pattern-hint valid">
-                          <Check size={12} />
-                          <span>
-                            识别为
-                            <strong>
-                              {livePatternCheck.mode === 'regex' ? ' 正则表达式 ' : ' 通配符 '}
-                            </strong>
-                            模式（回车添加）
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="pattern-hint err">
-                          <AlertTriangle size={12} />
-                          <span>{livePatternCheck.error}</span>
-                        </div>
-                      )
-                    ) : (
-                      <p className="pattern-syntax-tip">
-                        支持通配符（如 <code>*cursor*</code>）或正则（<code>/pattern/</code>
-                        ），大小写不敏感。
-                      </p>
-                    )}
-                  </div>
-
-                  {config.protectedProcessPatterns.length === 0 ? (
-                    <div className="pattern-empty">
-                      Claude 已由启动器专栏内置保护。如需根据实时监控通道联动保护其他应用，可在上方添加规则。
-                    </div>
-                  ) : (
-                    <div className="pattern-list">
-                      {config.protectedProcessPatterns.map((pat) => {
-                        const info = inspectProcessPattern(pat);
-                        return (
-                          <div key={pat} className="pattern-item">
-                            <div className="pattern-item-left">
-                              <code className="pattern-code">{pat}</code>
-                              <span
-                                className={`pattern-mode-tag ${
-                                  info.mode === 'regex' ? 'regex' : 'wildcard'
-                                }`}
-                              >
-                                {info.mode === 'regex' ? '正则' : '通配符'}
-                              </span>
-                            </div>
-                            <button
-                              className="btn-remove-pattern"
-                              onClick={() => void handleRemovePattern(pat)}
-                              title="移除该规则"
-                            >
-                              <Trash2 size={14} />
-                            </button>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  )}
-                </section>
-              </>
+              <ProcessGuardPane
+                config={config}
+                patternInput={ctrl.patternInput}
+                patternSubmitErr={ctrl.patternSubmitErr}
+                livePatternCheck={ctrl.livePatternCheck}
+                onUpdateConfig={(partial) =>
+                  void ctrl.updateConfigSafe(partial, 'global')
+                }
+                onChangePatternInput={(val) => {
+                  ctrl.setPatternInput(val);
+                  if (ctrl.patternSubmitErr) ctrl.setPatternSubmitErr(null);
+                }}
+                onAddPattern={() => void ctrl.handleAddPattern()}
+                onRemovePattern={(pat) => void ctrl.handleRemovePattern(pat)}
+              />
             )}
           </div>
         )}
 
-        {activeTab === 'settings' && (
-          <div className="tab-pane">
-            {/* 1. 实时监控专属设置（检测通道模式 + 监控异常告警） */}
-            <section className="panel-card">
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <Activity size={15} />
-                  <span>实时监控设置（通道与告警）</span>
-                </div>
-                <span className="mini-badge neutral">仅作用于实时监控</span>
-              </div>
-
-              <div className="radio-group">
-                <label className={`radio-card ${displayedProxyMode === 'auto' ? 'selected' : ''}`}>
-                  <input
-                    type="radio"
-                    name="proxyMode"
-                    checked={displayedProxyMode === 'auto'}
-                    onChange={() => void handleSwitchNonManualMode('auto')}
-                  />
-                  <div>
-                    <strong>自动识别 Clash 选中通道（推荐）</strong>
-                    <p>优先跟随 Clash Verge，未连接时回退系统代理或直连</p>
-                  </div>
-                </label>
-
-                <label
-                  className={`radio-card ${displayedProxyMode === 'manual' ? 'selected' : ''}`}
-                >
-                  <input
-                    type="radio"
-                    name="proxyMode"
-                    checked={displayedProxyMode === 'manual'}
-                    onChange={() => {
-                      if (config.proxyMode !== 'manual') {
-                        setPendingManualMode(true);
-                      }
-                    }}
-                  />
-                  <div>
-                    <strong>手动指定本地代理端口</strong>
-                    <p>固定使用自定义 HTTP / SOCKS5 代理检测</p>
-                  </div>
-                </label>
-
-                {displayedProxyMode === 'manual' && (
-                  <div className="manual-proxy-form">
-                    <select
-                      value={manualProto}
-                      onChange={(e) => setManualProto(e.target.value as 'http' | 'socks5')}
-                    >
-                      <option value="http">HTTP</option>
-                      <option value="socks5">SOCKS5</option>
-                    </select>
-                    <input
-                      type="text"
-                      value={manualHost}
-                      onChange={(e) => setManualHost(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') void handleSaveManualProxy();
-                      }}
-                      placeholder="127.0.0.1"
-                    />
-                    <input
-                      type="number"
-                      className="port-input"
-                      value={manualPort}
-                      onChange={(e) => setManualPort(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === 'Enter') void handleSaveManualProxy();
-                      }}
-                      placeholder="7890"
-                    />
-                    <button
-                      className="btn-save-inline"
-                      onClick={() => void handleSaveManualProxy()}
-                    >
-                      {config.proxyMode === 'manual' ? '保存重测' : '启用并重测'}
-                    </button>
-                  </div>
-                )}
-
-                <label
-                  className={`radio-card ${displayedProxyMode === 'direct' ? 'selected' : ''}`}
-                >
-                  <input
-                    type="radio"
-                    name="proxyMode"
-                    checked={displayedProxyMode === 'direct'}
-                    onChange={() => void handleSwitchNonManualMode('direct')}
-                  />
-                  <div>
-                    <strong>强制纯网卡直连（仅限全局 TUN 模式）</strong>
-                    <p>忽略系统代理，直接检测默认网卡出口</p>
-                  </div>
-                </label>
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>实时监控异常弹窗告警</strong>
-                  <p>出口地区/时区不符或触发联动强杀时置顶提醒</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  checked={config.monitorAlertEnabled}
-                  onChange={(e) =>
-                    void updateConfigSafe(
-                      { monitorAlertEnabled: e.target.checked },
-                      'global'
-                    )
-                  }
-                />
-              </div>
-
-              <div className="setting-row no-border-bottom">
-                <div>
-                  <strong>实时监控断连或超时报警</strong>
-                  <p>代理连接失败或节点超时时弹窗（需开启上方告警）</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  disabled={!config.monitorAlertEnabled}
-                  checked={config.alertOnDisconnect}
-                  onChange={(e) =>
-                    void updateConfigSafe(
-                      { alertOnDisconnect: e.target.checked },
-                      'global'
-                    )
-                  }
-                />
-              </div>
-            </section>
-
-            {/* 2. 软件全局通用设置 */}
-            <section className="panel-card">
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <Settings size={15} />
-                  <span>软件全局通用设置</span>
-                </div>
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>运行期后台巡检间隔</strong>
-                  <p>定时复核出口 IP 漂移（作用于 Claude 与实时监控）</p>
-                </div>
-                <select
-                  className="compact-select"
-                  value={config.heartbeatIntervalSec}
-                  onChange={(e) =>
-                    void updateConfigSafe(
-                      { heartbeatIntervalSec: Number(e.target.value) },
-                      'global'
-                    )
-                  }
-                >
-                  <option value={0}>仅本地事件触发</option>
-                  <option value={5}>每 5 秒</option>
-                  <option value={10}>每 10 秒</option>
-                  <option value={15}>每 15 秒 (推荐)</option>
-                  <option value={30}>每 30 秒</option>
-                  <option value={60}>每 60 秒</option>
-                </select>
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>异常警告提示音</strong>
-                  <p>触发置顶告警弹窗时播放声音提醒</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  checked={config.alertSoundEnabled}
-                  onChange={(e) =>
-                    void updateConfigSafe(
-                      { alertSoundEnabled: e.target.checked },
-                      'global'
-                    )
-                  }
-                />
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>关闭窗口时最小化到托盘</strong>
-                  <p>开启时隐藏窗口，关闭时销毁窗口；后台代理和安全检查持续运行</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  checked={config.closeToTray}
-                  onChange={(e) =>
-                    void updateConfigSafe(
-                      { closeToTray: e.target.checked },
-                      'global'
-                    )
-                  }
-                />
-              </div>
-
-              <div className="setting-row">
-                <div>
-                  <strong>开机自动启动</strong>
-                  <p>登录 Windows 时静默启动并驻留托盘</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  checked={config.autoLaunch}
-                  onChange={(e) =>
-                    void updateConfigSafe(
-                      { autoLaunch: e.target.checked },
-                      'global'
-                    )
-                  }
-                />
-              </div>
-
-              <div className="custom-probe-box">
-                <label>
-                  自定义探测 URL（留空默认 Cloudflare / AWS 探测源）：
-                </label>
-                <div className="custom-probe-row">
-                  <input
-                    type="text"
-                    value={customProbe}
-                    onChange={(e) => {
-                      setCustomProbe(e.target.value);
-                      if (probeUrlErr) setProbeUrlErr(null);
-                    }}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') void handleSaveCustomProbe();
-                    }}
-                    placeholder="例如 https://cp.cloudflare.com/cdn-cgi/trace"
-                  />
-                  <button
-                    className="btn-save-inline"
-                    onClick={() => void handleSaveCustomProbe()}
-                  >
-                    应用
-                  </button>
-                </div>
-                {probeUrlErr && (
-                  <div className="pattern-hint err">
-                    <AlertTriangle size={12} />
-                    <span>{probeUrlErr}</span>
-                  </div>
-                )}
-              </div>
-            </section>
-
-            {/* 3. 版本与自动更新设置 */}
-            <section
-              className={`panel-card update-card ${
-                updateState.status === 'downloaded' || updateState.status === 'applying'
-                  ? 'has-ready-update'
-                  : hasNewUpdate
-                  ? 'has-available-update'
-                  : ''
-              }`}
-            >
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <Sparkles size={15} />
-                  <span>版本与自动更新</span>
-                  <span className="mini-badge neutral">v{updateState.currentVersion}</span>
-                </div>
-                <div className="update-header-actions">
-                  <button
-                    type="button"
-                    className="btn-link-clear"
-                    onClick={handleOpenReleasePage}
-                    title="在浏览器中打开 GitHub Releases 页面"
-                  >
-                    <ExternalLink size={12} />
-                    <span>GitHub</span>
-                  </button>
-                  <button
-                    type="button"
-                    className="btn-refresh"
-                    disabled={isUpdateBusy}
-                    onClick={() => void handleCheckForUpdates()}
-                  >
-                    <RefreshCw
-                      size={13}
-                      className={updateState.status === 'checking' ? 'spin' : ''}
-                    />
-                    <span>
-                      {updateState.status === 'checking' ? '正在检查...' : '检查更新'}
-                    </span>
-                  </button>
-                </div>
-              </div>
-
-              <div className="update-meta-summary">
-                <span>
-                  当前版本 <strong>v{updateState.currentVersion}</strong> · Electron{' '}
-                  {updateState.electronVersion}
-                  {!updateState.isPackaged && ' · 源码运行模式'}
-                </span>
-                {updateState.lastCheckedAt && (
-                  <span className="update-last-checked">
-                    上次检查 {formatTime(updateState.lastCheckedAt)}
-                  </span>
-                )}
-              </div>
-
-              {updateFeedback && (
-                <div className={`locale-feedback ${updateFeedback.ok ? 'ok' : 'err'}`}>
-                  {updateFeedback.ok ? <Check size={14} /> : <AlertTriangle size={14} />}
-                  <span>{updateFeedback.text}</span>
-                </div>
-              )}
-
-              {Boolean(updateState.error) && !updateFeedback && (
-                <div className="locale-feedback err">
-                  <AlertTriangle size={14} />
-                  <span>{updateState.error}</span>
-                </div>
-              )}
-
-              {renderUpdateReleaseBox(false)}
-
-              <div className="setting-row">
-                <div>
-                  <strong>自动检查版本更新</strong>
-                  <p>启动与打开面板时按需检测（30 分钟冷却），正式版自动预下载增量包</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  checked={config.autoCheckUpdates}
-                  onChange={(e) =>
-                    void updateConfigSafe(
-                      { autoCheckUpdates: e.target.checked },
-                      'global'
-                    )
-                  }
-                />
-              </div>
-
-              <div className="setting-row no-border-bottom">
-                <div>
-                  <strong>GitHub 下载加速镜像兜底</strong>
-                  <p>连接超时时自动切换公开镜像，全程签名校验防篡改</p>
-                </div>
-                <input
-                  type="checkbox"
-                  className="toggle-switch"
-                  checked={config.useUpdateMirrorFallback}
-                  onChange={(e) =>
-                    void updateConfigSafe(
-                      { useUpdateMirrorFallback: e.target.checked },
-                      'global'
-                    )
-                  }
-                />
-              </div>
-            </section>
-          </div>
+        {ctrl.activeTab === 'settings' && (
+          <SettingsPane
+            config={config}
+            updateState={updateState}
+            displayedProxyMode={ctrl.displayedProxyMode}
+            manualProto={ctrl.manualProto}
+            manualHost={ctrl.manualHost}
+            manualPort={ctrl.manualPort}
+            customProbe={ctrl.customProbe}
+            probeUrlErr={ctrl.probeUrlErr}
+            hasNewUpdate={ctrl.hasNewUpdate}
+            isUpdateBusy={ctrl.isUpdateBusy}
+            isApplyingUpdate={ctrl.isApplyingUpdate}
+            pendingUpdateConfirm={ctrl.pendingUpdateConfirm}
+            isClaudeActiveForUpdate={ctrl.isClaudeActiveForUpdate}
+            updateFeedback={ctrl.updateFeedback}
+            onSwitchNonManualMode={(mode) => void ctrl.handleSwitchNonManualMode(mode)}
+            onSelectManualMode={() => {
+              if (config.proxyMode !== 'manual') {
+                ctrl.setPendingManualMode(true);
+              }
+            }}
+            onChangeManualProto={ctrl.setManualProto}
+            onChangeManualHost={ctrl.setManualHost}
+            onChangeManualPort={ctrl.setManualPort}
+            onSaveManualProxy={() => void ctrl.handleSaveManualProxy()}
+            onUpdateConfig={(partial) => void ctrl.updateConfigSafe(partial, 'global')}
+            onChangeCustomProbe={(url) => {
+              ctrl.setCustomProbe(url);
+              if (ctrl.probeUrlErr) ctrl.setProbeUrlErr(null);
+            }}
+            onSaveCustomProbe={() => void ctrl.handleSaveCustomProbe()}
+            onOpenReleasePage={ctrl.handleOpenReleasePage}
+            onCheckForUpdates={() => void ctrl.handleCheckForUpdates()}
+            onDownloadUpdate={() => void ctrl.handleDownloadUpdate()}
+            onClickApplyUpdate={ctrl.handleClickApplyUpdate}
+            onConfirmApplyUpdate={() => void ctrl.executeApplyUpdate(true)}
+            onCancelUpdateConfirm={() => ctrl.setPendingUpdateConfirm(false)}
+          />
         )}
 
-        {activeTab === 'logs' && (
-          <div className="tab-pane">
-            <section className="panel-card logs-card">
-              <div className="panel-card-header">
-                <div className="panel-title">
-                  <History size={15} />
-                  <span>最近状态与变更记录</span>
-                </div>
-                {logs.length > 0 && (
-                  <button
-                    className="btn-link-clear"
-                    onClick={() =>
-                      void window.guardAPI
-                        .clearLogs()
-                        .then(setState)
-                        .catch((err) => notifyError(err, 'global'))
-                    }
-                  >
-                    <Trash2 size={13} />
-                    <span>清空记录</span>
-                  </button>
-                )}
-              </div>
-
-              {logs.length === 0 ? (
-                <div className="logs-empty">暂无变更记录</div>
-              ) : (
-                <div className="logs-list">
-                  {logs.map((item) => (
-                    <div key={item.id} className={`log-item log-${item.level}`}>
-                      <span className="log-time">{formatTime(item.timestamp)}</span>
-                      <span className="log-msg">{item.message}</span>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </section>
-          </div>
+        {ctrl.activeTab === 'logs' && (
+          <LogsPane
+            logs={logs}
+            onClearLogs={() =>
+              void window.guardAPI
+                .clearLogs()
+                .then(ctrl.setState)
+                .catch((err) => ctrl.notifyError(err, 'global'))
+            }
+          />
         )}
       </main>
     </div>
   );
 };
-
-function formatBytes(bytes: number | null | undefined): string {
-  if (bytes === null || bytes === undefined || !Number.isFinite(bytes) || bytes <= 0) {
-    return '未知大小';
-  }
-  if (bytes < 1024) return `${bytes} B`;
-  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-function formatReleaseDate(iso: string): string {
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime()) || d.getUTCFullYear() <= 1970) {
-    return '';
-  }
-  const yyyy = d.getFullYear();
-  const mm = String(d.getMonth() + 1).padStart(2, '0');
-  const dd = String(d.getDate()).padStart(2, '0');
-  return `${yyyy}-${mm}-${dd}`;
-}
-
-function formatTime(ts: number): string {
-  const d = new Date(ts);
-  const hh = String(d.getHours()).padStart(2, '0');
-  const mm = String(d.getMinutes()).padStart(2, '0');
-  const ss = String(d.getSeconds()).padStart(2, '0');
-  return `${hh}:${mm}:${ss}`;
-}

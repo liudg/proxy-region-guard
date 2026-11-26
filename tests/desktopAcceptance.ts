@@ -2,7 +2,7 @@ import { app } from 'electron';
 import * as path from 'node:path';
 import * as fs from 'node:fs';
 import { execFileSync } from 'node:child_process';
-import { ConfigStore } from '../electron/configStore';
+import { ConfigStore } from '../electron/system';
 
 const directory = process.env.GUARD_TEST_DATA;
 if (!directory) throw new Error('桌面验收需要独立数据目录');

@@ -4,7 +4,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn, ChildProcess } from 'node:child_process';
 import { once } from 'node:events';
-import { configureAppUserData } from '../electron/appIdentity';
+import { configureAppUserData } from '../electron/system';
 
 const rawRoot = process.env.GUARD_TEST_DATA;
 if (!rawRoot) throw new Error('实例测试需要独立数据目录');

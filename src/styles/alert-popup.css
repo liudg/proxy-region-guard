@@ -1,0 +1,319 @@
+/* =========================================================
+   软件自绘独立置顶警告弹窗样式 (AlertPopup)
+   ========================================================= */
+.alert-popup-card {
+  width: 100%;
+  height: 100%;
+  border-radius: 14px;
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  background: #111827;
+  border: 1.5px solid rgba(239, 68, 68, 0.78);
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.65);
+}
+
+.alert-popup-card.alert-mismatch {
+  background: linear-gradient(155deg, #2a1019 0%, #111827 55%);
+  border-color: #ef4444;
+}
+
+.alert-popup-card.alert-disconnect {
+  background: linear-gradient(155deg, #2b1d0e 0%, #111827 55%);
+  border-color: #f59e0b;
+}
+
+.alert-popup-card.alert-recovered {
+  background: linear-gradient(155deg, #0d2922 0%, #111827 55%);
+  border-color: #10b981;
+}
+
+.alert-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.alert-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.alert-pulse-icon {
+  width: 28px;
+  height: 28px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(239, 68, 68, 0.22);
+  color: #f87171;
+}
+.alert-disconnect .alert-pulse-icon {
+  background: rgba(245, 158, 11, 0.22);
+  color: #fbbf24;
+}
+.alert-recovered .alert-pulse-icon {
+  background: rgba(16, 185, 129, 0.22);
+  color: #34d399;
+}
+
+.alert-title-text {
+  font-size: 14.5px;
+  font-weight: 700;
+  color: #fff;
+}
+
+.icon-close-btn {
+  width: 26px;
+  height: 26px;
+  border: none;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.icon-close-btn:hover {
+  background: rgba(239, 68, 68, 0.35);
+  color: #fff;
+}
+
+.alert-body {
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 9px;
+  min-height: 0;
+  overflow-y: auto;
+  margin: 10px 0;
+}
+
+.alert-body > * {
+  flex-shrink: 0;
+}
+
+.alert-detail {
+  overflow-wrap: anywhere;
+  white-space: normal;
+  user-select: text;
+}
+
+.alert-meta-item:has(.alert-detail) {
+  align-items: flex-start;
+}
+
+.alert-compare-grid {
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  gap: 8px;
+}
+
+.compare-box {
+  min-width: 0;
+  padding: 9px 10px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid rgba(148, 163, 184, 0.16);
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.compare-box.actual.danger {
+  border-color: rgba(239, 68, 68, 0.55);
+  background: rgba(239, 68, 68, 0.13);
+}
+.compare-box.actual.ok {
+  border-color: rgba(16, 185, 129, 0.55);
+  background: rgba(16, 185, 129, 0.13);
+}
+
+.compare-label {
+  font-size: 10.5px;
+  color: var(--text-secondary);
+}
+
+.compare-region-main {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.compare-region-text {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+.compare-region-text strong {
+  font-size: 13.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.compare-region-text small {
+  font-size: 10.5px;
+  color: var(--text-muted);
+}
+
+.compare-arrow {
+  color: #f87171;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+.alert-recovered .compare-arrow {
+  color: #34d399;
+}
+
+.alert-disconnect-box {
+  padding: 10px 12px;
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.7);
+  border: 1px solid rgba(245, 158, 11, 0.4);
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.disconnect-expect-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12.5px;
+}
+.disconnect-err-msg {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  font-size: 12px;
+  color: #fcd34d;
+  line-height: 1.4;
+}
+.disconnect-err-msg svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+}
+
+.alert-killed-banner {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  padding: 6px 10px;
+  border-radius: 7px;
+  background: rgba(239, 68, 68, 0.22);
+  border: 1px solid rgba(248, 113, 113, 0.45);
+  color: #fecaca;
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.45;
+}
+.alert-killed-banner svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: #f87171;
+}
+
+.alert-kill-error {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding: 5px 9px;
+  border-radius: 6px;
+  background: rgba(245, 158, 11, 0.2);
+  border: 1px solid rgba(245, 158, 11, 0.35);
+  color: #fde68a;
+  font-size: 11px;
+  line-height: 1.45;
+}
+.alert-kill-error svg {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: #fbbf24;
+}
+
+.alert-meta-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11.5px;
+  margin-top: auto;
+  padding-top: 8px;
+  border-top: 1px solid rgba(148, 163, 184, 0.12);
+}
+.alert-meta-item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  min-width: 0;
+  line-height: 1.45;
+}
+.meta-k {
+  color: var(--text-muted);
+  flex-shrink: 0;
+}
+.meta-v {
+  color: #e2e8f0;
+}
+.broadcast-tag {
+  font-size: 10.5px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: rgba(245, 158, 11, 0.2);
+  color: #fbbf24;
+}
+
+.alert-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 7px;
+}
+
+.btn-alert-primary,
+.btn-alert-secondary,
+.btn-alert-ghost {
+  height: 31px;
+  padding: 0 11px;
+  border-radius: 7px;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  border: none;
+}
+
+.btn-alert-primary {
+  background: #ef4444;
+  color: #fff;
+}
+.alert-disconnect .btn-alert-primary {
+  background: #f59e0b;
+  color: #111827;
+}
+.alert-recovered .btn-alert-primary {
+  background: #10b981;
+  color: #fff;
+}
+.btn-alert-primary:hover {
+  filter: brightness(1.1);
+}
+
+.btn-alert-secondary {
+  background: rgba(59, 130, 246, 0.2);
+  border: 1px solid rgba(59, 130, 246, 0.45);
+  color: #93c5fd;
+  margin-right: auto;
+}
+.btn-alert-secondary:hover {
+  background: rgba(59, 130, 246, 0.32);
+}
+
+.btn-alert-ghost {
+  background: rgba(148, 163, 184, 0.14);
+  color: var(--text-primary);
+}
+.btn-alert-ghost:hover {
+  background: rgba(148, 163, 184, 0.24);
+}

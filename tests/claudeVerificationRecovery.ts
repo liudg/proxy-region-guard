@@ -8,7 +8,7 @@ import { setTimeout as delay } from 'node:timers/promises';
 import {
   ClaudeVerificationRecovery,
   normalizeVerificationFailureSignature,
-} from '../electron/claudeVerificationRecovery';
+} from '../electron/guard';
 
 const listener = net.createServer((socket) => socket.end());
 let port: number;

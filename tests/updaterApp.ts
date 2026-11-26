@@ -2,7 +2,7 @@ import { app, BrowserWindow } from 'electron';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { spawn } from 'node:child_process';
-import { readUpdateFailureReason, recordUpdateBootEvent, writeUpdateReadyFile } from '../electron/updateBoot';
+import { readUpdateFailureReason, recordUpdateBootEvent, writeUpdateReadyFile } from '../electron/updater';
 
 const root = process.env.GUARD_UPDATER_TEST_ROOT!;
 if (!root) throw new Error('更新测试需要独立目录');

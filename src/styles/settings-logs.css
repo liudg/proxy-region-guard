@@ -1,0 +1,202 @@
+/* 设置页样式 */
+.radio-group {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.radio-card {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 9px;
+  border: 1px solid var(--border-subtle);
+  background: rgba(15, 23, 42, 0.45);
+  cursor: pointer;
+  transition: all 0.15s;
+}
+.radio-card.selected {
+  border-color: rgba(59, 130, 246, 0.55);
+  background: rgba(59, 130, 246, 0.1);
+}
+.radio-card input {
+  margin-top: 3px;
+  accent-color: #3b82f6;
+}
+.radio-card strong {
+  display: block;
+  font-size: 12.5px;
+  margin-bottom: 2px;
+}
+.radio-card p {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.manual-proxy-form {
+  display: flex;
+  gap: 6px;
+  padding: 4px 2px 4px 24px;
+}
+.manual-proxy-form select,
+.manual-proxy-form input,
+.custom-probe-row input {
+  height: 32px;
+  padding: 0 9px;
+  border-radius: 6px;
+  border: 1px solid var(--border-subtle);
+  background: #0f172a;
+  color: var(--text-primary);
+  font-size: 12px;
+  outline: none;
+}
+.manual-proxy-form input {
+  flex: 1;
+  min-width: 0;
+}
+.manual-proxy-form .port-input {
+  width: 78px;
+  flex: none;
+}
+
+.btn-save-inline {
+  height: 34px;
+  padding: 0 13px;
+  border-radius: 7px;
+  border: none;
+  background: #2563eb;
+  color: #fff;
+  font-size: 12px;
+  font-weight: 500;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+.btn-save-inline:hover {
+  background: #3b82f6;
+}
+
+.setting-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 0;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.08);
+}
+.setting-row.no-border-bottom {
+  border-bottom: none;
+  padding-bottom: 2px;
+}
+.setting-row strong {
+  display: block;
+  font-size: 12.5px;
+  margin-bottom: 2px;
+}
+.setting-row p {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+
+.toggle-switch {
+  appearance: none;
+  width: 38px;
+  height: 21px;
+  border-radius: 999px;
+  background: #334155;
+  position: relative;
+  cursor: pointer;
+  flex-shrink: 0;
+  transition: background 0.2s;
+}
+.toggle-switch::after {
+  content: '';
+  position: absolute;
+  top: 2.5px;
+  left: 3px;
+  width: 16px;
+  height: 16px;
+  border-radius: 50%;
+  background: #fff;
+  transition: transform 0.2s;
+}
+.toggle-switch:checked {
+  background: #10b981;
+}
+.toggle-switch:checked::after {
+  transform: translateX(16px);
+}
+.toggle-switch:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.custom-probe-box {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding-top: 4px;
+}
+.custom-probe-box label {
+  font-size: 11.5px;
+  color: var(--text-secondary);
+}
+.custom-probe-row {
+  display: flex;
+  gap: 6px;
+}
+.custom-probe-row input {
+  flex: 1;
+}
+
+/* 日志列表 */
+.logs-card {
+  min-height: 480px;
+}
+.logs-empty {
+  text-align: center;
+  padding: 40px 0;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+.logs-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.log-item {
+  display: flex;
+  gap: 9px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  font-size: 12px;
+  background: rgba(15, 23, 42, 0.55);
+  border-left: 3px solid #64748b;
+}
+.log-item.log-info {
+  border-left-color: #3b82f6;
+}
+.log-item.log-success {
+  border-left-color: #10b981;
+}
+.log-item.log-warn {
+  border-left-color: #f59e0b;
+}
+.log-item.log-danger {
+  border-left-color: #ef4444;
+  background: rgba(239, 68, 68, 0.1);
+}
+.log-time {
+  color: var(--text-muted);
+  font-family: 'Consolas', monospace;
+  flex-shrink: 0;
+}
+.log-msg {
+  color: var(--text-primary);
+  word-break: break-word;
+}

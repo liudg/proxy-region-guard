@@ -13,3 +13,4 @@
 - **底层取消零残留**：`AbortSignal` 须贯穿代理 Socket 与子进程销毁（SOCKS 统一 `socks5h://`），探测与自愈须校验世代（`probeSeq` / `recoveryEpoch` / `generation`），禁 `Promise.race` 伪超时与退出残留。
 - **手写打包同步**：读写 `.asar` 用 `original-fs`；改依赖、`resources/` 或更新清单须同步 `build-electron.mjs`、`package-release.mjs` 与 `updateManifest.ts`（验证打包加 `--out-dir <临时目录> --no-kill-running --no-relaunch`，禁交私钥）。
 - **Windows 细节**：拉起 Electron 须 `delete env.ELECTRON_RUN_AS_NODE`；PowerShell 经环境变量 + `-LiteralPath` 兼容中文、空格与 `[]` 路径；MSIX 别名重解析点用 `fs.lstatSync` 判存。
+- **用户视角界面**：界面只呈现终端用户操作与决策所必需的信息，不带入开发者视角。

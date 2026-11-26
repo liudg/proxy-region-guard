@@ -10,19 +10,22 @@ import { createHash, generateKeyPairSync, randomUUID } from 'node:crypto';
 import { setTimeout as delay } from 'node:timers/promises';
 import { SocksProxyAgent } from 'socks-proxy-agent';
 import * as yaml from 'js-yaml';
-import { PrivateProxyService, PrivateKernel, verifyCore } from '../electron/privateKernel';
-import { SubscriptionCatalog, NodeSnapshot } from '../electron/subscriptionCatalog';
-import { ClashMonitor } from '../electron/clashMonitor';
-import { mihomoRequest, MihomoEndpoint } from '../electron/mihomoClient';
-import { ConfigStore } from '../electron/configStore';
-import { signUpdateManifest, verifyUpdateManifestSignature } from '../electron/updateCrypto';
+import { PrivateProxyService, PrivateKernel, verifyCore } from '../electron/kernel';
+import {
+  SubscriptionCatalog,
+  NodeSnapshot,
+  ClashMonitor,
+  mihomoRequest,
+  MihomoEndpoint,
+} from '../electron/clash';
+import { ConfigStore } from '../electron/system';
+import { signUpdateManifest, verifyUpdateManifestSignature } from '../electron/updater';
 import { UpdateReleaseManifest, validateUpdateManifestStructure } from '../src/shared/updateManifest';
 import { isWindowsLocaleMatchingCountry } from '../src/shared/timezones';
 import { getTargetServiceVerificationError, isValidIpAddress } from '../src/shared/probeValidation';
-import { createStatusTrayIcon } from '../electron/trayIcon';
-import { requestTextViaProxy } from '../electron/netClient';
+import { createStatusTrayIcon } from '../electron/ui';
+import { requestTextViaProxy } from '../electron/net';
 import { validateSnapshots } from './snapshotValidation';
-import { validateLegacyMigration } from './legacyMigration';
 
 assert.ok(process.env.GUARD_TEST_DATA);
 const root = process.env.GUARD_TEST_DATA;
@@ -96,7 +99,6 @@ async function run(): Promise<void> {
   }
   fs.cpSync(path.resolve('resources/mihomo'), core, { recursive: true });
   const store = new ConfigStore();
-  await validateLegacyMigration(root);
   validateSnapshots(root);
   assert.throws(() => store.update({ dedicatedProxyPort: 27898 }), /不同/);
   assert.equal(store.get().dedicatedProxyPort, 27897);
@@ -192,8 +194,7 @@ async function run(): Promise<void> {
   console.log('通过：内核异常退出后自动恢复，另一通道的持续传输连接保持正常');
 
   // 使用真实网络请求占用串行队列，检查排队恢复与手动选择的交错执行。
-  const queuedKernel = service.channels.claude as unknown as { serial<T>(operation: () => Promise<T>): Promise<T> };
-  const requestPending = queuedKernel.serial(() => getThrough(agPort, `${origin}/slow`));
+  const requestPending = service.channels.claude.serial(() => getThrough(agPort, `${origin}/slow`));
   process.kill(service.channels.claude.getState().pid!);
   await until(() => service!.channels.claude.getState().phase === 'recovering');
   const selectionPending = service.channels.claude.select(snapshot, claudePort);

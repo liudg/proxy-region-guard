@@ -4,9 +4,8 @@ import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { generateKeyPairSync } from 'node:crypto';
 import * as yaml from 'js-yaml';
-import { SubscriptionCatalog } from '../electron/subscriptionCatalog';
-import { verifyCore } from '../electron/privateKernel';
-import { independentNodeDns } from '../electron/nodeDns';
+import { SubscriptionCatalog, independentNodeDns } from '../electron/clash';
+import { verifyCore } from '../electron/kernel';
 
 export function validateSnapshots(root: string): void {
   const directory = path.join(root, 'snapshot-validation');

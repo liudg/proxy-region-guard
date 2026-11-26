@@ -1,13 +1,17 @@
 import { app } from 'electron';
 import assert from 'node:assert/strict';
-import { getRawFs } from '../electron/updateCrypto';
+import { getRawFs } from '../electron/utils/rawFs';
 import * as path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { createHash } from 'node:crypto';
 import { spawn, ChildProcess } from 'node:child_process';
 import { setTimeout as delay } from 'node:timers/promises';
-import { buildEncodedPowerShellLaunch, resolveWindowsPowerShellExe } from '../electron/updaterService';
-import { readUpdateFailureReason, writeUpdateReadyFile } from '../electron/updateBoot';
+import {
+  buildEncodedPowerShellLaunch,
+  readUpdateFailureReason,
+  resolveWindowsPowerShellExe,
+  writeUpdateReadyFile,
+} from '../electron/updater';
 
 const root = process.env.GUARD_TEST_DATA!;
 const fs = getRawFs();
